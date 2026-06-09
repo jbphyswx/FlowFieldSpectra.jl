@@ -95,6 +95,28 @@ save("energy_spectrum.png", fig)
 
 ---
 
+## Example Figures
+
+### Cartesian 2D Flow Field Spectral Analysis
+
+![Cartesian Spectra](docs/src/assets/cartesian_spectra.png)
+
+*Taylor-Green vortex: velocity vectors (top-left), 2D spectral energy density (top-right), and 1D isotropic vs transect spectra (bottom).*
+
+### Spherical Harmonic Degree Spectrum
+
+![Spherical Spectra](docs/src/assets/spherical_spectra.png)
+
+*Left: scalar field on a Clenshaw-Curtis grid. Right: energy per spherical harmonic degree ℓ.*
+
+### Backend Parity (DirectSum vs FFTW)
+
+![Backend Parity](docs/src/assets/backend_parity.png)
+
+*Coefficient magnitude comparison between DirectSum and FFT backends; difference is at machine-precision levels.*
+
+---
+
 ## Core API Reference
 
 ### Spectral Calculation

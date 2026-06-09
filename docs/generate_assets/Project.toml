@@ -20,5 +20,5 @@ NUFSHT = "0.1"
 julia = "1.9"
 
 [sources]
-FlowFieldSpectra = { path = ".." }
+FlowFieldSpectra = { path = "../.." }
 NUFSHT = { url = "https://github.com/jbphyswx/NUFSHT.jl" }

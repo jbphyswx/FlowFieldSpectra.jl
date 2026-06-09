@@ -1,0 +1,10 @@
+   Resolving package versions...
+     Project No packages added to or removed from `/net/sampo/data1/jbenjami/Code/jbphyswx/FlowFieldSpectra.jl/examples/Project.toml`
+    Manifest No packages added to or removed from `/net/sampo/data1/jbenjami/Code/jbphyswx/FlowFieldSpectra.jl/Manifest.toml`
+     Project No packages added to or removed from `/net/sampo/data1/jbenjami/Code/jbphyswx/FlowFieldSpectra.jl/examples/Project.toml`
+    Manifest No packages added to or removed from `/net/sampo/data1/jbenjami/Code/jbphyswx/FlowFieldSpectra.jl/Manifest.toml`
+--- Running Spherical Grid Spectra Example ---
+Computing structured SHT via FastSphericalHarmonics...
+Computing unstructured SHT via NUFSHT (with CG solve)...
+Saved figure: /net/sampo/data1/jbenjami/Code/jbphyswx/FlowFieldSpectra.jl/examples/spherical_spectra.png
+Example run successfully!

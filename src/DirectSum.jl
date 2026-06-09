@@ -46,9 +46,9 @@ function calculate_spectrum_direct(
         length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
 
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (2π + 1e-5)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-5)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[1] == ms[2]) # spherical signature (theta, phi) with lmax = ms[1] - 1
+    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
+       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
+       (ms[2] == 2 * ms[1] - 1) # spherical signature (theta, phi) with Nphi = 2*Ntheta - 1
         # Spherical coordinate fallback: (theta, phi)
         # ms[1] is lmax + 1, ms[2] is 2*lmax + 1
         lmax = ms[1] - 1

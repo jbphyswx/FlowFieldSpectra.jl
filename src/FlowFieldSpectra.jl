@@ -6,15 +6,15 @@ include("Types.jl")
 include("DirectSum.jl")
 include("Reductions.jl")
 
-using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend
-using .DirectSum: calculate_spectrum_direct, sph_mode_index
-using .Reductions: isotropic_spectrum, transect_spectrum, spherical_energy_spectrum
+using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
+using .DirectSum: calculate_spectrum_direct, calculate_spectrum_direct!, sph_mode_index
+using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
 
 # Export Types
-export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend
+export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
 
 # Export APIs
-export calculate_spectrum, isotropic_spectrum, transect_spectrum, spherical_energy_spectrum, sph_mode_index
+export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
 export plot_spectrum, compare_spectra, compare_spectral_analysis
 
 
@@ -87,6 +87,137 @@ function calculate_spectrum(
     return calculate_spectrum_direct(coords_vecs, fields_vecs, ms; kwargs...)
 end
 
+"""
+    calculate_spectrum!(coeffs, backend::AbstractSpectralBackend, coords_vecs, fields_vecs, ms; kwargs...)
+
+In-place version of `calculate_spectrum`. Computes spectral coefficients into preallocated `coeffs` array.
+
+# Arguments
+- `coeffs`: Preallocated output array. Size must match expected output for the backend.
+- `backend::AbstractSpectralBackend`: The spectral backend to use.
+- `coords_vecs::Tuple`: Tuple of coordinate vectors.
+- `fields_vecs::Tuple`: Tuple of fields to analyze.
+- `ms::Tuple`: Target spectral resolution.
+
+# Returns
+- `ks_phys`: A tuple of physical wavenumber coordinates.
+
+# Example
+```julia
+# Preallocate once
+coeffs = zeros(Complex{Float64}, 64, 64, 2)
+
+# Reuse in time loop
+for t in 1:nt
+    ks = calculate_spectrum!(coeffs, DirectSumBackend(), coords, fields[t], (64, 64))
+    # ... analyze coeffs ...
+end
+```
+"""
+function calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    backend::AbstractSpectralBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    return _calculate_spectrum!(coeffs, backend, coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+# Backend-specific !() implementations
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::DirectSumBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    return calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::FFTBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    throw(ArgumentError("FFTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::NUFFTBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    throw(ArgumentError("NUFFTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::SHTBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    throw(ArgumentError("SHTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::NUFSHTBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    throw(ArgumentError("NUFSHTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::ThreadedBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    return _calculate_spectrum_threaded!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    backend::GPUBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    return _calculate_spectrum_gpu!(coeffs, backend, coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+function _calculate_spectrum!(
+    coeffs::AbstractArray{Complex{T}},
+    ::AutoBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+) where {T}
+    if isdefined(Main, :OhMyThreads) && Threads.nthreads() > 1
+        return _calculate_spectrum!(coeffs, ThreadedBackend(), coords_vecs, fields_vecs, ms; kwargs...)
+    else
+        return _calculate_spectrum!(coeffs, DirectSumBackend(), coords_vecs, fields_vecs, ms; kwargs...)
+    end
+end
+
 # Internal stub helpers for extensions
 function _calculate_spectrum_fft(args...; kwargs...)
     throw(ArgumentError("FFTBackend is not loaded. Run `using FFTW` to load the FFTW extension."))
@@ -102,6 +233,22 @@ end
 
 function _calculate_spectrum_nufsht(args...; kwargs...)
     throw(ArgumentError("NUFSHTBackend is not loaded. Run `using NUFSHT` to load the NUFSHT extension."))
+end
+
+function _calculate_spectrum_threaded(args...; kwargs...)
+    throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads` to load the OhMyThreads extension."))
+end
+
+function _calculate_spectrum_threaded!(args...; kwargs...)
+    throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads` to load the OhMyThreads extension."))
+end
+
+function _calculate_spectrum_gpu(args...; kwargs...)
+    throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions` to load the KernelAbstractions extension."))
+end
+
+function _calculate_spectrum_gpu!(args...; kwargs...)
+    throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions` to load the KernelAbstractions extension."))
 end
 
 function calculate_spectrum(
@@ -142,6 +289,40 @@ function calculate_spectrum(
     kwargs...,
 )
     return _calculate_spectrum_nufsht(coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+function calculate_spectrum(
+    ::ThreadedBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+)
+    return _calculate_spectrum_threaded(coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+function calculate_spectrum(
+    backend::GPUBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+)
+    return _calculate_spectrum_gpu(backend, coords_vecs, fields_vecs, ms; kwargs...)
+end
+
+function calculate_spectrum(
+    ::AutoBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    kwargs...,
+)
+    if isdefined(Main, :OhMyThreads) && Threads.nthreads() > 1
+        return calculate_spectrum(ThreadedBackend(), coords_vecs, fields_vecs, ms; kwargs...)
+    else
+        return calculate_spectrum(DirectSumBackend(), coords_vecs, fields_vecs, ms; kwargs...)
+    end
 end
 
 # Stubs for plotting extension

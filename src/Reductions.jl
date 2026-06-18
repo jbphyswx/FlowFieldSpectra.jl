@@ -3,7 +3,7 @@ module Reductions
 using Statistics: mean
 using ..DirectSum: sph_mode_index
 
-export isotropic_spectrum, transect_spectrum, spherical_energy_spectrum
+export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
 
 """
     isotropic_spectrum(ks_phys::Tuple, coeffs::AbstractArray; num_bins::Int=minimum(size(coeffs)[1:end-1]) ÷ 2)
@@ -193,6 +193,186 @@ function spherical_energy_spectrum(
     end
 
     return 0:lmax, E_l
+end
+
+"""
+    isotropic_spectrum!(E_k::Vector, k_bins::Vector, ks_phys::Tuple, coeffs::AbstractArray; num_bins::Int=0)
+
+In-place version of `isotropic_spectrum`. Computes the 1D isotropic energy spectrum into preallocated arrays.
+
+# Arguments
+- `E_k::Vector{T}`: Preallocated output array for energy spectrum values, length `num_bins`.
+- `k_bins::Vector{T}`: Preallocated output array for wavenumber bin centers, length `num_bins`.
+- `ks_phys::Tuple`: Physical wavenumber ranges.
+- `coeffs::AbstractArray`: Complex spectral coefficients.
+
+# Returns
+Nothing. Results are written to `E_k` and `k_bins`.
+
+# Example
+```julia
+num_bins = 32
+E_k = zeros(Float64, num_bins)
+k_bins = zeros(Float64, num_bins)
+isotropic_spectrum!(E_k, k_bins, ks, coeffs; num_bins=num_bins)
+```
+"""
+function isotropic_spectrum!(
+    E_k::Vector{T},
+    k_bins::Vector{T},
+    ks_phys::Tuple,
+    coeffs::AbstractArray{Complex{T}, N_dim};
+    num_bins::Int = 0,
+) where {T<:AbstractFloat, N_dim}
+    D = length(ks_phys)
+    @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
+
+    ms = size(coeffs)[1:D]
+    NU = size(coeffs, N_dim)
+
+    # Calculate wavenumber magnitude for each grid point
+    max_ks = [maximum(abs.(ks_phys[d])) for d in 1:D]
+    k_max = minimum(max_ks)
+
+    if num_bins <= 0
+        num_bins = minimum(ms) ÷ 2
+    end
+
+    @assert length(E_k) == num_bins "E_k length must equal num_bins"
+    @assert length(k_bins) == num_bins "k_bins length must equal num_bins"
+
+    bin_edges = range(zero(T), stop = k_max, length = num_bins + 1)
+    dk = k_max / num_bins
+
+    # Fill k_bins
+    for i in 1:num_bins
+        k_bins[i] = T(0.5) * (bin_edges[i] + bin_edges[i+1])
+    end
+
+    # Zero out E_k (in case of reuse)
+    fill!(E_k, zero(T))
+
+    # Accumulate energy in bins
+    @inbounds for I in CartesianIndices(ms)
+        k_mag = zero(T)
+        for d in 1:D
+            k_mag += ks_phys[d][I[d]]^2
+        end
+        k_mag = sqrt(k_mag)
+
+        if k_mag <= k_max
+            bin_idx = clamp(floor(Int, k_mag / dk) + 1, 1, num_bins)
+
+            energy = zero(T)
+            for c in 1:NU
+                energy += abs2(coeffs[I, c])
+            end
+            E_k[bin_idx] += T(0.5) * energy
+        end
+    end
+
+    # Normalize by bin width
+    E_k ./= dk
+
+    return nothing
+end
+
+"""
+    transect_spectrum!(E_reduced, ks_reduced, ks_phys, coeffs, dims)
+
+In-place version of `transect_spectrum`. Note: this function allocates internally for intermediate grid reductions.
+"""
+function transect_spectrum!(
+    E_reduced::AbstractArray{T},
+    ks_reduced::Vector,
+    ks_phys::Tuple,
+    coeffs::AbstractArray{Complex{T}, N_dim},
+    dims::Tuple,
+) where {T<:AbstractFloat, N_dim}
+    D = length(ks_phys)
+    @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
+
+    ms = size(coeffs)[1:D]
+    NU = size(coeffs, N_dim)
+
+    # Compute energy density
+    energy_grid = zeros(T, ms...)
+    for I in CartesianIndices(ms)
+        val = zero(T)
+        for c in 1:NU
+            val += abs2(coeffs[I, c])
+        end
+        energy_grid[I] = T(0.5) * val
+    end
+
+    sum_dims = filter(d -> d in dims, 1:D)
+    keep_dims = filter(d -> !(d in dims), 1:D)
+
+    reduced_energy = sum(energy_grid, dims=Tuple(sum_dims))
+
+    for d in sum_dims
+        dk_d = ks_phys[d][2] - ks_phys[d][1]
+        reduced_energy .*= dk_d
+    end
+
+    out_shape = Tuple(ms[d] for d in keep_dims)
+    @assert size(E_reduced) == out_shape "E_reduced size mismatch"
+
+    # Copy to output
+    copyto!(E_reduced, reshape(reduced_energy, out_shape))
+
+    # Fill ks_reduced
+    empty!(ks_reduced)
+    for d in keep_dims
+        push!(ks_reduced, ks_phys[d])
+    end
+
+    return nothing
+end
+
+"""
+    spherical_energy_spectrum!(E_l::Vector, coeffs::AbstractArray{Complex{T}, 3}; lmax::Int=size(coeffs, 1)-1)
+
+In-place version of `spherical_energy_spectrum`. Computes spherical energy spectrum into preallocated `E_l`.
+
+# Arguments
+- `E_l::Vector{T}`: Preallocated output array of length `lmax + 1`.
+- `coeffs::AbstractArray{Complex{T}, 3}`: Spherical harmonic coefficients.
+
+# Returns
+Nothing. Results written to `E_l`.
+
+# Example
+```julia
+lmax = 32
+E_l = zeros(Float64, lmax + 1)
+spherical_energy_spectrum!(E_l, coeffs; lmax=lmax)
+```
+"""
+function spherical_energy_spectrum!(
+    E_l::Vector{T},
+    coeffs::AbstractArray{Complex{T}, 3};
+    lmax::Int = size(coeffs, 1) - 1,
+) where {T<:AbstractFloat}
+    Nθ, Nφ, NU = size(coeffs)
+    @assert Nθ >= lmax + 1 "Coefficients size mismatch"
+    @assert length(E_l) == lmax + 1 "E_l length must be lmax + 1"
+
+    # Zero out (in case of reuse)
+    fill!(E_l, zero(T))
+
+    @inbounds for l in 0:lmax
+        energy = zero(T)
+        for m in -l:l
+            idx = sph_mode_index(l, m)
+            for c in 1:NU
+                energy += abs2(coeffs[idx, c])
+            end
+        end
+        E_l[l+1] = T(0.5) * energy
+    end
+
+    return nothing
 end
 
 end # module Reductions

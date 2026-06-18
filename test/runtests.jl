@@ -213,7 +213,25 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
         # Verify that solve recovers the coefficient better than raw adjoint
         idx_2_0 = FFS.sph_mode_index(2, 0)
-        Test.@test isapprox(c_nufsht_sol[idx_2_0, 1], 1.0, atol = 0.15)
+        Test.@test isapprox(c_nufsht_sol[idx_2_0, 1], 1.0, atol = 0.10)
     end
+
+    Test.@testset "Legendre Recurrence and Spherical Direct Sum Correctness" begin
+        # Test sectoral and standard recurrence results against analytical values
+        FT = Float64
+        x = FT(0.5)
+        s = sqrt(one(FT) - x^2)
+        
+        P_0_0 = FFS.DirectSum._normalized_legendre(0, 0, x, s)
+        P_1_0 = FFS.DirectSum._normalized_legendre(1, 0, x, s)
+        P_1_1 = FFS.DirectSum._normalized_legendre(1, 1, x, s)
+        
+        Test.@test isapprox(P_0_0, one(FT) / sqrt(FT(4π)), atol = 1e-15)
+        Test.@test isapprox(P_1_0, sqrt(FT(3) / (FT(4) * FT(π))) * x, atol = 1e-15)
+        Test.@test isapprox(P_1_1, -sqrt(FT(3) / (FT(8) * FT(π))) * s, atol = 1e-15)
+    end
+
+    # GPU/KA tests
+    include("test_gpu.jl")
 
 end

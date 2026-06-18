@@ -1,6 +1,6 @@
 module Types
 
-export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend
+export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
 
 """
     AbstractSpectralBackend
@@ -13,14 +13,13 @@ abstract type AbstractSpectralBackend end
 """
     DirectSumBackend <: AbstractSpectralBackend
 
-Slow fallback backend that computes the Discrete Fourier Transform (DFT) or Spherical Harmonic Transform (SHT) directly using ``O(N \\cdot M)`` direct summation.
+Slow, serial CPU fallback backend that computes the Discrete Fourier Transform (DFT) or Spherical Harmonic Transform (SHT) directly using ``O(N \\cdot M)`` direct summation.
 This backend is fully self-contained and requires no external packages to be loaded.
 
 # Details
 - **Cartesian coordinates**: Computes the exact Discrete Fourier Transform (DFT) at the target frequencies.
 - **Spherical coordinates**: Computes SHT coefficients using a direct projection onto the Spherical Harmonic basis, with associated Legendre polynomials computed via a type-stable recurrence relation.
 - **Complexity**: ``O(N \\cdot M)`` where ``N`` is the number of spatial grid points and ``M`` is the number of spectral modes.
-- **Threading**: Uses Julia's multi-threading (`Threads.@threads`) over spectral modes/grid coordinates.
 """
 struct DirectSumBackend <: AbstractSpectralBackend end
 
@@ -97,5 +96,31 @@ using NUFSHT
 - **Parameters**: Supports `solve::Bool` to trigger an iterative CG solver (conjugate gradient) for recovering the spectral coefficients from scattered grid measurements.
 """
 struct NUFSHTBackend <: AbstractSpectralBackend end
+
+"""
+    ThreadedBackend <: AbstractSpectralBackend
+
+Multi-threaded CPU execution backend using `OhMyThreads.jl` for direct sum spectral calculations.
+Requires the `OhMyThreads.jl` package to be loaded.
+"""
+struct ThreadedBackend <: AbstractSpectralBackend end
+
+"""
+    GPUBackend{B} <: AbstractSpectralBackend
+
+GPU-accelerated execution backend using `KernelAbstractions.jl`.
+Parameterized by the target GPU backend (e.g., `KernelAbstractions.CPU()`, `CUDA.CUDABackend()`).
+Requires `KernelAbstractions.jl` to be loaded.
+"""
+struct GPUBackend{B} <: AbstractSpectralBackend
+    backend::B
+end
+
+"""
+    AutoBackend <: AbstractSpectralBackend
+
+Automatic backend selection based on availability and runtime state.
+"""
+struct AutoBackend <: AbstractSpectralBackend end
 
 end # module Types

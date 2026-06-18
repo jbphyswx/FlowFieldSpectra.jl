@@ -1,12 +1,8 @@
 module DirectSum
 
-using LinearAlgebra: LinearAlgebra as LA
-using StaticArrays: StaticArrays as SA
-using Base.Threads: Threads
-
 using ..Types: DirectSumBackend
 
-export calculate_spectrum_direct, sph_mode_index
+export calculate_spectrum_direct, calculate_spectrum_direct!, sph_mode_index
 
 """
     sph_mode_index(l::Int, m::Int)
@@ -24,6 +20,7 @@ end
     calculate_spectrum_direct(coords_vecs, fields_vecs, ms; kwargs...)
 
 Compute direct sum spectral coefficients for Cartesian or spherical coordinates.
+Allocates output arrays. See also `calculate_spectrum_direct!` for preallocated output.
 """
 function calculate_spectrum_direct(
     coords_vecs::Tuple,
@@ -38,6 +35,65 @@ function calculate_spectrum_direct(
     N = length(coords_vecs[1])
     FT = eltype(coords_vecs[1])
 
+    # Determine output size based on coordinate type
+    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
+       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
+       (ms[2] == 2 * ms[1] - 1)
+        # Spherical: ms = (Nθ, Nφ) = (lmax+1, 2*lmax+1)
+        lmax = ms[1] - 1
+        Nθ = lmax + 1
+        Nφ = 2 * lmax + 1
+        coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
+        ks = calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; iflag, domain_size, weights)
+        return (coeffs, ks)
+    else
+        # Cartesian: ms = (mx, my, ...)
+        coeffs = zeros(Complex{FT}, ms..., NU)
+        ks = calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; iflag, domain_size, weights)
+        return (coeffs, ks)
+    end
+end
+
+"""
+    calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
+
+In-place version of `calculate_spectrum_direct`. Computes spectral coefficients
+using preallocated `coeffs` array. Returns the wavenumber ranges.
+
+# Arguments
+- `coeffs`: Preallocated output array. For Cartesian: size `(ms..., NU)`. For spherical: size `(Nθ, Nφ, NU)`.
+- `coords_vecs`: Tuple of coordinate vectors
+- `fields_vecs`: Tuple of field vectors
+- `ms`: Target spectral resolution tuple
+
+# Returns
+- `ks_phys`: Tuple of physical wavenumber ranges
+
+# Example
+```julia
+# Preallocate once
+coeffs = zeros(Complex{Float64}, 64, 64, 2)
+
+# Reuse in time loop
+for t in 1:nt
+    calculate_spectrum_direct!(coeffs, coords, fields[t], (64, 64))
+    # ... analyze coeffs ...
+end
+```
+"""
+function calculate_spectrum_direct!(
+    coeffs::AbstractArray{Complex{FT}},
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    ms::Tuple;
+    iflag::Int = 1,
+    domain_size::Union{Nothing, Tuple} = nothing,
+    weights::Union{Nothing, AbstractVector} = nothing,
+) where {FT}
+    D = length(coords_vecs)
+    NU = length(fields_vecs)
+    N = length(coords_vecs[1])
+
     # Validate inputs
     for d in 1:D
         length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
@@ -48,28 +104,31 @@ function calculate_spectrum_direct(
 
     if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
        all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1) # spherical signature (theta, phi) with Nphi = 2*Ntheta - 1
-        # Spherical coordinate fallback: (theta, phi)
-        # ms[1] is lmax + 1, ms[2] is 2*lmax + 1
+       (ms[2] == 2 * ms[1] - 1)
+        # Spherical coordinate path
         lmax = ms[1] - 1
-        return _calculate_spectrum_spherical_direct(coords_vecs, fields_vecs, lmax, weights)
+        return _calculate_spectrum_spherical_direct!(coeffs, coords_vecs, fields_vecs, lmax, weights)
     else
         # Cartesian coordinate path
-        return _calculate_spectrum_cartesian_direct(coords_vecs, fields_vecs, ms, iflag, domain_size)
+        return _calculate_spectrum_cartesian_direct!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
     end
 end
 
-# Cartesian Direct Sum Transform
-function _calculate_spectrum_cartesian_direct(
-    coords_vecs::Tuple{T1, Vararg{T1}},
-    fields_vecs::Tuple{T2, Vararg{T2}},
+# Cartesian Direct Sum Transform - SERIAL VERSION
+function _calculate_spectrum_cartesian_direct!(
+    coeffs::AbstractArray{Complex{FT}},
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
     ms::NTuple{D, Int},
     iflag::Int,
     domain_size::Union{Nothing, Tuple} = nothing,
-) where {D, T1, T2}
-    FT = eltype(coords_vecs[1])
+) where {FT, D}
     N = length(coords_vecs[1])
     NU = length(fields_vecs)
+
+    # Validate output size
+    expected_size = (ms..., NU)
+    size(coeffs) == expected_size || throw(DimensionMismatch("coeffs size $(size(coeffs)) != expected $expected_size"))
 
     # 1. Coordinate ranges for physical wavenumbers
     ranges = ntuple(Val(D)) do d
@@ -89,18 +148,20 @@ function _calculate_spectrum_cartesian_direct(
         Val(D),
     )
 
-    # Preallocate coefficients
-    coeffs = zeros(Complex{FT}, ms..., NU)
+    # Zero out coeffs (in case of reuse)
+    fill!(coeffs, zero(Complex{FT}))
 
-    # O(N * M) Cartesian direct Fourier sum
-    Threads.@threads for I in CartesianIndices(ms)
-        k_phys = SA.SVector{D, FT}(ntuple(d -> ks_phys[d][I[d]], Val(D)))
-
+    # O(N * M) Cartesian direct Fourier sum - SERIAL
+    @inbounds for I in CartesianIndices(ms)
         for j in 1:N
-            x_pos = SA.SVector{D, FT}(ntuple(d -> coords_vecs[d][j], Val(D)))
+            # Compute phase = k ⋅ x (manual loop for zero allocation)
+            phi = zero(FT)
+            for d in 1:D
+                phi += ks_phys[d][I[d]] * coords_vecs[d][j]
+            end
+            phi = -iflag * phi
 
-            phi = -iflag * (LA.dot(k_phys, x_pos))
-            W = exp(im * phi)
+            W = cis(phi)  # cis(x) = exp(im*x), more efficient
 
             for u_idx in 1:NU
                 coeffs[I, u_idx] += fields_vecs[u_idx][j] * W
@@ -109,38 +170,37 @@ function _calculate_spectrum_cartesian_direct(
     end
 
     coeffs ./= N
-    return coeffs, ks_phys
+    return ks_phys
 end
 
-# Spherical Direct SHT Projection
-function _calculate_spectrum_spherical_direct(
+# Spherical Direct SHT Projection - SERIAL VERSION
+function _calculate_spectrum_spherical_direct!(
+    coeffs::AbstractArray{Complex{FT}},
     coords_vecs::Tuple,
     fields_vecs::Tuple,
     lmax::Int,
     weights::Union{Nothing, AbstractVector},
-)
-    FT = eltype(coords_vecs[1])
+) where {FT}
     N = length(coords_vecs[1])
     NU = length(fields_vecs)
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
 
+    # Validate output size
+    expected_size = (Nθ, Nφ, NU)
+    size(coeffs) == expected_size || throw(DimensionMismatch("coeffs size $(size(coeffs)) != expected $expected_size"))
+
     θ = coords_vecs[1]
     φ = coords_vecs[2]
-
-    # Preallocate coefficients
-    coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
 
     # Use uniform weights if not provided
     w = weights === nothing ? fill(FT(4π) / N, N) : weights
 
-    # Temporary thread-local coefficient buffers to avoid data races
-    n_threads = Threads.nthreads()
-    thread_coeffs = [zeros(Complex{FT}, Nθ, Nφ, NU) for _ in 1:n_threads]
+    # Zero out coeffs (in case of reuse)
+    fill!(coeffs, zero(Complex{FT}))
 
-    # Compute SHT direct summation
-    Threads.@threads for j in 1:N
-        tid = Threads.threadid()
+    # Compute SHT direct summation - SERIAL with on-the-fly Legendre
+    @inbounds for j in 1:N
         θj = θ[j]
         φj = φ[j]
         wj = w[j]
@@ -148,55 +208,58 @@ function _calculate_spectrum_spherical_direct(
         xj = cos(θj)
         sj = sin(θj)
 
-        # Precompute Legendre polynomials for this point
-        # P[l+1, m+1] corresponds to normalized P_l^m(xj) for m >= 0
-        P = zeros(FT, Nθ, Nθ)
-
-        # 1. Sectoral recurrence m == 0
-        P[1, 1] = one(FT) / sqrt(FT(4π))
-        
-        # Sectoral recurrence for m > 0
-        for m in 1:lmax
-            P[m+1, m+1] = -sqrt(FT(2m+1) / (2m)) * sj * P[m, m]
-        end
-
-        # 2. Recurrence for l > m
-        for m in 0:lmax
-            if m + 1 <= lmax
-                P[m+2, m+1] = xj * sqrt(FT(2m+3)) * P[m+1, m+1]
-            end
-            for l in (m+2):lmax
-                P[l+1, m+1] = xj * sqrt(FT(4l^2 - 1) / (l^2 - m^2)) * P[l, m+1] -
-                              sqrt(FT(2l+1) * ((l-1)^2 - m^2) / ((2l-3) * (l^2 - m^2))) * P[l-1, m+1]
-            end
-        end
-
-        # Accumulate projection for each l, m
         for l in 0:lmax
             for m in -l:l
-                # Y_l^m = P_l^|m| * exp(i*m*phi)
-                # If m < 0, Y_l^m = (-1)^m * P_l^|m| * exp(i*m*phi)
                 abs_m = abs(m)
-                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                
-                phase = exp(im * m * φj)
-                Y_lm = factor * P[l+1, abs_m+1] * phase
+                P_l_m = _normalized_legendre(l, abs_m, xj, sj)
 
-                # Adjoint projection coefficient
+                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+                phase = cis(m * φj)
+                Y_lm = factor * P_l_m * phase
+
                 idx = sph_mode_index(l, m)
+                fj_conj_Ylm_wj = conj(Y_lm) * wj
                 for u_idx in 1:NU
-                    thread_coeffs[tid][idx, u_idx] += fields_vecs[u_idx][j] * conj(Y_lm) * wj
+                    coeffs[idx, u_idx] += fields_vecs[u_idx][j] * fj_conj_Ylm_wj
                 end
             end
         end
     end
 
-    # Sum up thread-local buffers
-    for tid in 1:n_threads
-        coeffs .+= thread_coeffs[tid]
+    return (0:lmax, -lmax:lmax)
+end
+
+"""
+    _normalized_legendre(l, m, x, s)
+
+Compute normalized associated Legendre polynomial P_l^m(x) using recurrence.
+On-the-fly computation avoids storing the full matrix.
+"""
+@inline function _normalized_legendre(l::Int, m::Int, x::FT, s::FT)::FT where FT
+    m > l && return zero(FT)
+
+    # P_m^m via sectoral recurrence
+    P_mm = one(FT) / sqrt(FT(4π))
+    @inbounds for mm in 1:m
+        P_mm *= -sqrt(FT(2mm + 1) / (2mm)) * s
     end
 
-    return coeffs, (0:lmax, -lmax:lmax)
+    l == m && return P_mm
+
+    # P_{m+1}^m using first-step recurrence
+    P_lm = x * sqrt(FT(2m + 3)) * P_mm
+    P_lminus1_m = P_mm
+
+    l == m + 1 && return P_lm
+
+    # Standard recurrence for higher l
+    @inbounds for ll in (m+2):l
+        coeff1 = sqrt(FT(4ll^2 - 1) / (ll^2 - m^2))
+        coeff2 = sqrt(FT(2ll + 1) * ((ll - 1)^2 - m^2) / ((2ll - 3) * (ll^2 - m^2)))
+        P_lminus1_m, P_lm = P_lm, x * coeff1 * P_lm - coeff2 * P_lminus1_m
+    end
+
+    return P_lm
 end
 
 end # module DirectSum

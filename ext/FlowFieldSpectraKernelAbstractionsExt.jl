@@ -16,103 +16,79 @@ function _array_on_backend(a, backend::KA.Backend)
 end
 
 # =============================================================================
-# GPU DirectSum Dispatch
+# GPU entry points — coordinate system fixed by caller (grid dispatch in core).
 # =============================================================================
 
-function FFS._calculate_spectrum_gpu(
-    gpu_backend::GPUBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...
-)
-    backend = gpu_backend.backend
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    FT = eltype(coords_vecs[1])
-
-    # Determine coordinate type (Spherical or Cartesian)
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical
-        lmax = ms[1] - 1
-        Nθ = lmax + 1
-        Nφ = 2 * lmax + 1
-        coeffs_dev = KA.zeros(backend, Complex{FT}, Nθ, Nφ, NU)
-        ks = FFS._calculate_spectrum_gpu!(coeffs_dev, gpu_backend, coords_vecs, fields_vecs, ms; kwargs...)
-        coeffs = Array(coeffs_dev)
-        return (coeffs, ks)
-    else
-        # Cartesian
-        coeffs_dev = KA.zeros(backend, Complex{FT}, ms..., NU)
-        ks = FFS._calculate_spectrum_gpu!(coeffs_dev, gpu_backend, coords_vecs, fields_vecs, ms; kwargs...)
-        coeffs = Array(coeffs_dev)
-        return (coeffs, ks)
+# Stage host vectors to the device (no-op if already resident there).
+function _stage_to_device(backend::KA.Backend, vecs::Tuple, ::Type{FT}, N::Int) where {FT}
+    _array_on_backend(vecs[1], backend) && return vecs
+    return ntuple(length(vecs)) do i
+        dev = KA.allocate(backend, FT, N)
+        copyto!(dev, collect(vecs[i]))
+        dev
     end
 end
 
-function FFS._calculate_spectrum_gpu!(
-    coeffs::AbstractArray{Complex{FT}},
+function FFS._calculate_spectrum_gpu_cartesian(
     gpu_backend::GPUBackend,
     coords_vecs::Tuple,
     fields_vecs::Tuple,
-    ms::Tuple;
-    iflag::Int = 1,
-    domain_size::Union{Nothing, Tuple} = nothing,
-    weights::Union{Nothing, AbstractVector} = nothing,
-) where {FT}
+    ms::Tuple,
+    iflag::Int,
+    domain_size,
+)
     backend = gpu_backend.backend
-    D = length(coords_vecs)
+    FT = eltype(coords_vecs[1])
     NU = length(fields_vecs)
     N = length(coords_vecs[1])
-
-    for d in 1:D
+    for d in 1:length(coords_vecs)
         length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
     end
     for u_idx in 1:NU
         length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
 
-    # Stage inputs to device if they are not already on the backend
-    is_gpu = _array_on_backend(coords_vecs[1], backend)
+    coords_dev = _stage_to_device(backend, coords_vecs, FT, N)
+    fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
+    coeffs_dev = KA.zeros(backend, Complex{FT}, ms..., NU)
+    ks = _calculate_spectrum_cartesian_gpu!(coeffs_dev, backend, coords_dev, fields_dev, ms, iflag, domain_size)
+    return Array(coeffs_dev), ks
+end
 
-    coords_dev = is_gpu ? coords_vecs : ntuple(d -> begin
-        dev_arr = KA.allocate(backend, FT, N)
-        copyto!(dev_arr, collect(coords_vecs[d]))
-        dev_arr
-    end, D)
-
-    fields_dev = is_gpu ? fields_vecs : ntuple(u -> begin
-        dev_arr = KA.allocate(backend, FT, N)
-        copyto!(dev_arr, collect(fields_vecs[u]))
-        dev_arr
-    end, NU)
-
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical coordinate path
-        lmax = ms[1] - 1
-        
-        weights_dev = if weights === nothing
-            w_host = fill(FT(4π) / N, N)
-            w_dev = KA.allocate(backend, FT, N)
-            copyto!(w_dev, w_host)
-            w_dev
-        else
-            is_gpu ? weights : begin
-                w_dev = KA.allocate(backend, FT, N)
-                copyto!(w_dev, collect(weights))
-                w_dev
-            end
-        end
-
-        return _calculate_spectrum_spherical_gpu!(coeffs, backend, coords_dev, fields_dev, lmax, weights_dev)
-    else
-        # Cartesian coordinate path
-        return _calculate_spectrum_cartesian_gpu!(coeffs, backend, coords_dev, fields_dev, ms, iflag, domain_size)
+function FFS._calculate_spectrum_gpu_spherical(
+    gpu_backend::GPUBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    lmax::Int,
+    weights,
+)
+    backend = gpu_backend.backend
+    FT = eltype(coords_vecs[1])
+    NU = length(fields_vecs)
+    N = length(coords_vecs[1])
+    for u_idx in 1:NU
+        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+
+    coords_dev = _stage_to_device(backend, coords_vecs, FT, N)
+    fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
+    weights_dev = if weights === nothing
+        w = KA.allocate(backend, FT, N)
+        copyto!(w, fill(FT(4π) / N, N))
+        w
+    elseif _array_on_backend(weights, backend)
+        weights
+    else
+        w = KA.allocate(backend, FT, N)
+        copyto!(w, collect(weights))
+        w
+    end
+
+    coeffs_dev = KA.zeros(backend, Complex{FT}, Nθ, Nφ, NU)
+    ks = _calculate_spectrum_spherical_gpu!(coeffs_dev, backend, coords_dev, fields_dev, lmax, weights_dev)
+    return Array(coeffs_dev), ks
 end
 
 # =============================================================================

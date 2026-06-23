@@ -4,68 +4,40 @@ using OhMyThreads: OhMyThreads as OMT
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 # =============================================================================
-# Threaded DirectSum Dispatch
+# Threaded entry points — coordinate system is fixed by the caller (grid type
+# dispatch happens in core), so there is no coordinate heuristic here.
 # =============================================================================
 
-function FFS._calculate_spectrum_threaded(
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...
-)
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    FT = eltype(coords_vecs[1])
-
-    # Determine coordinate type (Spherical or Cartesian)
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical
-        lmax = ms[1] - 1
-        Nθ = lmax + 1
-        Nφ = 2 * lmax + 1
-        coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
-        ks = FFS._calculate_spectrum_threaded!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
-        return (coeffs, ks)
-    else
-        # Cartesian
-        coeffs = zeros(Complex{FT}, ms..., NU)
-        ks = FFS._calculate_spectrum_threaded!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
-        return (coeffs, ks)
-    end
-end
-
-function FFS._calculate_spectrum_threaded!(
+function FFS._calculate_spectrum_threaded_cartesian!(
     coeffs::AbstractArray{Complex{FT}},
     coords_vecs::Tuple,
     fields_vecs::Tuple,
-    ms::Tuple;
-    iflag::Int = 1,
-    domain_size::Union{Nothing, Tuple} = nothing,
-    weights::Union{Nothing, AbstractVector} = nothing,
+    ms::Tuple,
+    iflag::Int,
+    domain_size,
 ) where {FT}
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
     N = length(coords_vecs[1])
-
-    for d in 1:D
+    for d in 1:length(coords_vecs)
         length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
     end
-    for u_idx in 1:NU
+    for u_idx in 1:length(fields_vecs)
         length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
+    return _calculate_spectrum_cartesian_threaded!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
+end
 
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical coordinate path
-        lmax = ms[1] - 1
-        return _calculate_spectrum_spherical_threaded!(coeffs, coords_vecs, fields_vecs, lmax, weights)
-    else
-        # Cartesian coordinate path
-        return _calculate_spectrum_cartesian_threaded!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
+function FFS._calculate_spectrum_threaded_spherical!(
+    coeffs::AbstractArray{Complex{FT}},
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    lmax::Int,
+    weights,
+) where {FT}
+    N = length(coords_vecs[1])
+    for u_idx in 1:length(fields_vecs)
+        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
+    return _calculate_spectrum_spherical_threaded!(coeffs, coords_vecs, fields_vecs, lmax, weights)
 end
 
 # =============================================================================

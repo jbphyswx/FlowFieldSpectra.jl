@@ -34,7 +34,8 @@ function generate_cartesian_figure()
     v = @. -sin(2 * xv) * cos(2 * yv)
     
     # Transform using FFTW
-    c_fft, k_fft = calculate_spectrum(FFTBackend(), (xv, yv), (u, v), (N, N); domain_size=(L, L))
+    cart_grid = UniformCartesianGrid((xv, yv); domain_size=(L, L))
+    c_fft, k_fft = calculate_spectrum(FFTBackend(), cart_grid, (u, v), (N, N))
     
     # 1D radial isotropic reduction
     k_bins, E_k = isotropic_spectrum(k_fft, c_fft; num_bins=32)
@@ -94,7 +95,8 @@ function generate_spherical_figure()
     f_val = vec(FastSphericalHarmonics.sph_evaluate(C_true))
     
     # Compute via SHTBackend
-    c_sht, _ = calculate_spectrum(SHTBackend(), (theta_nodes, phi_nodes), (f_val,), (Nθ, Nφ))
+    sht_grid = StructuredSphericalGrid(theta_nodes, phi_nodes)
+    c_sht, _ = calculate_spectrum(SHTBackend(), sht_grid, (f_val,), (Nθ, Nφ))
     deg, E_l = spherical_energy_spectrum(c_sht)
     
     # Plot
@@ -131,10 +133,11 @@ function generate_parity_figure()
     v = @. -sin(3 * xv) * cos(3 * yv)
     
     # Compute via DirectSum
-    c_direct, _ = calculate_spectrum(DirectSumBackend(), (xv, yv), (u, v), (N, N); domain_size=(L, L))
-    
+    parity_grid = UniformCartesianGrid((xv, yv); domain_size=(L, L))
+    c_direct, _ = calculate_spectrum(DirectSumBackend(), parity_grid, (u, v), (N, N))
+
     # Compute via FFTW
-    c_fft, _ = calculate_spectrum(FFTBackend(), (xv, yv), (u, v), (N, N); domain_size=(L, L))
+    c_fft, _ = calculate_spectrum(FFTBackend(), parity_grid, (u, v), (N, N))
     
     # Compute difference
     diff_u = abs.(c_direct[:, :, 1] .- c_fft[:, :, 1])

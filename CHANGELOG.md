@@ -16,7 +16,11 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
 - Shared `physical_wavenumbers` definition (previously duplicated across backends).
 
 ### Changed
-- (in progress) Centralized backend dispatch on `(grid, backend)`.
+- `calculate_spectrum`/`calculate_spectrum!` now dispatch on `(backend, grid, fields, ms)`. The
+  coordinate system is determined by the grid type — the fragile coordinate-range heuristic that
+  guessed Cartesian-vs-spherical is removed entirely (no guessing, no warnings, no fallbacks).
+- In-place `calculate_spectrum!` is grid-based and supported for `DirectSumBackend`/`ThreadedBackend`;
+  unsupported `(backend, grid)` combinations raise a clear error.
 
 ## [0.1.0]
 - Initial implementation: `calculate_spectrum` with DirectSum/FFT/NUFFT/SHT/NUFSHT/Threaded/GPU

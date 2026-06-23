@@ -1,5 +1,6 @@
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+FlowFieldSpectra = "e5f08a8b-40ae-41d5-97fc-c483fb8f16ad"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 
 [sources]

@@ -3,7 +3,7 @@ module DirectSum
 using ..Types: DirectSumBackend
 using ..Grids: physical_wavenumbers
 
-export calculate_spectrum_direct, calculate_spectrum_direct!, sph_mode_index
+export sph_mode_index
 
 """
     sph_mode_index(l::Int, m::Int)
@@ -15,104 +15,6 @@ standard 2D coefficient array of size `(lmax+1, 2lmax+1)`.
     row = l - abs(m) + 1
     col = m == 0 ? 1 : (m < 0 ? 2 * abs(m) : 2 * m + 1)
     return CartesianIndex(row, col)
-end
-
-"""
-    calculate_spectrum_direct(coords_vecs, fields_vecs, ms; kwargs...)
-
-Compute direct sum spectral coefficients for Cartesian or spherical coordinates.
-Allocates output arrays. See also `calculate_spectrum_direct!` for preallocated output.
-"""
-function calculate_spectrum_direct(
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    iflag::Int = 1,
-    domain_size::Union{Nothing, Tuple} = nothing,
-    weights::Union{Nothing, AbstractVector} = nothing,
-)
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    N = length(coords_vecs[1])
-    FT = eltype(coords_vecs[1])
-
-    # Determine output size based on coordinate type
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical: ms = (Nθ, Nφ) = (lmax+1, 2*lmax+1)
-        lmax = ms[1] - 1
-        Nθ = lmax + 1
-        Nφ = 2 * lmax + 1
-        coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
-        ks = calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; iflag, domain_size, weights)
-        return (coeffs, ks)
-    else
-        # Cartesian: ms = (mx, my, ...)
-        coeffs = zeros(Complex{FT}, ms..., NU)
-        ks = calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; iflag, domain_size, weights)
-        return (coeffs, ks)
-    end
-end
-
-"""
-    calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
-
-In-place version of `calculate_spectrum_direct`. Computes spectral coefficients
-using preallocated `coeffs` array. Returns the wavenumber ranges.
-
-# Arguments
-- `coeffs`: Preallocated output array. For Cartesian: size `(ms..., NU)`. For spherical: size `(Nθ, Nφ, NU)`.
-- `coords_vecs`: Tuple of coordinate vectors
-- `fields_vecs`: Tuple of field vectors
-- `ms`: Target spectral resolution tuple
-
-# Returns
-- `ks_phys`: Tuple of physical wavenumber ranges
-
-# Example
-```julia
-# Preallocate once
-coeffs = zeros(Complex{Float64}, 64, 64, 2)
-
-# Reuse in time loop
-for t in 1:nt
-    calculate_spectrum_direct!(coeffs, coords, fields[t], (64, 64))
-    # ... analyze coeffs ...
-end
-```
-"""
-function calculate_spectrum_direct!(
-    coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    iflag::Int = 1,
-    domain_size::Union{Nothing, Tuple} = nothing,
-    weights::Union{Nothing, AbstractVector} = nothing,
-) where {FT}
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    N = length(coords_vecs[1])
-
-    # Validate inputs
-    for d in 1:D
-        length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
-    end
-    for u_idx in 1:NU
-        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
-    end
-
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical coordinate path
-        lmax = ms[1] - 1
-        return _calculate_spectrum_spherical_direct!(coeffs, coords_vecs, fields_vecs, lmax, weights)
-    else
-        # Cartesian coordinate path
-        return _calculate_spectrum_cartesian_direct!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
-    end
 end
 
 # Cartesian Direct Sum Transform - SERIAL VERSION

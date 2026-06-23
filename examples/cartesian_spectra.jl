@@ -25,7 +25,8 @@ function run_cartesian_example()
     
     # 2. Compute via FFTW
     println("Computing uniform Cartesian spectrum via FFTW...")
-    c_fft, k_fft = calculate_spectrum(FFTBackend(), (xv, yv), (u, v), (N, N); domain_size=(L, L))
+    grid = UniformCartesianGrid((xv, yv); domain_size=(L, L))
+    c_fft, k_fft = calculate_spectrum(FFTBackend(), grid, (u, v), (N, N))
     
     # Isotropic 1D reduction
     k_bins, E_k = isotropic_spectrum(k_fft, c_fft; num_bins=32)
@@ -45,7 +46,8 @@ function run_cartesian_example()
     u_scat = @. cos(2 * xv_scat) * sin(2 * yv_scat)
     v_scat = @. -sin(2 * xv_scat) * cos(2 * yv_scat)
     
-    c_nufft, k_nufft = calculate_spectrum(NUFFTBackend(), (xv_scat, yv_scat), (u_scat, v_scat), (N, N); domain_size=(L, L))
+    grid_scat = ScatteredCartesianGrid((xv_scat, yv_scat); domain_size=(L, L))
+    c_nufft, k_nufft = calculate_spectrum(NUFFTBackend(), grid_scat, (u_scat, v_scat), (N, N))
     k_bins_scat, E_k_scat = isotropic_spectrum(k_nufft, c_nufft; num_bins=32)
     
     # 4. Generate Plot

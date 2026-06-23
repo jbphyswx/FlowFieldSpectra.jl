@@ -12,7 +12,6 @@ export AbstractGrid,
     ClenshawCurtis,
     GaussLegendre,
     Equiangular,
-    infer_grid,
     physical_wavenumbers,
     spatial_dims,
     npoints
@@ -207,65 +206,6 @@ Physical wavenumber ranges for a Cartesian grid at spectral resolution `ms`.
 """
 @inline function physical_wavenumbers(g::AbstractCartesianGrid{FT, D}, ms::NTuple{D, Int}) where {FT, D}
     return physical_wavenumbers(g.domain_size, ms, FT)
-end
-
-# -----------------------------------------------------------------------------
-# Heuristic classification — the ONLY surviving copy, opt-in via infer_grid
-# -----------------------------------------------------------------------------
-
-"""
-    _looks_spherical(coords, ms) -> Bool
-
-Legacy heuristic: a 2-tuple of coordinates is treated as spherical when `coords[1] ∈
-[0, π]`, `coords[2] ∈ [0, 2π]`, and `ms[2] == 2*ms[1] - 1`. Fragile (a small Cartesian
-domain in that range matches) — used only by [`infer_grid`](@ref) as a backwards-compatible
-convenience, and warns once when it fires implicitly.
-"""
-@inline function _looks_spherical(coords::Tuple, ms::Tuple)
-    length(coords) == 2 || return false
-    length(ms) == 2 || return false
-    e1 = extrema(coords[1])
-    e2 = extrema(coords[2])
-    return e1[1] >= -1e-5 && e1[2] <= (π + 1e-3) &&
-           e2[1] >= -1e-5 && e2[2] <= (2π + 1e-3) &&
-           ms[2] == 2 * ms[1] - 1
-end
-
-const _SPHERICAL_WARNED = Ref(false)
-
-"""
-    infer_grid(coords::Tuple, ms::Tuple; spherical=nothing, domain_size=nothing, weights=nothing,
-               uniform=false) -> AbstractGrid
-
-Construct an explicit grid from the legacy `(coords, ms)` arguments — a backwards-compatible
-adapter for the old positional API. Pass `spherical=true`/`false` to force the coordinate
-system; when `nothing`, the (fragile) range heuristic is used and warns once on implicit
-spherical detection. `uniform=true` selects `UniformCartesianGrid` (for the FFT backend);
-otherwise a Cartesian grid defaults to `ScatteredCartesianGrid`. This adapter does runtime
-classification by design; all hot-path dispatch happens on the returned grid's concrete type.
-"""
-function infer_grid(
-    coords::Tuple,
-    ms::Tuple;
-    spherical::Union{Nothing, Bool} = nothing,
-    domain_size = nothing,
-    weights = nothing,
-    uniform::Bool = false,
-)
-    is_sph = spherical === true || (spherical === nothing && _looks_spherical(coords, ms))
-    if is_sph
-        if spherical === nothing && !_SPHERICAL_WARNED[]
-            _SPHERICAL_WARNED[] = true
-            @warn "FlowFieldSpectra: coordinates were classified as spherical by the legacy range " *
-                  "heuristic. Construct a grid explicitly (e.g. `ScatteredSphericalGrid`) or pass " *
-                  "`spherical=true`/`spherical=false` to silence this." maxlog = 1
-        end
-        return weights === nothing ? ScatteredSphericalGrid(coords[1], coords[2]) :
-               ScatteredSphericalGrid(coords[1], coords[2]; weights = weights)
-    else
-        return uniform ? UniformCartesianGrid(coords; domain_size = domain_size) :
-               ScatteredCartesianGrid(coords; domain_size = domain_size)
-    end
 end
 
 end # module Grids

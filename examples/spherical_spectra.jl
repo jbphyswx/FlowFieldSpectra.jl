@@ -30,7 +30,8 @@ function run_spherical_example()
     
     # 2. Compute via structured SHTBackend
     println("Computing structured SHT via FastSphericalHarmonics...")
-    c_sht, _ = calculate_spectrum(SHTBackend(), (theta_nodes, phi_nodes), (f_val,), (Nθ, Nφ))
+    sht_grid = StructuredSphericalGrid(theta_nodes, phi_nodes)
+    c_sht, _ = calculate_spectrum(SHTBackend(), sht_grid, (f_val,), (Nθ, Nφ))
     
     # Spherical degree energy spectrum
     deg, E_l = spherical_energy_spectrum(c_sht)
@@ -51,10 +52,11 @@ function run_spherical_example()
     f_scat = zeros(N_pts)
     NUFSHT.nusht_type2!(f_scat, C_true, plan)
     
+    nufsht_grid = ScatteredSphericalGrid(theta_scat, phi_scat)
     c_nufsht, _ = calculate_spectrum(
-        NUFSHTBackend(), 
-        (theta_scat, phi_scat), 
-        (f_scat,), 
+        NUFSHTBackend(),
+        nufsht_grid,
+        (f_scat,),
         (Nθ, Nφ);
         solve=true,
         maxiter=500,

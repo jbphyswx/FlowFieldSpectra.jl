@@ -36,23 +36,13 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         u = @. cos(kx1 * xv + ky1 * yv) + 0.5 * sin(kx2 * xv + ky2 * yv)
         v = @. sin(kx1 * xv + ky1 * yv)
 
+        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+
         # 1. Compute via DirectSumBackend
-        c_direct, k_direct = FFS.calculate_spectrum(
-            FFS.DirectSumBackend(),
-            (xv, yv),
-            (u, v),
-            ms;
-            domain_size = (L, L),
-        )
+        c_direct, k_direct = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (u, v), ms)
 
         # 2. Compute via FFTBackend (requires FFTW)
-        c_fft, k_fft = FFS.calculate_spectrum(
-            FFS.FFTBackend(),
-            (xv, yv),
-            (u, v),
-            ms;
-            domain_size = (L, L),
-        )
+        c_fft, k_fft = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), ms)
 
         # Test bit-wise parity (FFT and Direct summation are mathematically equivalent)
         Test.@test isapprox(c_direct, c_fft, atol = 1e-12)
@@ -94,24 +84,14 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         u = @. cos(kx * xv + ky * yv)
         v = @. sin(kx * xv + ky * yv)
 
+        grid = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
+
         # 1. Compute via DirectSumBackend
-        c_direct, k_direct = FFS.calculate_spectrum(
-            FFS.DirectSumBackend(),
-            (xv, yv),
-            (u, v),
-            ms;
-            domain_size = (L, L),
-        )
+        c_direct, k_direct = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (u, v), ms)
 
         # 2. Compute via NUFFTBackend (requires FINUFFT)
-        c_nufft, k_nufft = FFS.calculate_spectrum(
-            FFS.NUFFTBackend(),
-            (xv, yv),
-            (u, v),
-            ms;
-            domain_size = (L, L),
-            eps = 1e-12,
-        )
+        c_nufft, k_nufft =
+            FFS.calculate_spectrum(FFS.NUFFTBackend(), grid, (u, v), ms; eps = 1e-12)
 
         Test.@test isapprox(c_direct, c_nufft, atol = 1e-10)
         Test.@test all(isapprox(k_direct[d], k_nufft[d], rtol = 1e-12) for d in 1:2)
@@ -136,12 +116,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         f_val = vec(FastSphericalHarmonics.sph_evaluate(C_true))
 
         # 1. Structured transform via SHTBackend
-        c_sht, _ = FFS.calculate_spectrum(
-            FFS.SHTBackend(),
-            (theta_nodes, phi_nodes),
-            (f_val,),
-            (Nθ, Nφ),
-        )
+        sgrid = FFS.StructuredSphericalGrid(theta_nodes, phi_nodes)
+        c_sht, _ = FFS.calculate_spectrum(FFS.SHTBackend(), sgrid, (f_val,), (Nθ, Nφ))
 
         # 2. Direct transform via DirectSumBackend
         # Clenshaw-Curtis quadrature weights
@@ -191,19 +167,16 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         f_val = zeros(N_pts)
         NUFSHT.nusht_type2!(f_val, C_true, plan)
 
+        usgrid = FFS.ScatteredSphericalGrid(theta_nodes, phi_nodes)
+
         # 1. NUFSHT adjoint transform
-        c_nufsht_adj, _ = FFS.calculate_spectrum(
-            FFS.NUFSHTBackend(),
-            (theta_nodes, phi_nodes),
-            (f_val,),
-            (Nθ, Nφ);
-            solve = false,
-        )
+        c_nufsht_adj, _ =
+            FFS.calculate_spectrum(FFS.NUFSHTBackend(), usgrid, (f_val,), (Nθ, Nφ); solve = false)
 
         # 2. NUFSHT CG solve transform
         c_nufsht_sol, _ = FFS.calculate_spectrum(
             FFS.NUFSHTBackend(),
-            (theta_nodes, phi_nodes),
+            usgrid,
             (f_val,),
             (Nθ, Nφ);
             solve = true,

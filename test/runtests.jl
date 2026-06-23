@@ -14,8 +14,14 @@ using NUFSHT: NUFSHT
 Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
     Test.@testset "Aqua Code Quality Analysis" begin
-        # Test code quality, exports, and namespace cleanliness
-        Aqua.test_all(FFS; ambiguities = false)
+        # Test code quality, exports, and namespace cleanliness.
+        #
+        # `unbound_args` is gated to Julia ≥ 1.12. The grid structs store `domain_size::NTuple{D, FT}`,
+        # whose auto-generated constructor is flagged on 1.10/1.11 for the *empty-tuple* (`D = 0`)
+        # case: `NTuple{0, FT}` == `Tuple{}` matches for any `FT`, so `FT` is unbound there. That is
+        # a genuine-but-unreachable corner — a 0-dimensional grid is never constructed — and 1.12's
+        # `detect_unbound_args` no longer reports it. We keep the check on where it is accurate.
+        Aqua.test_all(FFS; ambiguities = false, unbound_args = (VERSION >= v"1.12"))
     end
 
     Test.@testset "Explicit imports (no implicit / no stale)" begin

@@ -1,6 +1,6 @@
 module FlowFieldSpectraKernelAbstractionsExt
 
-using KernelAbstractions: KernelAbstractions as KA, @index, @atomic, @Const
+using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using FlowFieldSpectra: FlowFieldSpectra as FFS, GPUBackend
 
 # =============================================================================
@@ -223,56 +223,56 @@ function _calculate_spectrum_spherical_gpu!(
     θ_dev = coords_dev[1]
     φ_dev = coords_dev[2]
 
-    # Reinterpret complex array as a real array to support atomic operations
-    coeffs_real = reinterpret(reshape, FT, coeffs)
-
-    # Launch kernel - one thread per point
+    # One thread per output mode (row, col): each thread exclusively owns its coefficient
+    # slice across all components, so accumulation needs no atomics. Unused (row, col) slots
+    # (those with l > lmax) are skipped and stay zero.
     kernel! = _spherical_direct_sum_kernel!(backend)
-    kernel!(coeffs_real, θ_dev, φ_dev, fields_dev, weights_dev, lmax, Nφ, NU; ndrange = N)
+    kernel!(coeffs, θ_dev, φ_dev, fields_dev, weights_dev, lmax, N, NU; ndrange = Nθ * Nφ)
     KA.synchronize(backend)
 
     return (0:lmax, -lmax:lmax)
 end
 
 KA.@kernel function _spherical_direct_sum_kernel!(
-    coeffs_real,
+    coeffs,
     @Const(θ),
     @Const(φ),
     @Const(fields),
     @Const(w),
     lmax::Int,
-    Nφ::Int,
+    N::Int,
     NU::Int,
 )
-    j = @index(Global)
-    
-    if j <= length(θ)
-        θj = θ[j]
-        φj = φ[j]
-        wj = w[j]
+    idx = @index(Global)
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
 
-        xj = cos(θj)
-        sj = sin(θj)
+    if idx <= Nθ * Nφ
+        # Column-major decode of the (row, col) coefficient slot this thread owns.
+        col = (idx - 1) ÷ Nθ + 1
+        row = (idx - 1) % Nθ + 1
 
-        for l in 0:lmax
-            for m in -l:l
-                abs_m = abs(m)
-                P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
+        # Invert sph_mode_index: recover (m, |m|) from the column, then ℓ from the row.
+        m = col == 1 ? 0 : (iseven(col) ? -(col ÷ 2) : (col - 1) ÷ 2)
+        abs_m = abs(m)
+        l = row - 1 + abs_m
 
-                factor = (m < 0 && isodd(abs_m)) ? -one(typeof(P_l_m)) : one(typeof(P_l_m))
-                phase = cis(m * φj)
-                Y_lm = factor * P_l_m * phase
-
-                row = l - abs_m + 1
-                col = m == 0 ? 1 : (m < 0 ? 2 * abs_m : 2 * m + 1)
-                
-                fj_conj_Ylm_wj = conj(Y_lm) * wj
-                for u_idx in 1:NU
-                    contrib = fields[u_idx][j] * fj_conj_Ylm_wj
-                    # Use atomics for thread-safe accumulation on real and imaginary parts
-                    @atomic coeffs_real[1, row, col, u_idx] += real(contrib)
-                    @atomic coeffs_real[2, row, col, u_idx] += imag(contrib)
+        if l <= lmax
+            FT = eltype(θ)
+            CT = eltype(coeffs)
+            factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+            # Accumulate each component in a register, then store once — no atomics, no
+            # global read-modify-write. (Legendre is recomputed per component; NU is small.)
+            @inbounds for u_idx in 1:NU
+                acc = zero(CT)
+                for j in 1:N
+                    xj = cos(θ[j])
+                    sj = sin(θ[j])
+                    P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
+                    Y_lm = factor * P_l_m * cis(m * φ[j])
+                    acc += fields[u_idx][j] * conj(Y_lm) * w[j]
                 end
+                coeffs[row, col, u_idx] = acc
             end
         end
     end

@@ -81,6 +81,48 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::FFTWCa
     return plan.ks_phys
 end
 
+# Reconstruct the full (ms..., NU) complex DFT of a real field from its `rfft` half-spectrum
+# (non-redundant along dim 1) via Hermitian symmetry F[k] = conj(F[-k]). D-generic over the
+# spectral dims `1:D`; the trailing component axis is carried along. The result is bit-identical
+# (to floating point) to a full `fft` over `1:D`, so every downstream reduction is unchanged.
+function _full_from_rfft(half::AbstractArray{Complex{T}}, ms::NTuple{D, Int}) where {T, D}
+    NU = size(half, D + 1)
+    full = Array{Complex{T}}(undef, ms..., NU)
+    h1 = ms[1] ÷ 2 + 1
+    # Directly stored lower half along dim 1.
+    lower = ntuple(d -> d == 1 ? (1:h1) : Base.OneTo(size(full, d)), D + 1)
+    @views full[lower...] .= half
+    # Per-axis frequency-negation map: index j ↦ index of -frequency (1 ↦ 1, j ↦ m-j+2).
+    negmap = ntuple(d -> [1; ms[d]:-1:2], D)
+    @inbounds for u in 1:NU
+        for J in CartesianIndices(ms)
+            J[1] <= h1 && continue
+            src = CartesianIndex(ms[1] - J[1] + 2, ntuple(d -> negmap[d + 1][J[d + 1]], D - 1)...)
+            full[J, u] = conj(half[src, u])
+        end
+    end
+    return full
+end
+
+# Real-input fast path: rfft over the spectral dims (≈2× faster, half the transform memory),
+# reconstructed to the identical full complex spectrum, then fftshift + 1/prod(ms) normalization.
+function _rfft_spectrum(::Type{T}, fields_vecs::Tuple, ms::NTuple{D, Int}, ds) where {T, D}
+    NU = length(fields_vecs)
+    M = prod(ms)
+    inbuf = Array{T}(undef, ms..., NU)
+    @inbounds for u in 1:NU
+        length(fields_vecs[u]) == M ||
+            throw(DimensionMismatch("field $u length $(length(fields_vecs[u])) != prod(ms)=$M"))
+        copyto!(selectdim(inbuf, D + 1, u), fields_vecs[u])
+    end
+    full = _full_from_rfft(FFTW.rfft(inbuf, 1:D), ms)
+    coeffs = similar(full)
+    shifts = ntuple(i -> i <= D ? div(ms[i], 2) : 0, D + 1)
+    circshift!(coeffs, full, shifts)
+    coeffs .*= one(T) / M
+    return coeffs, FFS.Grids.physical_wavenumbers(ds, ms, T)
+end
+
 # One-shot allocating entry (called by the core (backend, grid) dispatch).
 function FFS._calculate_spectrum_fft(
     coords_vecs::Tuple,
@@ -96,6 +138,10 @@ function FFS._calculate_spectrum_fft(
     ds = domain_size === nothing ?
          ntuple(d -> (e = extrema(coords_vecs[d]); T(e[2] - e[1])), D) :
          ntuple(d -> T(domain_size[d]), D)
+    # Transparent real-input rfft fast path (forward transform only); identical output.
+    if iflag == 1 && all(f -> eltype(f) <: Real, fields_vecs)
+        return _rfft_spectrum(T, fields_vecs, NTuple{D, Int}(ms), ds)
+    end
     plan = _fftw_plan(T, NTuple{D, Int}(ms), ds, NU, iflag)
     coeffs = zeros(Complex{T}, ms..., NU)
     ks = FFS.calculate_spectrum!(coeffs, plan, fields_vecs)

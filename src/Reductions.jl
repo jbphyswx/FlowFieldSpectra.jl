@@ -38,7 +38,7 @@ function isotropic_spectrum(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
     # Calculate wavenumber magnitude for each grid point
@@ -236,7 +236,7 @@ function transect_spectrum(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
     keep_dims = Tuple(d for d in 1:D if !(d in dims))
@@ -263,24 +263,22 @@ end
 # tuple construction (so it scales to large 3D grids).
 function _accumulate_transect!(E_reduced::AbstractArray{T}, coeffs, ms::NTuple{D, Int}, NU::Int,
         keep_dims::Tuple, out_shape::Tuple) where {T, D}
-    nkeep = length(keep_dims)
-    out_strides = ones(Int, nkeep)
-    @inbounds for kk in 2:nkeep
-        out_strides[kk] = out_strides[kk-1] * out_shape[kk-1]
-    end
-    flatE = vec(E_reduced)
+    # Column-major linear index into E_reduced built with an incremental stride (no heap
+    # temporaries); E_reduced is addressed by linear index directly (no `vec` reshape).
     @inbounds for I in CartesianIndices(ms)
         e = zero(T)
         for c in 1:NU
             e += abs2(coeffs[I, c])
         end
         lin = 1
+        stride = 1
         kk = 0
         for d in keep_dims
             kk += 1
-            lin += (I[d] - 1) * out_strides[kk]
+            lin += (I[d] - 1) * stride
+            stride *= out_shape[kk]
         end
-        flatE[lin] += T(0.5) * e
+        E_reduced[lin] += T(0.5) * e
     end
     return E_reduced
 end
@@ -362,12 +360,22 @@ function isotropic_spectrum!(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    # Spectral extents from the type parameter (N_dim - 1 == D), so this is type-stable and
+    # allocation-free (a runtime `size(coeffs)[1:D]` slice would box a tuple of unknown length).
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
-    # Calculate wavenumber magnitude for each grid point
-    max_ks = [maximum(abs.(ks_phys[d])) for d in 1:D]
-    k_max = minimum(max_ks)
+    # Maximum resolved isotropic wavenumber (min over axes of each axis's max |k|), computed
+    # without allocating per-axis temporaries.
+    k_max = T(Inf)
+    @inbounds for d in 1:D
+        axmax = zero(T)
+        for v in ks_phys[d]
+            a = abs(T(v))
+            axmax = ifelse(a > axmax, a, axmax)
+        end
+        k_max = min(k_max, axmax)
+    end
 
     if num_bins <= 0
         num_bins = minimum(ms) ÷ 2
@@ -387,14 +395,12 @@ function isotropic_spectrum!(
     # Zero out E_k (in case of reuse)
     fill!(E_k, zero(T))
 
-    # Precompute squared wavenumbers per axis.
-    kd2 = [T.(ks_phys[d]) .^ 2 for d in 1:D]
-
-    # Accumulate energy in bins
+    # Accumulate energy in bins (squared wavenumbers formed inline — no per-axis allocation).
     @inbounds for I in CartesianIndices(ms)
         k_mag = zero(T)
         for d in 1:D
-            k_mag += kd2[d][I[d]]
+            kv = T(ks_phys[d][I[d]])
+            k_mag += kv * kv
         end
         k_mag = sqrt(k_mag)
 
@@ -418,7 +424,8 @@ end
 """
     transect_spectrum!(E_reduced, ks_reduced, ks_phys, coeffs, dims)
 
-In-place version of `transect_spectrum`. Note: this function allocates internally for intermediate grid reductions.
+In-place version of `transect_spectrum`. The energy accumulation kernel is allocation-free; only
+the `ks_reduced` axis bookkeeping (small, independent of grid size) touches the heap.
 """
 function transect_spectrum!(
     E_reduced::AbstractArray{T},
@@ -430,7 +437,7 @@ function transect_spectrum!(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
     keep_dims = Tuple(d for d in 1:D if !(d in dims))

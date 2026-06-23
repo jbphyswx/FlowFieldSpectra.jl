@@ -11,16 +11,44 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
   `ScatteredCartesianGrid`, `StructuredSphericalGrid`, `ScatteredSphericalGrid`) replacing the
   fragile coordinate-range heuristic for Cartesian-vs-spherical classification.
 - Typed preprocessing (`Hann`/`Hamming`/`Blackman`/`Tukey`/`NoWindow`, `Demean`/`LinearDetrend`/
-  `NoDetrend`) and normalization conventions (`OneSided`/`TwoSided`, `Density`/`Power`) — all
-  dispatched on types rather than symbols.
-- Shared `physical_wavenumbers` definition (previously duplicated across backends).
+  `NoDetrend`) and normalization conventions (`OneSided`/`TwoSided`, `DensityScaling`/`PowerScaling`)
+  — all dispatched on types rather than symbols.
+- Reusable spectral plans (`plan_spectrum`) for FFTW and FINUFFT, with batched spectral/trailing
+  axes (`n_transf`): build once, reuse across a z/t/component loop with allocation-free steady-state
+  execution (FFTW guru `mul!`, FINUFFT guru `makeplan`/`setpts!`/`exec!`).
+- Estimators: cross-spectrum family (`cross_spectrum`/`cospectrum`/`quadspectrum`), anisotropy-resolved
+  `anisotropic_spectrum` `E(k,θ)`, derived-quantity spectra (`spectral_vorticity`/`spectral_divergence`),
+  compensated/band-integrated wrappers (`compensate`/`band_energy`).
+- Variance-reduction & cross-analysis: `welch_power_spectrum`, `coherence_spectrum` (magnitude-squared
+  coherence + phase), `dpss` multitaper (Slepian) tapers, and `lomb_scargle` for irregular sampling.
+- First-class `synthesize` (inverse transform) for Cartesian and spherical grids — filtering and
+  round-trip validation.
+- Shared `physical_wavenumbers` and `SphericalKernels` (cached Legendre tables) used across all backends.
+- Documenter `@example` example pages (Cartesian, NUFFT + coastline cutout, spherical, 4D fixed-grid,
+  cross-spectra, backends) and Internals/API docs; CI, Docs, CompatHelper, TagBot workflows.
 
 ### Changed
 - `calculate_spectrum`/`calculate_spectrum!` now dispatch on `(backend, grid, fields, ms)`. The
   coordinate system is determined by the grid type — the fragile coordinate-range heuristic that
   guessed Cartesian-vs-spherical is removed entirely (no guessing, no warnings, no fallbacks).
-- In-place `calculate_spectrum!` is grid-based and supported for `DirectSumBackend`/`ThreadedBackend`;
-  unsupported `(backend, grid)` combinations raise a clear error.
+- In-place `calculate_spectrum!` works for all backends via plans; unsupported `(backend, grid)`
+  combinations raise a clear error instead of misrouting.
+
+### Performance
+- Real-input FFT routes transparently through `rfft` (≈2× faster, half the transform memory),
+  reconstructed to the identical full complex spectrum via Hermitian symmetry — no convention change.
+- GPU spherical transform rewritten to one-thread-per-output-mode with register accumulation and a
+  single store — **no atomics** (was one-thread-per-point atomic accumulation).
+- In-place reductions (`isotropic_spectrum!`, `transect_spectrum!`, `spherical_energy_spectrum!`) are
+  allocation-free in steady state (type-stable spectral-extent derivation; inlined squared wavenumbers).
+- FINUFFT default tolerance is precision-aware (`1e-6` for `Float32`, `1e-8` for `Float64`), avoiding
+  spurious tolerance warnings; full `Float32` support end-to-end.
+
+### Tested
+- Parseval/variance invariant and DirectSum-vs-FFT parity at `D = 1, 2, 3`; plan-reuse and batched-axis
+  parity; grid-dispatch errors; explicit-import policy (ExplicitImports) and Aqua; `Float32` end-to-end;
+  rfft-vs-full-FFT equivalence; GPU CPU-backend parity (no-atomics kernel); allocation (`@allocated≈0`)
+  for in-place reductions and bounded/constant steady-state plan execution.
 
 ## [0.1.0]
 - Initial implementation: `calculate_spectrum` with DirectSum/FFT/NUFFT/SHT/NUFSHT/Threaded/GPU

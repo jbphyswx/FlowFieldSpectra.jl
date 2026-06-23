@@ -72,8 +72,13 @@ function _nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_size::
     return plan
 end
 
+# Default FINUFFT tolerance: must stay above the float type's machine epsilon, so single precision
+# uses a looser tolerance than double (FINUFFT warns and clamps if eps < eps(T)).
+_default_eps(::Type{T}) where {T} = T === Float32 ? 1.0e-6 : 1.0e-8
+
 function FFS.plan_spectrum(::NUFFTBackend, g::FFS.AbstractCartesianGrid, ::Type{T},
-        ms::NTuple{D, Int}; n_transf::Int = 1, iflag::Int = 1, eps::Real = 1e-8) where {T, D}
+        ms::NTuple{D, Int}; n_transf::Int = 1, iflag::Int = 1,
+        eps::Real = _default_eps(T)) where {T, D}
     return _nufft_plan(T, g.coords, ms, g.domain_size, n_transf, iflag, eps)
 end
 
@@ -121,17 +126,18 @@ function FFS._calculate_spectrum_nufft(
     fields_vecs::Tuple,
     ms::Tuple;
     iflag::Int = 1,
-    eps::Real = 1e-8,
+    eps::Union{Nothing, Real} = nothing,
     domain_size::Union{Nothing, Tuple} = nothing,
     kwargs...,
 )
     D = length(ms)
     NU = length(fields_vecs)
     T = float(real(eltype(coords_vecs[1])))
+    epsv = eps === nothing ? _default_eps(T) : eps
     ds = domain_size === nothing ?
          ntuple(d -> (e = extrema(coords_vecs[d]); T(e[2] - e[1])), D) :
          ntuple(d -> T(domain_size[d]), D)
-    plan = _nufft_plan(T, coords_vecs, NTuple{D, Int}(ms), ds, NU, iflag, eps)
+    plan = _nufft_plan(T, coords_vecs, NTuple{D, Int}(ms), ds, NU, iflag, epsv)
     coeffs = zeros(Complex{T}, ms..., NU)
     ks = FFS.calculate_spectrum!(coeffs, plan, fields_vecs)
     return coeffs, ks

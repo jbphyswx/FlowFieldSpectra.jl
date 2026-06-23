@@ -345,6 +345,63 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         end
     end
 
+    Test.@testset "Real-input rfft fast path == full FFT (D=1/2/3)" begin
+        Random.seed!(13)
+        for D in 1:3
+            N = D == 3 ? 6 : 12
+            L = 2π
+            dx = L / N
+            ax = collect(range(0.0, stop = L - dx, length = N))
+            mesh = Iterators.product(ntuple(_ -> ax, D)...)
+            coords = ntuple(d -> [pt[d] for pt in mesh] |> vec, D)
+            ms = ntuple(_ -> N, D)
+            domain = ntuple(_ -> L, D)
+            grid = FFS.UniformCartesianGrid(coords; domain_size = domain)
+            # Two components to exercise the trailing NU axis through the mirror.
+            f1 = [sum(cos((d + 1) * coords[d][i]) for d in 1:D) for i in 1:N^D]
+            f2 = [sum(sin(d * coords[d][i]) for d in 1:D) for i in 1:N^D]
+            # Real input → rfft branch; complex input (identical values) → full-FFT branch.
+            c_real, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f1, f2), ms)
+            c_cplx, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid,
+                (ComplexF64.(f1), ComplexF64.(f2)), ms)
+            Test.@test isapprox(c_real, c_cplx; atol = 1e-12)
+        end
+    end
+
+    Test.@testset "Float32 end-to-end (DirectSum / FFT / NUFFT)" begin
+        Random.seed!(7)
+        L = 2.0f0 * Float32(π)
+        N = 16
+        dx = L / N
+        ax = collect(range(0.0f0, stop = L - dx, length = N))
+        xv = vec(Float32[x for x in ax, y in ax])
+        yv = vec(Float32[y for x in ax, y in ax])
+        f = @. cos(2xv) + 0.5f0 * sin(3yv)
+        ug = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+
+        c_dir, _ = FFS.calculate_spectrum(FFS.DirectSumBackend(), ug, (f,), (N, N))
+        c_fft, ks = FFS.calculate_spectrum(FFS.FFTBackend(), ug, (f,), (N, N))
+        # Coefficient eltype stays single precision through the whole pipeline.
+        Test.@test eltype(c_dir) === ComplexF32
+        Test.@test eltype(c_fft) === ComplexF32
+        Test.@test isapprox(c_fft, c_dir; atol = 1.0f-4)
+        # Reductions preserve precision.
+        k_iso, E_iso = FFS.isotropic_spectrum(ks, c_fft; num_bins = 6)
+        Test.@test eltype(E_iso) === Float32
+
+        # Scattered Float32 via FINUFFT: no tolerance warning (default eps is precision-aware),
+        # parity with the double-precision result on the same points.
+        xs = rand(Float32, 80) .* L
+        ys = rand(Float32, 80) .* L
+        fs = @. cos(xs) + sin(2ys)
+        sg = FFS.ScatteredCartesianGrid((xs, ys); domain_size = (L, L))
+        c32, _ = FFS.calculate_spectrum(FFS.NUFFTBackend(), sg, (fs,), (N, N))
+        Test.@test eltype(c32) === ComplexF32
+        sg64 = FFS.ScatteredCartesianGrid((Float64.(xs), Float64.(ys)); domain_size = (Float64(L), Float64(L)))
+        c64, _ = FFS.calculate_spectrum(FFS.NUFFTBackend(), sg64, (Float64.(fs),), (N, N))
+        Test.@test isapprox(ComplexF64.(c32), c64; atol = 1e-3)
+    end
+
     Test.@testset "Plan reuse parity + batch (FFTW / FINUFFT)" begin
         Random.seed!(99)
         L = 2π
@@ -506,6 +563,62 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         fs = FFS.synthesize(sg, C, (Nθ, Nφ))
         Test.@test length(fs[1]) == N_pts
         Test.@test all(isfinite, fs[1])
+    end
+
+    Test.@testset "Allocations (in-place reductions + steady-state plans ≈ 0)" begin
+        # Measure through function barriers (typed args) so `@allocated` reflects the kernel,
+        # not closure-capture boxing of global testset variables.
+        _iso(Ek, kb, ks, c, nb) =
+            @allocated FFS.isotropic_spectrum!(Ek, kb, ks, c; num_bins = nb)
+        _tr(Er, c, ms) = @allocated FFS.Reductions._accumulate_transect!(Er, c, ms, 1, (1,), (ms[2],))
+        _sph(El, C, l) = @allocated FFS.spherical_energy_spectrum!(El, C; lmax = l)
+        _exec(out, plan, f) = @allocated FFS.calculate_spectrum!(out, plan, (f,))
+
+        Random.seed!(5)
+        N = 16
+        L = 2π
+        dx = L / N
+        xs = range(0.0, stop = L - dx, length = N)
+        xv = vec([x for x in xs, y in xs])
+        yv = vec([y for x in xs, y in xs])
+        u = @. cos(2xv) + sin(3yv)
+        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+        c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u,), (N, N))
+
+        # --- In-place reductions: genuinely zero steady-state allocation. ---
+        nb = 6
+        E_k = zeros(Float64, nb)
+        k_bins = zeros(Float64, nb)
+        _iso(E_k, k_bins, ks, c, nb)                      # warmup
+        Test.@test _iso(E_k, k_bins, ks, c, nb) == 0
+
+        E_red = zeros(Float64, N)
+        _tr(E_red, c, (N, N))
+        Test.@test _tr(E_red, c, (N, N)) == 0
+
+        lmax = 8
+        Csph = zeros(ComplexF64, lmax + 1, 2lmax + 1, 1)
+        Csph[FFS.sph_mode_index(3, 1), 1] = 1.0
+        E_l = zeros(Float64, lmax + 1)
+        _sph(E_l, Csph, lmax)
+        Test.@test _sph(E_l, Csph, lmax) == 0
+
+        # --- Steady-state plan execution: small, constant (does not scale with data). ---
+        fplan = FFS.plan_spectrum(FFS.FFTBackend(), grid, Float64, (N, N); n_transf = 1)
+        cc = zeros(ComplexF64, N, N, 1)
+        _exec(cc, fplan, u)
+        Test.@test _exec(cc, fplan, u) < 1024            # broadcast/reshape wrappers only
+
+        Random.seed!(6)
+        M = 200
+        px = rand(M) .* L
+        py = rand(M) .* L
+        fs = @. cos(px) + sin(2py)
+        sg = FFS.ScatteredCartesianGrid((px, py); domain_size = (L, L))
+        nplan = FFS.plan_spectrum(FFS.NUFFTBackend(), sg, Float64, (N, N); n_transf = 1)
+        cn = zeros(ComplexF64, N, N, 1)
+        _exec(cn, nplan, fs)
+        Test.@test _exec(cn, nplan, fs) < 512
     end
 
     # GPU/KA tests

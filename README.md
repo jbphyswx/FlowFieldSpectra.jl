@@ -75,15 +75,10 @@ yv = vec([y for x in xs, y in ys])
 u = @. cos(2π * 2 * xv / L) + 0.5 * sin(2π * 5 * yv / L)
 v = @. sin(2π * 2 * xv / L)
 
-# 3. Calculate Spectral Coefficients via FFTW
-# ms=(N, N) defines the target number of modes
-coeffs, ks = calculate_spectrum(
-    FFTBackend(), 
-    (xv, yv), 
-    (u, v), 
-    (N, N); 
-    domain_size=(L, L)
-)
+# 3. Build an explicit grid and compute spectral coefficients via FFTW.
+#    The coordinate system is the grid type — there is no coordinate guessing.
+grid = UniformCartesianGrid((xv, yv); domain_size=(L, L))
+coeffs, ks = calculate_spectrum(FFTBackend(), grid, (u, v), (N, N))
 
 # 4. Reduce 2D Coefficients to a 1D Isotropic (Radial) Spectrum
 k_bins, E_k = isotropic_spectrum(ks, coeffs; num_bins=32)
@@ -92,6 +87,11 @@ k_bins, E_k = isotropic_spectrum(ks, coeffs; num_bins=32)
 fig = plot_spectrum(ks, coeffs; title="Radial Energy Spectrum")
 save("energy_spectrum.png", fig)
 ```
+
+Construct the grid that matches your data — `UniformCartesianGrid`, `ScatteredCartesianGrid`
+(NUFFT), `StructuredSphericalGrid` (SHT), or `ScatteredSphericalGrid` (NUFSHT) — and dispatch is
+exact. For repeated transforms on a fixed grid (e.g. each level/time of an `(x,y,z,t)` field),
+build a plan once with `plan_spectrum` and reuse it via `calculate_spectrum!`.
 
 ---
 

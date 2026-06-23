@@ -18,6 +18,14 @@ makedocs(;
     pages = [
         "Home"                   => "index.md",
         "Backends & Extensions"  => "backends.md",
+        "Examples"               => [
+            "Cartesian (FFT)"          => "examples/cartesian.md",
+            "NUFFT & coastline cutout" => "examples/nufft_coastline.md",
+            "4D fixed-grid spectra"    => "examples/horizontal_4d.md",
+            "Derived quantities"       => "examples/derived_quantities.md",
+            "Cross-spectra"            => "examples/cross_spectra.md",
+            "Spherical harmonics"      => "examples/spherical.md",
+        ],
         "API Reference"          => "api.md",
     ],
     warnonly = [:missing_docs, :docs_block],

@@ -3,139 +3,138 @@ module FlowFieldSpectraFINUFFTExt
 using FINUFFT: FINUFFT
 using FlowFieldSpectra: FlowFieldSpectra as FFS, NUFFTBackend
 
-"""
-    calculate_spectrum(::NUFFTBackend, coords_vecs, fields_vecs, ms; eps=1e-9, iflag=1, domain_size=nothing, ...)
+# =============================================================================
+# Reusable FINUFFT (guru) plan for scattered Cartesian grids.
+#
+# The nonuniform points are FIXED by the grid, so `finufft_makeplan` + `finufft_setpts!` run
+# ONCE at plan construction and `finufft_exec!` runs per call with `ntrans = n_transf` — a batch
+# of co-located fields/slices (components, vertical levels, time, ...) transformed together and
+# the plan reused across calls (e.g. a time loop). This is the fast path for horizontal spectra
+# of an `(x, y, z, t)` field on a fixed (possibly nonuniform) horizontal grid.
+# =============================================================================
 
-Compute non-uniform fast Fourier transform using FINUFFT.
+mutable struct NUFFTCartesianPlan{T, D, NM, PH, KS} <: FFS.AbstractSpectralPlan
+    guru::Any                       # FINUFFT guru plan (C resource)
+    cj::Matrix{Complex{T}}          # strengths buffer (M, n_transf)
+    fk::Array{Complex{T}, NM}       # modes buffer (ms..., n_transf)
+    ms::NTuple{D, Int}
+    n_transf::Int
+    M::Int                          # number of nonuniform points
+    phase::PH                       # (ms...) translation-correction phase
+    norm::T                         # 1/M
+    ks_phys::KS
+end
+
+function _nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_size::NTuple{D},
+        n_transf::Int, iflag::Int, eps::Real) where {T, D}
+    M = length(coords[1])
+    for d in 1:D
+        length(coords[d]) == M || throw(DimensionMismatch("coordinate $d length mismatch"))
+    end
+
+    # Per-axis offset (min) and physical period; scale points to FINUFFT's radian convention.
+    offsets = ntuple(d -> T(minimum(coords[d])), D)
+    ranges = ntuple(d -> (r = T(domain_size[d]); r == 0 ? one(T) : r), D)
+    scaled = ntuple(d -> T(2π) .* (T.(coords[d]) .- offsets[d]) ./ ranges[d], D)
+
+    # FINUFFT type-1 plan; sign is -iflag to match the e^{-ik·x} analysis convention.
+    guru = FINUFFT.finufft_makeplan(1, collect(ms), -iflag, n_transf, T(eps); dtype = T)
+    if D == 1
+        FINUFFT.finufft_setpts!(guru, scaled[1])
+    elseif D == 2
+        FINUFFT.finufft_setpts!(guru, scaled[1], scaled[2])
+    elseif D == 3
+        FINUFFT.finufft_setpts!(guru, scaled[1], scaled[2], scaled[3])
+    else
+        FINUFFT.finufft_destroy!(guru)
+        throw(ArgumentError("FINUFFT supports up to 3 dimensions; got $D"))
+    end
+
+    # Centered integer modes (FINUFFT modeord=0) → translation-correction phase per axis.
+    k_ints = ntuple(d -> collect(-(ms[d] ÷ 2):((ms[d] - 1) ÷ 2)), D)
+    phase = Array{Complex{T}, D}(undef, ms...)
+    @inbounds for I in CartesianIndices(ms)
+        p = one(Complex{T})
+        for d in 1:D
+            p *= cis(-iflag * k_ints[d][I[d]] * (offsets[d] * T(2π) / ranges[d]))
+        end
+        phase[I] = p
+    end
+
+    ks_phys = FFS.Grids.physical_wavenumbers(ranges, ms, T)
+    cj = Matrix{Complex{T}}(undef, M, n_transf)
+    fk = Array{Complex{T}, D + 1}(undef, ms..., n_transf)
+
+    plan = NUFFTCartesianPlan{T, D, D + 1, typeof(phase), typeof(ks_phys)}(
+        guru, cj, fk, ms, n_transf, M, phase, one(T) / M, ks_phys,
+    )
+    finalizer(p -> FINUFFT.finufft_destroy!(p.guru), plan)
+    return plan
+end
+
+function FFS.plan_spectrum(::NUFFTBackend, g::FFS.AbstractCartesianGrid, ::Type{T},
+        ms::NTuple{D, Int}; n_transf::Int = 1, iflag::Int = 1, eps::Real = 1e-8) where {T, D}
+    return _nufft_plan(T, g.coords, ms, g.domain_size, n_transf, iflag, eps)
+end
+
+function _load_strengths!(plan::NUFFTCartesianPlan{T}, fields_vecs::Tuple) where {T}
+    length(fields_vecs) == plan.n_transf ||
+        throw(DimensionMismatch("expected $(plan.n_transf) fields, got $(length(fields_vecs))"))
+    @inbounds for u in 1:length(fields_vecs)
+        length(fields_vecs[u]) == plan.M ||
+            throw(DimensionMismatch("field $u length $(length(fields_vecs[u])) != npoints=$(plan.M)"))
+        col = view(plan.cj, :, u)
+        for j in 1:plan.M
+            col[j] = fields_vecs[u][j]
+        end
+    end
+    return plan
+end
+
+function _load_strengths!(plan::NUFFTCartesianPlan{T}, field::AbstractArray) where {T}
+    length(field) == length(plan.cj) ||
+        throw(DimensionMismatch("field has $(length(field)) entries, expected $(length(plan.cj))"))
+    copyto!(plan.cj, field)
+    return plan
+end
+
 """
+    calculate_spectrum!(coeffs, plan::NUFFTCartesianPlan, fields) -> ks_phys
+
+Execute a prebuilt FINUFFT guru plan in place. `fields` is a tuple of `n_transf` field vectors
+(each `npoints` long) or a packed `(npoints, batch...)` array; `coeffs` has shape
+`(ms..., n_transf)`. The plan and point sorting are reused across calls.
+"""
+function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUFFTCartesianPlan{T, D},
+        fields) where {T, D}
+    size(coeffs) == (plan.ms..., plan.n_transf) ||
+        throw(DimensionMismatch("coeffs size $(size(coeffs)) != $((plan.ms..., plan.n_transf))"))
+    _load_strengths!(plan, fields)
+    FINUFFT.finufft_exec!(plan.guru, plan.cj, plan.fk)
+    coeffs .= plan.fk .* reshape(plan.phase, plan.ms..., 1) .* plan.norm
+    return plan.ks_phys
+end
+
+# One-shot allocating entry (called by the core (backend, grid) dispatch).
 function FFS._calculate_spectrum_nufft(
     coords_vecs::Tuple,
     fields_vecs::Tuple,
     ms::Tuple;
-    eps::Real = 1e-9,
     iflag::Int = 1,
+    eps::Real = 1e-8,
     domain_size::Union{Nothing, Tuple} = nothing,
     kwargs...,
 )
-    D = length(coords_vecs)
+    D = length(ms)
     NU = length(fields_vecs)
-    N = length(coords_vecs[1])
-    FT = eltype(coords_vecs[1])
-
-    # Validate dimensions
-    D <= 3 || throw(ArgumentError("FINUFFT only supports up to 3 dimensions"))
-    for d in 1:D
-        length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
-    end
-    for k in 1:NU
-        length(fields_vecs[k]) == N || throw(DimensionMismatch("Field length mismatch"))
-    end
-
-    # 1. Filter out NaNs/Infs
-    valid_mask = trues(N)
-    for d in 1:D
-        valid_mask .&= isfinite.(coords_vecs[d])
-    end
-    for k in 1:NU
-        valid_mask .&= isfinite.(fields_vecs[k])
-    end
-
-    N_valid = count(valid_mask)
-    if N_valid == 0
-        return zeros(Complex{FT}, ms..., NU),
-               ntuple(i -> range(zero(FT), stop = zero(FT), length = ms[i]), Val(D))
-    end
-
-    # 2. Rescale coordinates to [0, 2π] range as required by FINUFFT Type 1
-    scaled_x = ntuple(Val(D)) do d
-        x = coords_vecs[d][valid_mask]
-        min_x, max_x = extrema(x)
-        range_calc = max_x - min_x
-        range_x = domain_size === nothing ? range_calc : domain_size[d]
-
-        if range_x ≈ 0
-            return (zeros(FT, N_valid), min_x, one(FT))
-        end
-        return (FT(2π) .* (x .- min_x) ./ range_x, min_x, range_x)
-    end
-
-    xs = ntuple(i -> scaled_x[i][1], Val(D))
-    offsets = ntuple(i -> scaled_x[i][2], Val(D))
-    ranges_calc = ntuple(i -> scaled_x[i][3], Val(D))
-    ranges = domain_size === nothing ? ranges_calc : domain_size
-
-    # 3. Call FINUFFT Type 1 (non-uniform points to uniform modes)
-    coeffs = zeros(Complex{FT}, ms..., NU)
-
-    for k in 1:NU
-        uk = Complex{FT}.(fields_vecs[k][valid_mask])
-        coeffs_k = zeros(Complex{FT}, ms...)
-
-        if D == 1
-            FINUFFT.nufft1d1!(xs[1], uk, -iflag, eps, coeffs_k)
-        elseif D == 2
-            FINUFFT.nufft2d1!(xs[1], xs[2], uk, -iflag, eps, coeffs_k)
-        elseif D == 3
-            FINUFFT.nufft3d1!(xs[1], xs[2], xs[3], uk, -iflag, eps, coeffs_k)
-        end
-        Base.selectdim(coeffs, D + 1, k) .= coeffs_k
-    end
-
-    # 4. Phase shift to correct for min_x coordinate offset (Translation Property)
-    # If we mapped x -> (x - min_x) * 2π/L, we must multiply the modes by exp(ik * min_x * 2π/L)
-    ks = ntuple(
-        i -> range(FT(-ms[i] ÷ 2), stop = FT((ms[i] - 1) ÷ 2), length = ms[i]),
-        Val(D),
-    )
-
-    for d in 1:D
-        k_vec = ks[d]
-        L = ranges[d]
-        # Match direction of transform
-        phase = exp.(im .* (-iflag) .* k_vec .* (offsets[d] * FT(2π) / L))
-
-        # Apply phase correction along dimension d
-        if D == 1
-            for k in 1:NU
-                coeffs[:, k] .*= phase
-            end
-        elseif D == 2
-            if d == 1
-                for k in 1:NU, j in 1:ms[2]
-                    coeffs[:, j, k] .*= phase
-                end
-            else
-                for k in 1:NU, i in 1:ms[1]
-                    coeffs[i, :, k] .*= phase
-                end
-            end
-        elseif D == 3
-            if d == 1
-                for k in 1:NU, j in 1:ms[2], l in 1:ms[3]
-                    coeffs[:, j, l, k] .*= phase
-                end
-            elseif d == 2
-                for k in 1:NU, i in 1:ms[1], l in 1:ms[3]
-                    coeffs[i, :, l, k] .*= phase
-                end
-            else
-                for k in 1:NU, i in 1:ms[1], j in 1:ms[2]
-                    coeffs[i, j, :, k] .*= phase
-                end
-            end
-        end
-    end
-
-    # 5. Scale by 1/N
-    coeffs ./= N_valid
-
-    # 6. Physical wavenumbers
-    ks_phys = ntuple(
-        d -> ks[d] .* (FT(2π) / (ranges[d] == 0 ? one(FT) : ranges[d])),
-        Val(D),
-    )
-
-    return coeffs, ks_phys
+    T = float(real(eltype(coords_vecs[1])))
+    ds = domain_size === nothing ?
+         ntuple(d -> (e = extrema(coords_vecs[d]); T(e[2] - e[1])), D) :
+         ntuple(d -> T(domain_size[d]), D)
+    plan = _nufft_plan(T, coords_vecs, NTuple{D, Int}(ms), ds, NU, iflag, eps)
+    coeffs = zeros(Complex{T}, ms..., NU)
+    ks = FFS.calculate_spectrum!(coeffs, plan, fields_vecs)
+    return coeffs, ks
 end
 
 end # module FlowFieldSpectraFINUFFTExt

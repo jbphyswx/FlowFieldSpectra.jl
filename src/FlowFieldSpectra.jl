@@ -7,6 +7,7 @@ include("Grids.jl")
 include("Preprocessing.jl")
 include("Normalization.jl")
 include("Problem.jl")
+include("Plans.jl")
 include("DirectSum.jl")
 include("Reductions.jl")
 
@@ -15,6 +16,7 @@ using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, Unifor
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, Density, Power, SpectralConvention
 using .Problem: TransformProblem
+using .Plans: AbstractSpectralPlan, plan_spectrum
 using .DirectSum: sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
 
@@ -30,6 +32,7 @@ export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
 export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
 export AbstractSidedness, OneSided, TwoSided, AbstractScaling, Density, Power, SpectralConvention
 export TransformProblem
+export AbstractSpectralPlan, plan_spectrum
 
 # Export APIs
 export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index

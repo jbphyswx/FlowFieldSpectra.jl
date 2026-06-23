@@ -55,21 +55,19 @@ function isotropic_spectrum(
     k_bins = [T(0.5) * (bin_edges[i] + bin_edges[i+1]) for i in 1:num_bins]
     E_k = zeros(T, num_bins)
 
-    # Accumulate energy in bins
-    # E(k) = 1/2 * sum |C|^2
-    for I in CartesianIndices(ms)
-        # Compute physical wavenumber magnitude
+    # Precompute squared wavenumbers per axis (avoids re-squaring shared values).
+    kd2 = [T.(ks_phys[d]) .^ 2 for d in 1:D]
+
+    # Accumulate energy in bins: E(k) = 1/2 * sum |C|^2
+    @inbounds for I in CartesianIndices(ms)
         k_mag = zero(T)
         for d in 1:D
-            k_mag += ks_phys[d][I[d]]^2
+            k_mag += kd2[d][I[d]]
         end
         k_mag = sqrt(k_mag)
 
-        # Skip points outside the Nyquist circle/sphere
         if k_mag <= k_max
-            # Find bin index
             bin_idx = clamp(floor(Int, k_mag / dk) + 1, 1, num_bins)
-
             energy = zero(T)
             for c in 1:NU
                 energy += abs2(coeffs[I, c])
@@ -118,36 +116,50 @@ function transect_spectrum(
     ms = size(coeffs)[1:D]
     NU = size(coeffs, N_dim)
 
-    # Compute energy density at each mode
-    # E = 1/2 * sum |C|^2
-    energy_grid = zeros(T, ms...)
-    for I in CartesianIndices(ms)
-        val = zero(T)
-        for c in 1:NU
-            val += abs2(coeffs[I, c])
-        end
-        energy_grid[I] = T(0.5) * val
-    end
+    keep_dims = Tuple(d for d in 1:D if !(d in dims))
+    sum_dims = Tuple(d for d in 1:D if d in dims)
 
-    # Dimensions to sum over
-    sum_dims = filter(d -> d in dims, 1:D)
-    keep_dims = filter(d -> !(d in dims), 1:D)
-
-    # Sum along dims
-    reduced_energy = sum(energy_grid, dims=Tuple(sum_dims))
-
-    # Wavenumber spacing for summed dimensions to convert sum to integration density
-    for d in sum_dims
-        dk_d = ks_phys[d][2] - ks_phys[d][1]
-        reduced_energy .*= dk_d
-    end
-
-    # Reshape and extract
+    # Allocate only the reduced output (no full ms-sized intermediate grid).
     out_shape = Tuple(ms[d] for d in keep_dims)
-    E_reduced = reshape(reduced_energy, out_shape...)
-    ks_reduced = Tuple(ks_phys[d] for d in keep_dims)
+    E_reduced = zeros(T, out_shape)
 
+    dk_prod = one(T)
+    for d in sum_dims
+        dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
+    end
+
+    _accumulate_transect!(E_reduced, coeffs, ms, NU, keep_dims, out_shape)
+    E_reduced .*= dk_prod
+
+    ks_reduced = Tuple(ks_phys[d] for d in keep_dims)
     return ks_reduced, E_reduced
+end
+
+# Accumulate 1/2 Σ|C|^2 from an (ms..., NU) coeff array into the reduced output indexed by the
+# kept dimensions. Uses precomputed strides + linear indexing — allocation-free, no per-mode
+# tuple construction (so it scales to large 3D grids).
+function _accumulate_transect!(E_reduced::AbstractArray{T}, coeffs, ms::NTuple{D, Int}, NU::Int,
+        keep_dims::Tuple, out_shape::Tuple) where {T, D}
+    nkeep = length(keep_dims)
+    out_strides = ones(Int, nkeep)
+    @inbounds for kk in 2:nkeep
+        out_strides[kk] = out_strides[kk-1] * out_shape[kk-1]
+    end
+    flatE = vec(E_reduced)
+    @inbounds for I in CartesianIndices(ms)
+        e = zero(T)
+        for c in 1:NU
+            e += abs2(coeffs[I, c])
+        end
+        lin = 1
+        kk = 0
+        for d in keep_dims
+            kk += 1
+            lin += (I[d] - 1) * out_strides[kk]
+        end
+        flatE[lin] += T(0.5) * e
+    end
+    return E_reduced
 end
 
 """
@@ -252,11 +264,14 @@ function isotropic_spectrum!(
     # Zero out E_k (in case of reuse)
     fill!(E_k, zero(T))
 
+    # Precompute squared wavenumbers per axis.
+    kd2 = [T.(ks_phys[d]) .^ 2 for d in 1:D]
+
     # Accumulate energy in bins
     @inbounds for I in CartesianIndices(ms)
         k_mag = zero(T)
         for d in 1:D
-            k_mag += ks_phys[d][I[d]]^2
+            k_mag += kd2[d][I[d]]
         end
         k_mag = sqrt(k_mag)
 
@@ -295,33 +310,21 @@ function transect_spectrum!(
     ms = size(coeffs)[1:D]
     NU = size(coeffs, N_dim)
 
-    # Compute energy density
-    energy_grid = zeros(T, ms...)
-    for I in CartesianIndices(ms)
-        val = zero(T)
-        for c in 1:NU
-            val += abs2(coeffs[I, c])
-        end
-        energy_grid[I] = T(0.5) * val
-    end
-
-    sum_dims = filter(d -> d in dims, 1:D)
-    keep_dims = filter(d -> !(d in dims), 1:D)
-
-    reduced_energy = sum(energy_grid, dims=Tuple(sum_dims))
-
-    for d in sum_dims
-        dk_d = ks_phys[d][2] - ks_phys[d][1]
-        reduced_energy .*= dk_d
-    end
+    keep_dims = Tuple(d for d in 1:D if !(d in dims))
+    sum_dims = Tuple(d for d in 1:D if d in dims)
 
     out_shape = Tuple(ms[d] for d in keep_dims)
     @assert size(E_reduced) == out_shape "E_reduced size mismatch"
 
-    # Copy to output
-    copyto!(E_reduced, reshape(reduced_energy, out_shape))
+    dk_prod = one(T)
+    for d in sum_dims
+        dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
+    end
 
-    # Fill ks_reduced
+    fill!(E_reduced, zero(T))
+    _accumulate_transect!(E_reduced, coeffs, ms, NU, keep_dims, out_shape)
+    E_reduced .*= dk_prod
+
     empty!(ks_reduced)
     for d in keep_dims
         push!(ks_reduced, ks_phys[d])

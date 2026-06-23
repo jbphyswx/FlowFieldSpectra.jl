@@ -133,4 +133,59 @@ function _calculate_spectrum_spherical_direct!(
     return (0:lmax, -lmax:lmax)
 end
 
+# Inverse Cartesian direct sum: reconstruct fields at the grid points from (ms..., NU) coeffs,
+#   f_u(x_j) = Σ_I coeffs[I, u] · exp(+iflag · i · k_I · x_j),
+# which is the exact inverse of the forward (1/N)-normalized direct sum on a uniform grid.
+function _synthesize_cartesian_direct(coeffs::AbstractArray{Complex{FT}}, coords_vecs::Tuple,
+        ms::NTuple{D, Int}, iflag::Int, domain_size) where {FT, D}
+    N = length(coords_vecs[1])
+    NU = size(coeffs, D + 1)
+    ranges = ntuple(d -> FT(domain_size[d]), D)
+    ks = Grids.physical_wavenumbers(ranges, ms, FT)
+    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
+    @inbounds for j in 1:N
+        for I in CartesianIndices(ms)
+            phi = zero(FT)
+            for d in 1:D
+                phi += ks[d][I[d]] * coords_vecs[d][j]
+            end
+            W = cis(iflag * phi)
+            for u_idx in 1:NU
+                out[u_idx][j] += coeffs[I, u_idx] * W
+            end
+        end
+    end
+    return out
+end
+
+# Inverse spherical direct sum: f_u(θ_j, φ_j) = Σ_{l,m} coeffs[l,m,u] · Y_l^m(θ_j, φ_j).
+function _synthesize_spherical_direct(coeffs::AbstractArray{Complex{FT}}, coords_vecs::Tuple,
+        lmax::Int) where {FT}
+    θ = coords_vecs[1]
+    φ = coords_vecs[2]
+    N = length(θ)
+    NU = size(coeffs, 3)
+    tables = SphericalKernels.legendre_tables(FT, lmax)
+    Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
+    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
+    @inbounds for j in 1:N
+        xj = cos(θ[j])
+        sj = sin(θ[j])
+        φj = φ[j]
+        SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
+        for l in 0:lmax
+            for m in -l:l
+                abs_m = abs(m)
+                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+                Y_lm = factor * Plm[l+1, abs_m+1] * cis(m * φj)
+                idx = sph_mode_index(l, m)
+                for u_idx in 1:NU
+                    out[u_idx][j] += coeffs[idx, u_idx] * Y_lm
+                end
+            end
+        end
+    end
+    return out
+end
+
 end # module DirectSum

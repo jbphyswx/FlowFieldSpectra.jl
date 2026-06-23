@@ -42,7 +42,7 @@ export TransformProblem
 export AbstractSpectralPlan, plan_spectrum
 
 # Export APIs
-export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
+export calculate_spectrum, calculate_spectrum!, synthesize, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
 export spectral_divergence, spectral_vorticity, compensate, band_energy
 export cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 export welch_power_spectrum, coherence_spectrum, lomb_scargle
@@ -198,6 +198,28 @@ function calculate_spectrum(b::AbstractSpectralBackend, g::AbstractGrid, fields_
         "$(nameof(typeof(b))) does not support a $(nameof(typeof(g))). " *
         "FFTBackend/NUFFTBackend require a Cartesian grid; SHTBackend/NUFSHTBackend require a spherical grid.",
     ))
+end
+
+"""
+    synthesize(grid::AbstractGrid, coeffs, ms::Tuple; real_output=true, iflag=1)
+
+Inverse transform: reconstruct field values at the `grid` points from spectral coefficients
+`coeffs` (shape `(ms..., NU)` Cartesian, `(Nθ, Nφ, NU)` spherical) — the inverse of
+[`calculate_spectrum`](@ref). Returns a tuple of `NU` field vectors of length `npoints(grid)`.
+Useful for spectral filtering (zero out modes, then synthesize) and round-trip validation. With
+`real_output=true` the real part is returned (appropriate for real fields). Uses the direct-sum
+inverse, so it works for any grid.
+"""
+function synthesize(g::AbstractCartesianGrid{FT, D}, coeffs::AbstractArray, ms::NTuple{D, Int};
+        real_output::Bool = true, iflag::Int = 1) where {FT, D}
+    out = DirectSum._synthesize_cartesian_direct(coeffs, g.coords, ms, iflag, g.domain_size)
+    return real_output ? map(v -> real.(v), out) : out
+end
+
+function synthesize(g::AbstractSphericalGrid, coeffs::AbstractArray, ms::NTuple{2, Int};
+        real_output::Bool = true)
+    out = DirectSum._synthesize_spherical_direct(coeffs, g.coords, ms[1] - 1)
+    return real_output ? map(v -> real.(v), out) : out
 end
 
 """

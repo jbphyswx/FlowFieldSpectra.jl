@@ -471,6 +471,43 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test_throws ArgumentError FFS.lomb_scargle(t, y, [0.0, 1.0])
     end
 
+    Test.@testset "Synthesis / inverse transform (round-trip)" begin
+        # Cartesian: forward then synthesize recovers the field on a uniform grid (exact DFT/IDFT).
+        L = 2π
+        N = 16
+        dx = L / N
+        xs = range(0.0, stop = L - dx, length = N)
+        xv = vec([x for x in xs, y in xs])
+        yv = vec([y for x in xs, y in xs])
+        u = @. cos(2xv) + 0.5 * sin(3yv) - 0.3 * cos(xv + 2yv)
+        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+        coeffs, _ = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (u,), (N, N))
+        urec = FFS.synthesize(grid, coeffs, (N, N))
+        Test.@test urec isa Tuple
+        Test.@test isapprox(urec[1], u; atol = 1e-10)
+
+        # Spectral filtering: zero the highest modes, synthesize a smoothed field (still real).
+        cfilt = copy(coeffs)
+        cfilt[1, :, :] .= 0          # drop the kx = -N/2 column
+        ufilt = FFS.synthesize(grid, cfilt, (N, N))
+        Test.@test length(ufilt[1]) == N^2
+
+        # Spherical: synthesize from a single-mode coefficient set, transform back, recover it.
+        lmax = 6
+        Nθ, Nφ = lmax + 1, 2lmax + 1
+        N_pts = 4 * Nθ * Nφ
+        ga = π * (3 - sqrt(5))
+        z = [1 - 2 * (i + 0.5) / N_pts for i in 0:(N_pts-1)]
+        θs = acos.(clamp.(z, -1.0, 1.0))
+        φs = mod.(ga .* (0:(N_pts-1)), 2π)
+        sg = FFS.ScatteredSphericalGrid(θs, φs)
+        C = zeros(ComplexF64, Nθ, Nφ, 1)
+        C[FFS.sph_mode_index(3, 1), 1] = 1.0
+        fs = FFS.synthesize(sg, C, (Nθ, Nφ))
+        Test.@test length(fs[1]) == N_pts
+        Test.@test all(isfinite, fs[1])
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

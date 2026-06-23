@@ -5,6 +5,7 @@
 ```@docs
 calculate_spectrum
 calculate_spectrum!
+synthesize
 plan_spectrum
 AbstractSpectralPlan
 sph_mode_index

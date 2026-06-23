@@ -1,6 +1,7 @@
 module DirectSum
 
 using ..Types: DirectSumBackend
+using ..Grids: physical_wavenumbers
 
 export calculate_spectrum_direct, calculate_spectrum_direct!, sph_mode_index
 
@@ -133,20 +134,15 @@ function _calculate_spectrum_cartesian_direct!(
     # 1. Coordinate ranges for physical wavenumbers
     ranges = ntuple(Val(D)) do d
         if domain_size !== nothing
-            return domain_size[d]
+            return FT(domain_size[d])
         else
             min_x, max_x = extrema(coords_vecs[d])
-            return max_x - min_x
+            return FT(max_x - min_x)
         end
     end
 
-    # Generate physical wavenumbers consistent with FFTW/FINUFFT
-    ks_phys = ntuple(
-        d ->
-            range(FT(-ms[d] ÷ 2), stop = FT((ms[d] - 1) ÷ 2), length = ms[d]) .*
-            (FT(2π) / (ranges[d] == 0 ? one(FT) : ranges[d])),
-        Val(D),
-    )
+    # Generate physical wavenumbers consistent with FFTW/FINUFFT (shared definition)
+    ks_phys = physical_wavenumbers(ranges, ms, FT)
 
     # Zero out coeffs (in case of reuse)
     fill!(coeffs, zero(Complex{FT}))

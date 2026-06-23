@@ -3,15 +3,33 @@ module FlowFieldSpectra
 using PrecompileTools: @setup_workload, @compile_workload
 
 include("Types.jl")
+include("Grids.jl")
+include("Preprocessing.jl")
+include("Normalization.jl")
+include("Problem.jl")
 include("DirectSum.jl")
 include("Reductions.jl")
 
 using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
+using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, infer_grid, physical_wavenumbers, spatial_dims, npoints
+using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
+using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, Density, Power, SpectralConvention
+using .Problem: TransformProblem
 using .DirectSum: calculate_spectrum_direct, calculate_spectrum_direct!, sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
 
 # Export Types
 export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
+
+# Export Grids
+export AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid
+export AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
+
+# Export Preprocessing & Normalization (typed configuration)
+export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
+export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
+export AbstractSidedness, OneSided, TwoSided, AbstractScaling, Density, Power, SpectralConvention
+export TransformProblem
 
 # Export APIs
 export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index

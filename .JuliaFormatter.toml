@@ -1,0 +1,5 @@
+style = "sciml"
+margin = 92
+indent = 4
+format_docstrings = true
+trailing_comma = true

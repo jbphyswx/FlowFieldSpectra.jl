@@ -53,8 +53,11 @@ function run_horizontal_spectra_4d_example()
         E[:, b] .= Ek
     end
 
-    # Plot E(k) for every level at the first time step (spectral peak shifts with height).
-    fig = Figure(size = (1100, 480))
+    # Average over time for a clean E(k, z); the dominant horizontal scale migrates with height.
+    Ekz = reshape(E, nbins, nz, nt)
+    Ekz_t = dropdims(sum(Ekz; dims = 3); dims = 3) ./ nt    # E(k, z)
+
+    fig = Figure(size = (1150, 470))
     Label(fig[0, 1:2], "Horizontal Spectra of f(x,y,z,t) on a Fixed Nonuniform Grid",
         fontsize = 18, font = :bold)
 
@@ -62,13 +65,13 @@ function run_horizontal_spectra_4d_example()
         aspect = DataAspect())
     scatter!(ax1, xv, yv; markersize = 3, color = :steelblue)
 
-    ax2 = Axis(fig[1, 2]; title = "E(k) per level (t = 0), one plan reused for all z·t",
-        xlabel = "k", ylabel = "E(k)", yscale = log10)
-    for iz in 1:nz
-        b = iz                       # first time step
-        lines!(ax2, kbins, E[:, b] .+ 1e-20; linewidth = 2, label = "z-level $iz")
-    end
-    axislegend(ax2; position = :rt)
+    # Heatmap E(k) vs height: a bright ridge migrating to higher k shows the peak scale
+    # sharpening with altitude — recovered for every level/time from ONE plan build.
+    ax2 = Axis(fig[1, 2]; title = "log₁₀ E(k, z): peak scale migrates with height",
+        xlabel = "horizontal wavenumber k", ylabel = "z-level")
+    hm = heatmap!(ax2, kbins, 1:nz, log10.(Ekz_t' .+ 1e-12)'; colormap = :viridis)
+    Colorbar(fig[1, 3], hm; label = "log₁₀ E(k)")
+    ax2.yticks = 1:nz
 
     outpath = joinpath(@__DIR__, "horizontal_spectra_4d.png")
     save(outpath, fig)

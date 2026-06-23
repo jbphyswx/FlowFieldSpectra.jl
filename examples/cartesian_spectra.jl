@@ -61,18 +61,24 @@ function run_cartesian_example()
             reshape(v, N, N)[1:4:end, 1:4:end], 
             lengthscale=0.5, arrowcolor=:blue, linecolor=:blue)
     
-    # Panel B: 2D Fourier energy density grid
-    ax2 = Axis(fig[1, 2], title="2D Energy Density log10(|C|^2)", xlabel="k_x", ylabel="k_y", aspect=DataAspect())
+    # Panel B: 2D Fourier energy density grid. The Taylor-Green vortex lives at a handful of
+    # modes; clamp the colour range so they stand out against a clean background.
+    ax2 = Axis(fig[1, 2], title="2D Energy Density log10(|C|²)", xlabel="k_x", ylabel="k_y", aspect=DataAspect())
     energy_2d = log10.(0.5 .* (abs2.(c_fft[:, :, 1]) .+ abs2.(c_fft[:, :, 2])) .+ 1e-15)
     kx_grid = k_fft[1]
     ky_grid = k_fft[2]
-    hm = heatmap!(ax2, kx_grid, ky_grid, energy_2d, colormap=:viridis)
+    emax = maximum(energy_2d)
+    hm = heatmap!(ax2, kx_grid, ky_grid, energy_2d, colormap=:viridis, colorrange=(emax - 8, emax))
     Colorbar(fig[1, 3], hm)
-    
-    # Panel C: 1D Radially integrated spectrum comparison
+
+    # Panel C: 1D radially-integrated spectrum. The uniform FFT is exact (its off-mode tail is at
+    # machine precision); the scattered NUFFT recovers the same peak above a non-uniform-sampling
+    # leakage floor. Clamp the y-range so both — not the 1e-30 FFT tail — are legible.
     ax3 = Axis(fig[2, 1:2], title="1D Isotropic Energy Spectrum", xlabel="k (magnitude)", ylabel="E(k)", yscale=log10)
-    lines!(ax3, k_bins, E_k, label="Uniform Grid (FFT)", color=:red, linewidth=2)
-    scatter!(ax3, k_bins_scat, E_k_scat, label="Scattered Grid (NUFFT)", color=:blue, markersize=8)
+    floor_y = 1e-8
+    lines!(ax3, k_bins, max.(E_k, floor_y), label="Uniform grid (FFT, exact)", color=:black, linewidth=2)
+    scatter!(ax3, k_bins_scat, max.(E_k_scat, floor_y), label="Scattered grid (NUFFT)", color=:crimson, markersize=8)
+    ylims!(ax3, floor_y, 10 * maximum(E_k))
     axislegend(ax3)
     
     # Save Figure

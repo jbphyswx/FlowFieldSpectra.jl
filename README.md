@@ -56,9 +56,9 @@ By default, the package runs slow-path direct sums (DFT/SHT, ``O(N \cdot M)`` co
 Below is a complete example showing how to compute and plot the 1D isotropic energy spectrum of a 2D Cartesian flow field.
 
 ```julia
-using FlowFieldSpectra
-using FFTW        # Unlocks FFTBackend()
-using CairoMakie  # Unlocks plot_spectrum()
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FFTW: FFTW                          # activates the FFTBackend extension
+using CairoMakie: CairoMakie as Mke       # activates the plotting extension
 
 # 1. Define a 2D Cartesian Domain
 L = 10.0
@@ -77,15 +77,15 @@ v = @. sin(2π * 2 * xv / L)
 
 # 3. Build an explicit grid and compute spectral coefficients via FFTW.
 #    The coordinate system is the grid type — there is no coordinate guessing.
-grid = UniformCartesianGrid((xv, yv); domain_size=(L, L))
-coeffs, ks = calculate_spectrum(FFTBackend(), grid, (u, v), (N, N))
+grid = FFS.UniformCartesianGrid((xv, yv); domain_size=(L, L))
+coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
 
 # 4. Reduce 2D Coefficients to a 1D Isotropic (Radial) Spectrum
-k_bins, E_k = isotropic_spectrum(ks, coeffs; num_bins=32)
+k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins=32)
 
 # 5. Visualize the Energy Spectrum
-fig = plot_spectrum(ks, coeffs; title="Radial Energy Spectrum")
-save("energy_spectrum.png", fig)
+fig = FFS.plot_spectrum(ks, coeffs; title="Radial Energy Spectrum")
+Mke.save("energy_spectrum.png", fig)
 ```
 
 Construct the grid that matches your data — `UniformCartesianGrid`, `ScatteredCartesianGrid`

@@ -6,7 +6,9 @@ via spectral differentiation (`ik^α`), gives the spectra of **vorticity**, **di
 `∇·u = 0`) whose vorticity is `ω = 2 sin x sin y`.
 
 ```@example derived
-using FlowFieldSpectra, FFTW, CairoMakie
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FFTW: FFTW                          # activates the FFTBackend extension
+using CairoMakie: CairoMakie as Mke
 
 L = 2π
 N = 32
@@ -17,22 +19,22 @@ yv = vec([y for x in xs, y in xs])
 u = @. sin(xv) * cos(yv)
 v = @. -cos(xv) * sin(yv)
 
-grid = UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = calculate_spectrum(FFTBackend(), grid, (u, v), (N, N))
+grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
 
 # Divergence is ~0 for incompressible flow; vorticity → enstrophy spectrum.
-divc = spectral_divergence(ks, coeffs)
-vortc = spectral_vorticity(ks, coeffs)
+divc = FFS.spectral_divergence(ks, coeffs)
+vortc = FFS.spectral_vorticity(ks, coeffs)
 @assert maximum(abs.(divc)) < 1e-12
 
-k, E = isotropic_spectrum(ks, coeffs; num_bins = 8)   # energy spectrum
-_, Z = isotropic_spectrum(ks, vortc; num_bins = 8)    # enstrophy spectrum
+k, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = 8)   # energy spectrum
+_, Z = FFS.isotropic_spectrum(ks, vortc; num_bins = 8)    # enstrophy spectrum
 
-fig = Figure(size = (640, 420))
-ax = Axis(fig[1, 1]; title = "Energy vs enstrophy spectra (Z = k² E on the active shell)",
+fig = Mke.Figure(size = (640, 420))
+ax = Mke.Axis(fig[1, 1]; title = "Energy vs enstrophy spectra (Z = k² E on the active shell)",
     xlabel = "k", ylabel = "spectral density", yscale = log10)
-scatter!(ax, k, E .+ 1e-20; label = "E(k) energy", markersize = 10)
-scatter!(ax, k, Z .+ 1e-20; label = "Z(k) enstrophy", markersize = 10, marker = :diamond)
-axislegend(ax; position = :rt)
+Mke.scatter!(ax, k, E .+ 1e-20; label = "E(k) energy", markersize = 10)
+Mke.scatter!(ax, k, Z .+ 1e-20; label = "Z(k) enstrophy", markersize = 10, marker = :diamond)
+Mke.axislegend(ax; position = :rt)
 fig
 ```

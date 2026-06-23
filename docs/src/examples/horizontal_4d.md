@@ -7,7 +7,10 @@ batched execution — then the plan is reused across the time loop. This is the 
 per-level / per-time spectra of large geophysical datasets.
 
 ```@example fourd
-using FlowFieldSpectra, FINUFFT, CairoMakie, Random
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FINUFFT: FINUFFT                    # activates the NUFFTBackend extension
+using CairoMakie: CairoMakie as Mke
+using Random: Random
 Random.seed!(42)
 
 L = 2π
@@ -18,7 +21,7 @@ ms = (N, N)
 # Fixed non-uniform horizontal locations.
 xv = rand(N * N) .* L
 yv = rand(N * N) .* L
-hgrid = ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
+hgrid = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
 
 # f(x,y,z,t): dominant horizontal scale sharpens with height z and drifts in time t.
 nb = nz * nt
@@ -30,20 +33,20 @@ for (it, t) in enumerate(range(0, 1; length = nt)), (iz, k0) in enumerate(kz)
 end
 
 # ONE plan build; transform the entire z·t stack in a single exec.
-plan = plan_spectrum(NUFFTBackend(), hgrid, Float64, ms; n_transf = nb, eps = 1e-9)
+plan = FFS.plan_spectrum(FFS.NUFFTBackend(), hgrid, Float64, ms; n_transf = nb, eps = 1e-9)
 coeffs = zeros(ComplexF64, ms..., nb)
-ks = calculate_spectrum!(coeffs, plan, stack)
+ks = FFS.calculate_spectrum!(coeffs, plan, stack)
 
 # E(k) per level at the first time step.
 nbins = 18
-fig = Figure(size = (680, 430))
-ax = Axis(fig[1, 1]; title = "E(k) per z-level (t=0) — one plan reused for all z·t",
+fig = Mke.Figure(size = (680, 430))
+ax = Mke.Axis(fig[1, 1]; title = "E(k) per z-level (t=0) — one plan reused for all z·t",
     xlabel = "k", ylabel = "E(k)", yscale = log10)
 for iz in 1:nz
     slice = reshape(view(coeffs, :, :, iz), ms..., 1)
-    kb, Ek = isotropic_spectrum(ks, slice; num_bins = nbins)
-    lines!(ax, kb, Ek .+ 1e-20; linewidth = 2, label = "z-level $iz")
+    kb, Ek = FFS.isotropic_spectrum(ks, slice; num_bins = nbins)
+    Mke.lines!(ax, kb, Ek .+ 1e-20; linewidth = 2, label = "z-level $iz")
 end
-axislegend(ax; position = :rt)
+Mke.axislegend(ax; position = :rt)
 fig
 ```

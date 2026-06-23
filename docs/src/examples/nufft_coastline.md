@@ -7,7 +7,11 @@ scattered, *masked* point cloud. Here we jitter the sample locations off the gri
 spectrum against the true spectrum from the full uniform grid.
 
 ```@example coast
-using FlowFieldSpectra, FFTW, FINUFFT, CairoMakie, Random
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FFTW: FFTW                          # activates the FFTBackend extension
+using FINUFFT: FINUFFT                    # activates the NUFFTBackend extension
+using CairoMakie: CairoMakie as Mke
+using Random: Random
 Random.seed!(42)
 
 L = 2π
@@ -20,9 +24,9 @@ yv = vec([y for x in xs, y in xs])
 field(x, y) = cos(3x) + 0.6 * sin(5y) + 0.4 * cos(2x + 4y)
 
 # Reference spectrum on the full uniform grid.
-grid = UniformCartesianGrid((xv, yv); domain_size = (L, L))
-c_fft, k_fft = calculate_spectrum(FFTBackend(), grid, (field.(xv, yv),), (N, N))
-k_ref, E_ref = isotropic_spectrum(k_fft, c_fft; num_bins = 24)
+grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+c_fft, k_fft = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (field.(xv, yv),), (N, N))
+k_ref, E_ref = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 24)
 
 # Jitter the points off the grid, then cut out "land".
 xj = clamp.(xv .+ (rand(length(xv)) .- 0.5) .* (0.4dx), 0.0, L)
@@ -33,17 +37,17 @@ xo, yo = xj[ocean], yj[ocean]
 fo = field.(xo, yo)
 
 # NUFFT on the irregular ocean-only cloud.
-ocean_grid = ScatteredCartesianGrid((xo, yo); domain_size = (L, L))
-c_nu, k_nu = calculate_spectrum(NUFFTBackend(), ocean_grid, (fo,), (N, N); eps = 1e-9)
-k_b, E_nu = isotropic_spectrum(k_nu, c_nu; num_bins = 24)
+ocean_grid = FFS.ScatteredCartesianGrid((xo, yo); domain_size = (L, L))
+c_nu, k_nu = FFS.calculate_spectrum(FFS.NUFFTBackend(), ocean_grid, (fo,), (N, N); eps = 1e-9)
+k_b, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 24)
 
-fig = Figure(size = (1100, 460))
-ax1 = Axis(fig[1, 1]; title = "Ocean samples (land cut out)", xlabel = "x", ylabel = "y",
-    aspect = DataAspect())
-scatter!(ax1, xo, yo; color = fo, colormap = :balance, markersize = 4)
-ax2 = Axis(fig[1, 2]; title = "Recovered spectrum", xlabel = "k", ylabel = "E(k)", yscale = log10)
-lines!(ax2, k_ref, E_ref .+ 1e-20; color = :black, linewidth = 2, label = "Full grid (FFT)")
-scatter!(ax2, k_b, E_nu .+ 1e-20; color = :crimson, markersize = 9, label = "Ocean cloud (NUFFT)")
-axislegend(ax2; position = :rt)
+fig = Mke.Figure(size = (1100, 460))
+ax1 = Mke.Axis(fig[1, 1]; title = "Ocean samples (land cut out)", xlabel = "x", ylabel = "y",
+    aspect = Mke.DataAspect())
+Mke.scatter!(ax1, xo, yo; color = fo, colormap = :balance, markersize = 4)
+ax2 = Mke.Axis(fig[1, 2]; title = "Recovered spectrum", xlabel = "k", ylabel = "E(k)", yscale = log10)
+Mke.lines!(ax2, k_ref, E_ref .+ 1e-20; color = :black, linewidth = 2, label = "Full grid (FFT)")
+Mke.scatter!(ax2, k_b, E_nu .+ 1e-20; color = :crimson, markersize = 9, label = "Ocean cloud (NUFFT)")
+Mke.axislegend(ax2; position = :rt)
 fig
 ```

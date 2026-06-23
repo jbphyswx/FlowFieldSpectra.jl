@@ -1,7 +1,7 @@
-using FlowFieldSpectra
-using FINUFFT
-using CairoMakie
-using Random
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FINUFFT: FINUFFT     # loaded to activate the NUFFTBackend extension
+using CairoMakie: CairoMakie as Mke
+using Random: Random
 
 """
     run_horizontal_spectra_4d_example()
@@ -24,7 +24,7 @@ function run_horizontal_spectra_4d_example()
     # Fixed non-uniform horizontal sample locations.
     xv = rand(N * N) .* L
     yv = rand(N * N) .* L
-    hgrid = ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
+    hgrid = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
     npts = length(xv)
 
     # Synthesize f(x,y,z,t): a horizontal wave whose dominant scale sharpens with height z
@@ -38,9 +38,9 @@ function run_horizontal_spectra_4d_example()
     end
 
     # Build the plan ONCE for the fixed points, transform the whole z*t stack in one exec.
-    plan = plan_spectrum(NUFFTBackend(), hgrid, Float64, ms; n_transf = nb, eps = 1e-9)
+    plan = FFS.plan_spectrum(FFS.NUFFTBackend(), hgrid, Float64, ms; n_transf = nb, eps = 1e-9)
     coeffs = zeros(ComplexF64, ms..., nb)
-    ks = calculate_spectrum!(coeffs, plan, stack)
+    ks = FFS.calculate_spectrum!(coeffs, plan, stack)
 
     # Reduce each (z,t) slice to an isotropic spectrum E(k) — gives E(k, z, t).
     nbins = 18
@@ -48,7 +48,7 @@ function run_horizontal_spectra_4d_example()
     kbins = nothing
     for b in 1:nb
         slice = reshape(view(coeffs, :, :, b), ms..., 1)
-        kb, Ek = isotropic_spectrum(ks, slice; num_bins = nbins)
+        kb, Ek = FFS.isotropic_spectrum(ks, slice; num_bins = nbins)
         kbins = kb
         E[:, b] .= Ek
     end
@@ -57,24 +57,24 @@ function run_horizontal_spectra_4d_example()
     Ekz = reshape(E, nbins, nz, nt)
     Ekz_t = dropdims(sum(Ekz; dims = 3); dims = 3) ./ nt    # E(k, z)
 
-    fig = Figure(size = (1150, 470))
-    Label(fig[0, 1:2], "Horizontal Spectra of f(x,y,z,t) on a Fixed Nonuniform Grid",
+    fig = Mke.Figure(size = (1150, 470))
+    Mke.Label(fig[0, 1:2], "Horizontal Spectra of f(x,y,z,t) on a Fixed Nonuniform Grid",
         fontsize = 18, font = :bold)
 
-    ax1 = Axis(fig[1, 1]; title = "Fixed horizontal sample locations", xlabel = "x", ylabel = "y",
-        aspect = DataAspect())
-    scatter!(ax1, xv, yv; markersize = 3, color = :steelblue)
+    ax1 = Mke.Axis(fig[1, 1]; title = "Fixed horizontal sample locations", xlabel = "x", ylabel = "y",
+        aspect = Mke.DataAspect())
+    Mke.scatter!(ax1, xv, yv; markersize = 3, color = :steelblue)
 
     # Heatmap E(k) vs height: a bright ridge migrating to higher k shows the peak scale
     # sharpening with altitude — recovered for every level/time from ONE plan build.
-    ax2 = Axis(fig[1, 2]; title = "log₁₀ E(k, z): peak scale migrates with height",
+    ax2 = Mke.Axis(fig[1, 2]; title = "log₁₀ E(k, z): peak scale migrates with height",
         xlabel = "horizontal wavenumber k", ylabel = "z-level")
-    hm = heatmap!(ax2, kbins, 1:nz, log10.(Ekz_t' .+ 1e-12)'; colormap = :viridis)
-    Colorbar(fig[1, 3], hm; label = "log₁₀ E(k)")
+    hm = Mke.heatmap!(ax2, kbins, 1:nz, log10.(Ekz_t' .+ 1e-12)'; colormap = :viridis)
+    Mke.Colorbar(fig[1, 3], hm; label = "log₁₀ E(k)")
     ax2.yticks = 1:nz
 
     outpath = joinpath(@__DIR__, "horizontal_spectra_4d.png")
-    save(outpath, fig)
+    Mke.save(outpath, fig)
     println("Transformed $(nb) (z,t) slices with ONE plan build. Saved figure: ", outpath)
     println("Example run successfully!")
     return fig

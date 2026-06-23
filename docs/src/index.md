@@ -30,9 +30,9 @@ construct an explicit **grid** (the coordinate system is the grid type — there
 and pass it to `calculate_spectrum`.
 
 ```@example quickstart
-using FlowFieldSpectra
-using FFTW        # load FFTW to unlock FFTBackend()
-using CairoMakie  # load CairoMakie to unlock plot_spectrum()
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FFTW: FFTW              # activates the FFTBackend extension
+using CairoMakie: CairoMakie  # activates the plotting extension
 
 # 1. Coordinate lists on a uniform grid
 L = 2π
@@ -47,12 +47,12 @@ u = @. cos(2 * xv) + 0.5 * sin(5 * yv)
 v = @. sin(2 * xv)
 
 # 3. Build the grid and compute Fourier coefficients (FFTBackend needs FFTW)
-grid = UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = calculate_spectrum(FFTBackend(), grid, (u, v), (N, N))
+grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
 
 # 4. Radially integrate to a 1D isotropic energy spectrum
-k_bins, E_k = isotropic_spectrum(ks, coeffs; num_bins = 16)
+k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 16)
 
 # 5. Plot
-plot_spectrum(ks, coeffs; title = "Flow Field Energy Spectrum")
+FFS.plot_spectrum(ks, coeffs; title = "Flow Field Energy Spectrum")
 ```

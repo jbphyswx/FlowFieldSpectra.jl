@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Cartesian (FFT) · FlowFieldSpectra.jl</title><meta name="title" content="Cartesian (FFT) · FlowFieldSpectra.jl"/><meta property="og:title" content="Cartesian (FFT) · FlowFieldSpectra.jl"/><meta property="twitter:title" content="Cartesian (FFT) · FlowFieldSpectra.jl"/><meta name="description" content="Documentation for FlowFieldSpectra.jl."/><meta property="og:description" content="Documentation for FlowFieldSpectra.jl."/><meta property="twitter:description" content="Documentation for FlowFieldSpectra.jl."/><meta property="og:url" content="https://jbphyswx.github.io/FlowFieldSpectra.jl/examples/cartesian/"/><meta property="twitter:url" content="https://jbphyswx.github.io/FlowFieldSpectra.jl/examples/cartesian/"/><link rel="canonical" href="https://jbphyswx.github.io/FlowFieldSpectra.jl/examples/cartesian/"/><script data-outdated-warner src="../../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="../.."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../../assets/documenter.js"></script><script src="../../search_index.js"></script><script src="../../siteinfo.js"></script><script src="../../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../../">FlowFieldSpectra.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../../">Home</a></li><li><a class="tocitem" href="../../backends/">Backends &amp; Extensions</a></li><li><span class="tocitem">Examples</span><ul><li class="is-active"><a class="tocitem" href>Cartesian (FFT)</a><ul class="internal"><li><a class="tocitem" href="#Isotropic-(radial)-energy-spectrum"><span>Isotropic (radial) energy spectrum</span></a></li><li><a class="tocitem" href="#Transect-spectrum"><span>Transect spectrum</span></a></li><li><a class="tocitem" href="#Anisotropy-resolved-spectrum-E(k,-θ)"><span>Anisotropy-resolved spectrum <code>E(k, θ)</code></span></a></li><li><a class="tocitem" href="#Compensated-and-band-integrated-spectra"><span>Compensated &amp; band-integrated spectra</span></a></li><li><a class="tocitem" href="#Synthesis-and-spectral-filtering"><span>Synthesis &amp; spectral filtering</span></a></li></ul></li><li><a class="tocitem" href="../nufft_coastline/">NUFFT &amp; coastline cutout</a></li><li><a class="tocitem" href="../horizontal_4d/">4D fixed-grid spectra</a></li><li><a class="tocitem" href="../derived_quantities/">Derived quantities</a></li><li><a class="tocitem" href="../cross_spectra/">Cross-spectra &amp; coherence</a></li><li><a class="tocitem" href="../komega/">Wavenumber–frequency E(k,ω)</a></li><li><a class="tocitem" href="../estimation/">Irregular &amp; windowed</a></li><li><a class="tocitem" href="../spherical/">Spherical harmonics</a></li></ul></li><li><a class="tocitem" href="../../api/">API Reference</a></li><li><a class="tocitem" href="../../internals/">Internals</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li><a class="is-disabled">Examples</a></li><li class="is-active"><a href>Cartesian (FFT)</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Cartesian (FFT)</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/jbphyswx/FlowFieldSpectra.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/jbphyswx/FlowFieldSpectra.jl/blob/main/docs/src/examples/cartesian.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Cartesian-spectra-(FFT)"><a class="docs-heading-anchor" href="#Cartesian-spectra-(FFT)">Cartesian spectra (FFT)</a><a id="Cartesian-spectra-(FFT)-1"></a><a class="docs-heading-anchor-permalink" href="#Cartesian-spectra-(FFT)" title="Permalink"></a></h1><p>A synthetic <strong>incompressible turbulent</strong> field with a Kolmogorov <code>k⁻⁵ᐟ³</code> energy cascade, its 2D energy-density map, and the various 1D reductions. The figures below are produced live when the documentation is built.</p><pre><code class="language-julia hljs">using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FFTW: FFTW                          # activates the FFTBackend extension
+using CairoMakie: CairoMakie as Mke
+import Random
+
+L = 2π
+N = 64
+dx = L / N
+xs = range(0.0, stop = L - dx, length = N)
+xv = vec([x for x in xs, y in xs])
+yv = vec([y for x in xs, y in xs])
+
+# Synthetic turbulence: a broadband streamfunction ψ, then u = ∂ψ/∂y, v = -∂ψ/∂x (spectral
+# derivatives), so the velocity is incompressible with an E(k) ∝ k⁻⁵ᐟ³ cascade.
+Random.seed!(1)
+freq = [0:(N ÷ 2 - 1); -(N ÷ 2):-1] .* (2π / L)        # FFTW-order wavenumbers
+ψ̂ = FFTW.fft(randn(N, N))
+for j in 1:N, i in 1:N
+    k = hypot(freq[i], freq[j])
+    ψ̂[i, j] *= k == 0 ? 0.0 : k^(-(11 / 3 + 1) / 2)
+end
+u = vec(real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N])))
+v = vec(real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N])))
+
+grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))</code></pre><h2 id="Isotropic-(radial)-energy-spectrum"><a class="docs-heading-anchor" href="#Isotropic-(radial)-energy-spectrum">Isotropic (radial) energy spectrum</a><a id="Isotropic-(radial)-energy-spectrum-1"></a><a class="docs-heading-anchor-permalink" href="#Isotropic-(radial)-energy-spectrum" title="Permalink"></a></h2><pre><code class="language-julia hljs">k_bins_iso, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 32)
+rng = 2:findlast(&lt;=(0.6 * maximum(k_bins_iso)), k_bins_iso)   # resolved inertial range
+
+fig = Mke.Figure(size = (660, 440))
+ax = Mke.Axis(fig[1, 1]; title = &quot;Isotropic energy spectrum&quot;, xlabel = &quot;k&quot;, ylabel = &quot;E(k)&quot;,
+    xscale = log10, yscale = log10)
+Mke.lines!(ax, k_bins_iso[rng], E_k[rng]; linewidth = 3, label = &quot;E(k)&quot;)
+mid = rng[length(rng) ÷ 2]
+Mke.lines!(ax, k_bins_iso[rng], E_k[mid] .* (k_bins_iso[rng] ./ k_bins_iso[mid]) .^ (-5 / 3);
+    color = :red, linestyle = :dash, label = &quot;k⁻⁵ᐟ³ (Kolmogorov)&quot;)
+Mke.axislegend(ax; position = :lb)
+fig</code></pre><img src="32f6acd1.png" alt="Example block output"/><h2 id="Transect-spectrum"><a class="docs-heading-anchor" href="#Transect-spectrum">Transect spectrum</a><a id="Transect-spectrum-1"></a><a class="docs-heading-anchor-permalink" href="#Transect-spectrum" title="Permalink"></a></h2><p>Integrate out the second axis to get the 1D (zonal) spectrum along the first. Unlike the isotropic spectrum, this keeps the <em>signed</em> <code>kₓ</code> axis:</p><pre><code class="language-julia hljs">k_red, E_red = FFS.transect_spectrum(ks, coeffs, (2,))
+
+fig = Mke.Figure(size = (660, 420))
+ax = Mke.Axis(fig[1, 1]; title = &quot;Transect spectrum (integrated over kᵧ)&quot;, xlabel = &quot;kₓ&quot;,
+    ylabel = &quot;E(kₓ)&quot;, yscale = log10)
+Mke.lines!(ax, k_red[1], E_red .+ 1e-20; linewidth = 2)
+fig</code></pre><img src="56d78afc.png" alt="Example block output"/><h2 id="Anisotropy-resolved-spectrum-E(k,-θ)"><a class="docs-heading-anchor" href="#Anisotropy-resolved-spectrum-E(k,-θ)">Anisotropy-resolved spectrum <code>E(k, θ)</code></a><a id="Anisotropy-resolved-spectrum-E(k,-θ)-1"></a><a class="docs-heading-anchor-permalink" href="#Anisotropy-resolved-spectrum-E(k,-θ)" title="Permalink"></a></h2><p><code>isotropic_spectrum</code> averages over direction; <code>anisotropic_spectrum</code> resolves it. We build a <em>directionally biased</em> broadband field (energy stretched toward one axis) so the preferred orientation shows up as a band in the <code>(k, θ)</code> plane.</p><pre><code class="language-julia hljs">ĝ = FFTW.fft(randn(N, N))
+for j in 1:N, i in 1:N
+    kk = hypot(3.5 * freq[i], freq[j] / 3.5)           # anisotropic weighting
+    ĝ[i, j] *= kk == 0 ? 0.0 : kk^(-(0.6 + 1) / 2)
+end
+g = vec(real(FFTW.ifft(ĝ)))
+cg, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (g,), (N, N))
+k_bins, θ_bins, Ekθ = FFS.anisotropic_spectrum(ks, cg; num_k_bins = 24, num_θ_bins = 28)
+
+fig = Mke.Figure(size = (680, 460))
+ax = Mke.Axis(fig[1, 1]; title = &quot;E(k, θ)&quot;, xlabel = &quot;k&quot;, ylabel = &quot;θ [rad]&quot;)
+hm = Mke.heatmap!(ax, k_bins, θ_bins, Ekθ; colormap = :viridis)
+Mke.Colorbar(fig[1, 2], hm)
+fig</code></pre><img src="7ec2b5c1.png" alt="Example block output"/><h2 id="Compensated-and-band-integrated-spectra"><a class="docs-heading-anchor" href="#Compensated-and-band-integrated-spectra">Compensated &amp; band-integrated spectra</a><a id="Compensated-and-band-integrated-spectra-1"></a><a class="docs-heading-anchor-permalink" href="#Compensated-and-band-integrated-spectra" title="Permalink"></a></h2><p><code>compensate(k, E, p)</code> forms <code>kᵖ E(k)</code>; the <code>k⁵ᐟ³</code> compensation flattens a Kolmogorov inertial range into a plateau, making the cascade easy to verify. <code>band_energy</code> integrates <code>E(k)</code> over a band.</p><pre><code class="language-julia hljs">E_comp = FFS.compensate(k_bins_iso, E_k, 5 / 3)
+band = FFS.band_energy(k_bins_iso, E_k, 1.0, 8.0)
+@show band
+
+fig = Mke.Figure(size = (660, 420))
+ax = Mke.Axis(fig[1, 1]; title = &quot;Compensated spectrum k⁵ᐟ³ E(k) — flat over the cascade&quot;,
+    xlabel = &quot;k&quot;, ylabel = &quot;k⁵ᐟ³ E(k)&quot;, xscale = log10)
+Mke.lines!(ax, k_bins_iso[rng], E_comp[rng]; linewidth = 3)
+fig</code></pre><img src="7ca65ae4.png" alt="Example block output"/><h2 id="Synthesis-and-spectral-filtering"><a class="docs-heading-anchor" href="#Synthesis-and-spectral-filtering">Synthesis &amp; spectral filtering</a><a id="Synthesis-and-spectral-filtering-1"></a><a class="docs-heading-anchor-permalink" href="#Synthesis-and-spectral-filtering" title="Permalink"></a></h2><p><code>synthesize</code> is the inverse transform. Zeroing the high-wavenumber coefficients and synthesizing back gives a low-pass-filtered field — an exact round-trip on a uniform grid.</p><pre><code class="language-julia hljs"># Low-pass: keep only |k| ≲ 4 by masking the shifted coefficient grid.
+kx, ky = ks
+mask = [sqrt(kx[i]^2 + ky[j]^2) &lt;= 4.0 for i in 1:N, j in 1:N]
+cfilt = copy(coeffs)
+for c in axes(cfilt, 3)
+    @views cfilt[:, :, c] .*= mask
+end
+u_lp = FFS.synthesize(grid, cfilt, (N, N))[1]
+
+fig = Mke.Figure(size = (860, 380))
+ax1 = Mke.Axis(fig[1, 1]; title = &quot;u (original turbulent field)&quot;, aspect = 1)
+ax2 = Mke.Axis(fig[1, 2]; title = &quot;u (low-pass, |k| ≤ 4)&quot;, aspect = 1)
+Mke.heatmap!(ax1, xs, xs, reshape(u, N, N); colormap = :balance)
+Mke.heatmap!(ax2, xs, xs, reshape(real.(u_lp), N, N); colormap = :balance)
+fig</code></pre><img src="5c1f6413.png" alt="Example block output"/></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../../backends/">« Backends &amp; Extensions</a><a class="docs-footer-nextpage" href="../nufft_coastline/">NUFFT &amp; coastline cutout »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.17.0 on <span class="colophon-date" title="Tuesday 23 June 2026 19:27">Tuesday 23 June 2026</span>. Using Julia version 1.12.6.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>

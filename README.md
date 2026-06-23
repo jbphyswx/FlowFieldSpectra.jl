@@ -13,16 +13,28 @@ Instead of writing custom FFT grid shifting, scaling, non-uniform coordinate map
 
 ## Core Features
 
-- **Unified Interface**: Use `calculate_spectrum` for any combination of coordinates, grid types, and dimensions.
-- **Cartesian & Spherical**: 
-  - Cartesian: 1D, 2D, 3D, and arbitrary ND transforms.
-  - Spherical: Spherical Harmonic Transforms (SHT) on the sphere.
-- **Structured & Scattered Grids**: 
-  - Uniform/rectilinear grids.
-  - Non-uniform, scattered, or random coordinate point clouds.
-- **Zero-Dependency Baseline**: Works out-of-the-box using naive direct-sum methods (`DirectSumBackend`) without compiling heavy C/C++ libraries.
-- **Fast Path via Extensions**: Simply import your favorite backend package (`FFTW`, `FINUFFT`, `FastSphericalHarmonics`, `NUFSHT`) to automatically activate highly optimized, parallelized fast algorithms.
-- **Reductions & Plotting**: Built-in methods for isotropic/radial spectrum binning, transects/slices, spherical degree spectra, and visualizations.
+- **Unified, grid-typed interface**: one `calculate_spectrum` (and allocation-free `calculate_spectrum!`)
+  for any combination of coordinates, grid types, and dimensions — the grid type *is* the coordinate
+  system, so dispatch is exact with no coordinate guessing.
+- **Cartesian & spherical**: Cartesian 1D / 2D / 3D / ND transforms; Spherical Harmonic Transforms on
+  the sphere. Works for any number of field components (scalar, or 1-/2-/3-component vector flows).
+- **Structured & scattered grids**: uniform/rectilinear grids, and non-uniform / scattered / random
+  point clouds (e.g. masked by a coastline) — recovered correctly via non-uniform transforms.
+- **Zero-dependency baseline**: works out-of-the-box via direct-sum (`DirectSumBackend`) with no heavy
+  C/C++ libraries; load `FFTW` / `FINUFFT` / `FastSphericalHarmonics` / `NUFSHT` to activate the fast
+  `O(N log N)` paths, plus `OhMyThreads` (threaded) and `KernelAbstractions` (GPU).
+- **Reductions**: isotropic/radial binning, transects/slices, anisotropy-resolved `E(k, θ)`,
+  wavenumber–frequency `E(k, ω)`, spherical degree spectra, compensated `kᵖE(k)` and band-integrated energy.
+- **Cross-analysis**: cross-/co-/quadrature spectra (flux by scale, e.g. `⟨u'w'⟩`), magnitude-squared
+  coherence and phase, Welch and multitaper (DPSS) variance reduction.
+- **Derived-quantity spectra**: vorticity, divergence, and enstrophy spectra via spectral differentiation
+  (`Z(k) = k²E(k)` holds on incompressible 2D fields).
+- **Irregular sampling**: Lomb–Scargle periodogram for unevenly-sampled series (moorings, drifters, tracks).
+- **Synthesis & filtering**: first-class inverse transform for spectral filtering and round-trip validation.
+- **Performance**: reusable FFTW/FINUFFT plans with batched trailing axes (build once, reuse across
+  z/t/components), transparent real-input `rfft` fast path, cached spherical Legendre tables, and `Float32`
+  support end-to-end.
+- **Plotting**: `CairoMakie` extension for spectra and backend-comparison figures.
 
 ---
 
@@ -95,42 +107,96 @@ build a plan once with `plan_spectrum` and reuse it via `calculate_spectrum!`.
 
 ---
 
-## Example Figures
+## Gallery
 
-### Cartesian 2D Flow Field Spectral Analysis
+A quick visual tour of what the package does. Each figure is generated reproducibly by
+[`docs/generate_assets/generate_assets.jl`](docs/generate_assets/generate_assets.jl), and every
+capability has a runnable, rendered [example in the docs](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/).
+
+### Cartesian spectra (FFT)
 
 ![Cartesian Spectra](docs/src/assets/cartesian_spectra.png)
 
-*Taylor-Green vortex: velocity vectors (top-left), 2D spectral energy density (top-right), and 1D isotropic vs transect spectra (bottom).*
+*A synthetic turbulent flow, its 2D spectral energy density, and the isotropic `E(k)` — which follows the canonical Kolmogorov `k⁻⁵ᐟ³` cascade.*
 
-### Spherical Harmonic Degree Spectrum
+### Scattered points & coastline cutout (NUFFT)
+
+![NUFFT coastline](docs/src/assets/nufft_coastline.png)
+
+*A field sampled only at jittered "ocean" points (land masked out) is transformed with FINUFFT; the recovered spectrum tracks the full-grid reference.*
+
+### Anisotropy-resolved spectrum `E(k, θ)`
+
+![Anisotropy](docs/src/assets/anisotropy.png)
+
+*A directionally biased field (elongated structures, left) concentrates its energy at a preferred angle, resolved by `E(k, θ)` (right).*
+
+### Cross-spectra, coherence & phase
+
+![Cross-spectra & coherence](docs/src/assets/cross_coherence.png)
+
+*Welch-averaged power, plus magnitude-squared coherence and the recovered phase between two fields — the basis for flux-by-scale (e.g. `⟨u'w'⟩`).*
+
+### Derived-quantity spectra (energy vs enstrophy)
+
+![Derived quantities](docs/src/assets/derived_quantities.png)
+
+*Energy `E(k) ∝ k⁻⁵ᐟ³` and enstrophy `Z(k) ∝ k⁺¹ᐟ³` via spectral differentiation; the `Z(k) = k²E(k)` identity holds exactly on an incompressible field.*
+
+### Wavenumber–frequency spectrum `E(k, ω)`
+
+![k-omega](docs/src/assets/komega.png)
+
+*Time as a spectral axis: a propagating wave sits on the `ω = k` dispersion line, separating waves from a slower background.*
+
+### Irregular sampling & windowed estimation
+
+![Irregular & windowed](docs/src/assets/irregular_estimation.png)
+
+*Lomb–Scargle recovers a tone from unevenly-sampled data (left); multitaper (DPSS) averaging cuts the variance of a short record's spectrum (right).*
+
+### Spherical harmonic degree spectrum
 
 ![Spherical Spectra](docs/src/assets/spherical_spectra.png)
 
-*Left: scalar field on a Clenshaw-Curtis grid. Right: energy per spherical harmonic degree ℓ.*
+*Scalar field on a Clenshaw–Curtis grid (left) and its energy per spherical-harmonic degree ℓ (right). Scattered nodes use the NUFSHT backend.*
 
-### Backend Parity (DirectSum vs FFTW)
+### Backend parity (validation)
 
 ![Backend Parity](docs/src/assets/backend_parity.png)
 
-*Coefficient magnitude comparison between DirectSum and FFT backends; difference is at machine-precision levels.*
+*DirectSum vs FFTW coefficients agree to machine precision — every fast backend is checked against the direct-sum reference.*
 
 ---
 
 ## Core API Reference
 
-### Spectral Calculation
-- `calculate_spectrum(backend, coords, fields, ms; kwargs...)`: Computes complex coefficients and physical wavenumber grids.
+See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/) for the full surface.
+
+### Spectral calculation
+- `calculate_spectrum(backend, grid, fields, ms; kwargs...)`: complex coefficients + physical wavenumber grids.
+- `calculate_spectrum!(coeffs, plan, fields)` / `plan_spectrum(backend, grid, T, ms; n_transf)`: reusable plans with batched trailing axes for allocation-free repeated transforms.
+- `synthesize(grid, coeffs, ms)`: inverse transform (spectral filtering, round-trip).
 
 ### Reductions
-- `isotropic_spectrum(ks, coeffs; num_bins)`: Integrate ND coefficients radially to get a 1D energy density spectrum.
-- `transect_spectrum(ks, coeffs, dims)`: Integrate out specific dimensions (e.g. summing along y to get a zonal spectrum).
-- `spherical_energy_spectrum(coeffs; lmax)`: Get the energy per spherical degree ``l``.
+- `isotropic_spectrum(ks, coeffs; num_bins)`: radial integration to a 1D energy-density spectrum.
+- `transect_spectrum(ks, coeffs, dims)`: integrate out specific dimensions (e.g. a zonal spectrum).
+- `anisotropic_spectrum(ks, coeffs; num_k_bins, num_θ_bins)`: anisotropy-resolved `E(k, θ)`.
+- `spherical_energy_spectrum(coeffs; lmax)`: energy per spherical degree `ℓ`.
+- `compensate(k, E, p)` / `band_energy(k, E, k1, k2)`: `kᵖE(k)` and band-integrated energy.
+
+### Cross-analysis & estimation
+- `cross_spectrum` / `cospectrum` / `quadspectrum`: scale-by-scale covariance (flux by scale).
+- `coherence_spectrum`, `welch_power_spectrum`, `dpss`: coherence/phase and variance reduction (Welch, multitaper).
+- `lomb_scargle(t, y, freqs)`: periodogram for irregularly-sampled series.
+
+### Derived quantities
+- `spectral_vorticity(ks, coeffs)` / `spectral_divergence(ks, coeffs)`: spectral-differentiation operators.
 
 ### Plotting (with `CairoMakie`)
-- `plot_spectrum(ks, coeffs; title)`: Plot 1D/2D Cartesian or spherical energy spectra.
-- `compare_spectra(spectra_list; labels)`: Compare multiple 1D spectra on the same axes.
-- `compare_spectral_analysis(true_coeffs, approx_coeffs)`: Plot spectral errors and coefficient deviations.
+- `plot_spectrum(ks, coeffs; title)`: plot 1D/2D Cartesian or spherical energy spectra.
+- `compare_spectra(spectra_list; labels)`: overlay multiple 1D spectra.
+- `compare_spectral_analysis(true_coeffs, approx_coeffs)`: spectral errors and coefficient deviations.
 
 
 ### References

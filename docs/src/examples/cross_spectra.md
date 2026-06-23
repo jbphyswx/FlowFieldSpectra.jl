@@ -34,3 +34,53 @@ fig
 
 The co-spectrum peaks at the shared scale (`k ≈ 2`) and is near zero where the two fields have
 independent structure.
+
+## Welch averaging, coherence & phase
+
+A single realization gives a noisy estimate and no meaningful coherence. Averaging over an
+ensemble of realizations (the trailing axis of the coefficient array) reduces variance and lets us
+estimate the **magnitude-squared coherence** `γ²(k) ∈ [0, 1]` and the **phase** between the two
+fields.
+
+To recover a meaningful phase we use **complex (rotary) signals** — e.g. a horizontal velocity
+`u + iv`. A complex field has spectral content at `+k` only, so the cross-spectrum phase survives
+the radial binning; for a pair of *real* fields the `±k` modes are complex conjugates and the binned
+phase cancels to zero. Each realization here shares a rotating mode at `k ≈ 2` with a fixed phase
+lead `ϕ`, plus independent structure elsewhere.
+
+```@example cross
+import Random
+Random.seed!(1)
+
+nreal = 32
+ϕ = 0.7                                        # fixed phase lead of g over f at the shared mode
+Cf = zeros(ComplexF64, N, N, nreal)
+Cg = zeros(ComplexF64, N, N, nreal)
+for r in 1:nreal
+    a = 1.0 + 0.1 * randn()                    # shared-mode amplitude jitter
+    fr = @. a * exp(im * 2 * xv) + 0.5 * exp(im * (5 * xv) + im * 2π * rand())
+    gr = @. a * exp(im * (2 * xv - ϕ)) + 0.5 * exp(im * (7 * yv) + im * 2π * rand())
+    cfr, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (fr,), (N, N))
+    cgr, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (gr,), (N, N))
+    Cf[:, :, r] .= cfr[:, :, 1]
+    Cg[:, :, r] .= cgr[:, :, 1]
+end
+
+kw, Ef = FFS.welch_power_spectrum(ks, Cf; num_bins = 24)
+kc, γ², phase = FFS.coherence_spectrum(ks, Cf, Cg; num_bins = 24)
+# Phase is only meaningful where coherence is appreciable; mask the rest.
+phase_plot = [γ²[i] > 0.3 ? phase[i] / π : NaN for i in eachindex(phase)]
+
+fig = Mke.Figure(size = (820, 360))
+ax1 = Mke.Axis(fig[1, 1]; title = "Welch power E(k)", xlabel = "k", ylabel = "E(k)", yscale = log10)
+Mke.lines!(ax1, kw, Ef .+ 1e-20; linewidth = 2)
+ax2 = Mke.Axis(fig[1, 2]; title = "Coherence² (—) & phase/π (●)", xlabel = "k", ylabel = "γ², phase/π")
+Mke.lines!(ax2, kc, γ²; linewidth = 2)
+Mke.scatter!(ax2, kc, phase_plot; color = :orange)
+Mke.hlines!(ax2, [ϕ / π]; color = :gray, linestyle = :dash)
+fig
+```
+
+Coherence is high only at the shared scale `k ≈ 2`, where the recovered phase matches the imposed
+lead `ϕ` (dashed line); elsewhere the independent structure drives coherence toward zero (and the
+phase, masked here, is meaningless).

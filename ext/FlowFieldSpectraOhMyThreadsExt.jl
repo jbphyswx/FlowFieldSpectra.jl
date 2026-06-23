@@ -4,68 +4,40 @@ using OhMyThreads: OhMyThreads as OMT
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 # =============================================================================
-# Threaded DirectSum Dispatch
+# Threaded entry points — coordinate system is fixed by the caller (grid type
+# dispatch happens in core), so there is no coordinate heuristic here.
 # =============================================================================
 
-function FFS._calculate_spectrum_threaded(
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...
-)
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    FT = eltype(coords_vecs[1])
-
-    # Determine coordinate type (Spherical or Cartesian)
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical
-        lmax = ms[1] - 1
-        Nθ = lmax + 1
-        Nφ = 2 * lmax + 1
-        coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
-        ks = FFS._calculate_spectrum_threaded!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
-        return (coeffs, ks)
-    else
-        # Cartesian
-        coeffs = zeros(Complex{FT}, ms..., NU)
-        ks = FFS._calculate_spectrum_threaded!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
-        return (coeffs, ks)
-    end
-end
-
-function FFS._calculate_spectrum_threaded!(
+function FFS._calculate_spectrum_threaded_cartesian!(
     coeffs::AbstractArray{Complex{FT}},
     coords_vecs::Tuple,
     fields_vecs::Tuple,
-    ms::Tuple;
-    iflag::Int = 1,
-    domain_size::Union{Nothing, Tuple} = nothing,
-    weights::Union{Nothing, AbstractVector} = nothing,
+    ms::Tuple,
+    iflag::Int,
+    domain_size,
 ) where {FT}
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
     N = length(coords_vecs[1])
-
-    for d in 1:D
+    for d in 1:length(coords_vecs)
         length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
     end
-    for u_idx in 1:NU
+    for u_idx in 1:length(fields_vecs)
         length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
+    return _calculate_spectrum_cartesian_threaded!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
+end
 
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical coordinate path
-        lmax = ms[1] - 1
-        return _calculate_spectrum_spherical_threaded!(coeffs, coords_vecs, fields_vecs, lmax, weights)
-    else
-        # Cartesian coordinate path
-        return _calculate_spectrum_cartesian_threaded!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
+function FFS._calculate_spectrum_threaded_spherical!(
+    coeffs::AbstractArray{Complex{FT}},
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    lmax::Int,
+    weights,
+) where {FT}
+    N = length(coords_vecs[1])
+    for u_idx in 1:length(fields_vecs)
+        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
+    return _calculate_spectrum_spherical_threaded!(coeffs, coords_vecs, fields_vecs, lmax, weights)
 end
 
 # =============================================================================
@@ -127,7 +99,8 @@ function _calculate_spectrum_cartesian_threaded!(
 end
 
 # =============================================================================
-# Threaded Spherical Direct Sum
+# Threaded Spherical Direct Sum — parallelize over point chunks with per-task
+# accumulators (O(nthreads) buffers, not O(N)) and the shared Legendre table.
 # =============================================================================
 
 function _calculate_spectrum_spherical_threaded!(
@@ -149,82 +122,46 @@ function _calculate_spectrum_spherical_threaded!(
     φ = coords_vecs[2]
     w = weights === nothing ? fill(FT(4π) / N, N) : weights
 
-    # Zero out coeffs
     fill!(coeffs, zero(Complex{FT}))
+    N == 0 && return (0:lmax, -lmax:lmax)
 
-    # Use tmapreduce for race-condition-free accumulation
-    partial_coeffs = OMT.tmapreduce(
-        j -> _compute_point_contribution_threaded(j, θ, φ, fields_vecs, w, lmax, Nθ, Nφ, NU, FT),
-        (a, b) -> begin
-            a[1] .+= b[1]
-            a
-        end,
-        1:N,
-        init = (zeros(Complex{FT}, Nθ, Nφ, NU),)
-    )
+    tables = FFS.SphericalKernels.legendre_tables(FT, lmax)
 
-    copyto!(coeffs, partial_coeffs[1])
+    # Contiguous point chunks, one parallel task each.
+    nt = max(1, min(Threads.nthreads(), N))
+    chunks = [(div((c - 1) * N, nt) + 1):(div(c * N, nt)) for c in 1:nt]
 
-    return (0:lmax, -lmax:lmax)
-end
-
-@inline function _compute_point_contribution_threaded(
-    j, θ, φ, fields_vecs, w, lmax, Nθ, Nφ, NU, FT
-)
-    θj = θ[j]
-    φj = φ[j]
-    wj = w[j]
-
-    xj = cos(θj)
-    sj = sin(θj)
-
-    local_coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
-
-    @inbounds for l in 0:lmax
-        for m in -l:l
-            abs_m = abs(m)
-            P_l_m = _normalized_legendre_threaded(l, abs_m, xj, sj)
-
-            factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-            phase = cis(m * φj)
-            Y_lm = factor * P_l_m * phase
-
-            idx = FFS.sph_mode_index(l, m)
-            fj_conj_Ylm_wj = conj(Y_lm) * wj
-            for u_idx in 1:NU
-                local_coeffs[idx, u_idx] += fields_vecs[u_idx][j] * fj_conj_Ylm_wj
+    accs = OMT.tmap(chunks) do chunk
+        acc = zeros(Complex{FT}, Nθ, Nφ, NU)
+        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
+        @inbounds for j in chunk
+            xj = cos(θ[j])
+            sj = sin(θ[j])
+            φj = φ[j]
+            wj = w[j]
+            FFS.SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
+            for l in 0:lmax
+                for m in -l:l
+                    abs_m = abs(m)
+                    P_l_m = Plm[l+1, abs_m+1]
+                    factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+                    Y_lm = factor * P_l_m * cis(m * φj)
+                    idx = FFS.sph_mode_index(l, m)
+                    g = conj(Y_lm) * wj
+                    for u_idx in 1:NU
+                        acc[idx, u_idx] += fields_vecs[u_idx][j] * g
+                    end
+                end
             end
         end
+        return acc
     end
 
-    return (local_coeffs,)
-end
-
-@inline function _normalized_legendre_threaded(l::Int, m::Int, x::FT, s::FT)::FT where FT
-    m > l && return zero(FT)
-
-    # Sectoral recurrence
-    P_mm = one(FT) / sqrt(FT(4π))
-    @inbounds for mm in 1:m
-        P_mm *= -sqrt(FT(2mm + 1) / (2mm)) * s
+    @inbounds for acc in accs
+        coeffs .+= acc
     end
 
-    l == m && return P_mm
-
-    # P_{m+1}^m using first-step recurrence
-    P_lm = x * sqrt(FT(2m + 3)) * P_mm
-    P_lminus1_m = P_mm
-
-    l == m + 1 && return P_lm
-
-    # Standard recurrence for higher l
-    @inbounds for ll in (m+2):l
-        coeff1 = sqrt(FT(4ll^2 - 1) / (ll^2 - m^2))
-        coeff2 = sqrt(FT(2ll + 1) * ((ll - 1)^2 - m^2) / ((2ll - 3) * (ll^2 - m^2)))
-        P_lminus1_m, P_lm = P_lm, x * coeff1 * P_lm - coeff2 * P_lminus1_m
-    end
-
-    return P_lm
+    return (0:lmax, -lmax:lmax)
 end
 
 end # module FlowFieldSpectraOhMyThreadsExt

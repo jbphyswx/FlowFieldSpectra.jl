@@ -1,7 +1,7 @@
 module FlowFieldSpectraNUFSHTExt
 
 using NUFSHT: NUFSHT
-using FlowFieldSpectra: FlowFieldSpectra as FFS, NUFSHTBackend, sph_mode_index
+using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 """
     calculate_spectrum(::NUFSHTBackend, coords_vecs, fields_vecs, ms; tol=1e-8, solve=false, maxiter=500, rtol=1e-6, ...)
@@ -44,7 +44,7 @@ function FFS._calculate_spectrum_nufsht(
         # Map to complex coefficients coeffs
         for l in 0:lmax
             for m in -l:l
-                idx = sph_mode_index(l, m)
+                idx = FFS.sph_mode_index(l, m)
                 fsh_idx = NUFSHT.FastSphericalHarmonics.sph_mode(l, m)
                 coeffs[idx, k] = C_real[fsh_idx]
             end

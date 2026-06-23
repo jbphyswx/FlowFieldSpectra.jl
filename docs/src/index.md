@@ -25,43 +25,34 @@ A typical flow field spectral analysis consists of three main steps:
 
 ### Quickstart Tutorial: Cartesian 2D Flow Field
 
-Here is a complete, runnable example computing the isotropic energy spectrum of a 2D uniform flow field.
+A complete example computing the isotropic energy spectrum of a 2D uniform flow field. You
+construct an explicit **grid** (the coordinate system is the grid type — there is no guessing)
+and pass it to `calculate_spectrum`.
 
-```julia
-using FlowFieldSpectra
-using FFTW        # Load FFTW to unlock fast FFTBackend()
-using CairoMakie  # Load CairoMakie to unlock plot_spectrum()
+```@example quickstart
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FFTW: FFTW              # activates the FFTBackend extension
+using CairoMakie: CairoMakie  # activates the plotting extension
 
-# 1. Define coordinate grid axes
+# 1. Coordinate lists on a uniform grid
 L = 2π
 N = 32
 dx = L / N
-xs = range(0.0, stop=L-dx, length=N)
-ys = range(0.0, stop=L-dx, length=N)
+xs = range(0.0, stop = L - dx, length = N)
+xv = vec([x for x in xs, y in xs])
+yv = vec([y for x in xs, y in xs])
 
-# Expand to matching flat coordinate lists
-xv = vec([x for x in xs, y in ys])
-yv = vec([y for x in xs, y in ys])
-
-# 2. Synthesize u (zonal) and v (meridional) velocities
-# Here we add wave components with specific wavenumbers
+# 2. Synthesize zonal/meridional velocities with specific wavenumbers
 u = @. cos(2 * xv) + 0.5 * sin(5 * yv)
 v = @. sin(2 * xv)
 
-# 3. Calculate Fourier Coefficients
-# FFTBackend() requires FFTW to be imported
-coeffs, ks = calculate_spectrum(
-    FFTBackend(),
-    (xv, yv),
-    (u, v),
-    (N, N);
-    domain_size=(L, L)
-)
+# 3. Build the grid and compute Fourier coefficients (FFTBackend needs FFTW)
+grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
 
-# 4. Integrate radially to compute a 1D isotropic energy spectrum
-k_bins, E_k = isotropic_spectrum(ks, coeffs; num_bins=16)
+# 4. Radially integrate to a 1D isotropic energy spectrum
+k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 16)
 
-# 5. Plot the result
-fig = plot_spectrum(ks, coeffs; title="Flow Field Energy Spectrum")
-save("spectrum_plot.png", fig)
+# 5. Plot
+FFS.plot_spectrum(ks, coeffs; title = "Flow Field Energy Spectrum")
 ```

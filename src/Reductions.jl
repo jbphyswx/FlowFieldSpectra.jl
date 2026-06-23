@@ -1,9 +1,10 @@
 module Reductions
 
-using Statistics: mean
-using ..DirectSum: sph_mode_index
+using ..DirectSum: DirectSum
 
-export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
+export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!,
+    spherical_energy_spectrum, spherical_energy_spectrum!,
+    cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 
 """
     isotropic_spectrum(ks_phys::Tuple, coeffs::AbstractArray; num_bins::Int=minimum(size(coeffs)[1:end-1]) ÷ 2)
@@ -37,7 +38,7 @@ function isotropic_spectrum(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
     # Calculate wavenumber magnitude for each grid point
@@ -55,21 +56,19 @@ function isotropic_spectrum(
     k_bins = [T(0.5) * (bin_edges[i] + bin_edges[i+1]) for i in 1:num_bins]
     E_k = zeros(T, num_bins)
 
-    # Accumulate energy in bins
-    # E(k) = 1/2 * sum |C|^2
-    for I in CartesianIndices(ms)
-        # Compute physical wavenumber magnitude
+    # Precompute squared wavenumbers per axis (avoids re-squaring shared values).
+    kd2 = [T.(ks_phys[d]) .^ 2 for d in 1:D]
+
+    # Accumulate energy in bins: E(k) = 1/2 * sum |C|^2
+    @inbounds for I in CartesianIndices(ms)
         k_mag = zero(T)
         for d in 1:D
-            k_mag += ks_phys[d][I[d]]^2
+            k_mag += kd2[d][I[d]]
         end
         k_mag = sqrt(k_mag)
 
-        # Skip points outside the Nyquist circle/sphere
         if k_mag <= k_max
-            # Find bin index
             bin_idx = clamp(floor(Int, k_mag / dk) + 1, 1, num_bins)
-
             energy = zero(T)
             for c in 1:NU
                 energy += abs2(coeffs[I, c])
@@ -82,6 +81,128 @@ function isotropic_spectrum(
     E_k ./= dk
 
     return k_bins, E_k
+end
+
+"""
+    anisotropic_spectrum(ks_phys::Tuple, coeffs; num_k_bins=0, num_θ_bins=16)
+
+Anisotropy-resolved 2D energy spectrum ``E(k, \\theta)`` for a 2D Cartesian field: bin the
+energy ``\\tfrac12\\sum_c|C|^2`` by wavenumber magnitude ``k=|\\mathbf k|`` and polar angle
+``\\theta=\\mathrm{atan}(k_y, k_x)\\in(-\\pi,\\pi]``. Returns `(k_bins, θ_bins, E)` where `E` is
+`(num_k_bins, num_θ_bins)`, normalized as a density (per `dk·dθ`). Integrating over `θ` recovers
+the isotropic spectrum.
+"""
+function anisotropic_spectrum(
+    ks_phys::Tuple,
+    coeffs::AbstractArray{Complex{T}, N_dim};
+    num_k_bins::Int = 0,
+    num_θ_bins::Int = 16,
+) where {T<:AbstractFloat, N_dim}
+    D = length(ks_phys)
+    D == 2 || throw(ArgumentError("anisotropic_spectrum is defined for 2D fields (D=2), got D=$D"))
+    @assert N_dim == 3 "coeffs must have shape (mx, my, NU)"
+    ms = size(coeffs)[1:2]
+    NU = size(coeffs, 3)
+
+    k_max = minimum((maximum(abs.(ks_phys[1])), maximum(abs.(ks_phys[2]))))
+    num_k_bins <= 0 && (num_k_bins = minimum(ms) ÷ 2)
+
+    dk = k_max / num_k_bins
+    dθ = T(2π) / num_θ_bins
+    k_bins = [T(0.5) * dk + (i - 1) * dk for i in 1:num_k_bins]
+    θ_bins = [-T(π) + (j - T(0.5)) * dθ for j in 1:num_θ_bins]
+    E = zeros(T, num_k_bins, num_θ_bins)
+
+    @inbounds for I in CartesianIndices(ms)
+        kx = T(ks_phys[1][I[1]])
+        ky = T(ks_phys[2][I[2]])
+        k_mag = sqrt(kx^2 + ky^2)
+        (k_mag > k_max || k_mag == 0) && continue
+        ik = clamp(floor(Int, k_mag / dk) + 1, 1, num_k_bins)
+        θ = atan(ky, kx)                       # (-π, π]
+        iθ = clamp(floor(Int, (θ + T(π)) / dθ) + 1, 1, num_θ_bins)
+        energy = zero(T)
+        for c in 1:NU
+            energy += abs2(coeffs[I, c])
+        end
+        E[ik, iθ] += T(0.5) * energy
+    end
+    E ./= (dk * dθ)
+    return k_bins, θ_bins, E
+end
+
+"""
+    cross_spectrum(ks_phys::Tuple, coeffs_f, coeffs_g; num_bins=0)
+
+Radially-binned **cross-spectrum** ``S_{fg}(k) = \\tfrac{1}{2}\\sum_{c}\\hat f_c\\,\\overline{\\hat g_c}``
+of two fields whose coefficients `coeffs_f`, `coeffs_g` share shape `(ms..., NU)`. Returns
+`(k_bins, S)` with `S` complex.
+
+Its real part is the **co-spectrum** ([`cospectrum`](@ref)) — the scale-by-scale covariance whose
+integral recovers ``\\langle f\\,g\\rangle`` (e.g. the momentum-flux co-spectrum ``\\langle u'w'\\rangle``);
+its negative imaginary part is the **quadrature spectrum** ([`quadspectrum`](@ref)). Coherence and
+phase additionally require segment/ensemble averaging to be meaningful.
+"""
+function cross_spectrum(
+    ks_phys::Tuple,
+    coeffs_f::AbstractArray{Complex{T}, N_dim},
+    coeffs_g::AbstractArray{Complex{T}, N_dim};
+    num_bins::Int = 0,
+) where {T<:AbstractFloat, N_dim}
+    D = length(ks_phys)
+    @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
+    size(coeffs_f) == size(coeffs_g) || throw(DimensionMismatch("coeffs_f and coeffs_g must match"))
+
+    ms = size(coeffs_f)[1:D]
+    NU = size(coeffs_f, N_dim)
+
+    max_ks = [maximum(abs.(ks_phys[d])) for d in 1:D]
+    k_max = minimum(max_ks)
+    num_bins <= 0 && (num_bins = minimum(ms) ÷ 2)
+
+    bin_edges = range(zero(T), stop = k_max, length = num_bins + 1)
+    dk = k_max / num_bins
+    k_bins = [T(0.5) * (bin_edges[i] + bin_edges[i+1]) for i in 1:num_bins]
+    S = zeros(Complex{T}, num_bins)
+
+    kd2 = [T.(ks_phys[d]) .^ 2 for d in 1:D]
+    @inbounds for I in CartesianIndices(ms)
+        k_mag = zero(T)
+        for d in 1:D
+            k_mag += kd2[d][I[d]]
+        end
+        k_mag = sqrt(k_mag)
+        if k_mag <= k_max
+            bin_idx = clamp(floor(Int, k_mag / dk) + 1, 1, num_bins)
+            acc = zero(Complex{T})
+            for c in 1:NU
+                acc += coeffs_f[I, c] * conj(coeffs_g[I, c])
+            end
+            S[bin_idx] += T(0.5) * acc
+        end
+    end
+    S ./= dk
+    return k_bins, S
+end
+
+"""
+    cospectrum(ks_phys, coeffs_f, coeffs_g; num_bins=0) -> (k_bins, Co)
+
+Co-spectrum ``\\mathrm{Co}_{fg}(k) = \\mathrm{Re}\\,S_{fg}(k)`` — the in-phase, flux-carrying part.
+"""
+function cospectrum(ks_phys::Tuple, coeffs_f, coeffs_g; num_bins::Int = 0)
+    k_bins, S = cross_spectrum(ks_phys, coeffs_f, coeffs_g; num_bins = num_bins)
+    return k_bins, real.(S)
+end
+
+"""
+    quadspectrum(ks_phys, coeffs_f, coeffs_g; num_bins=0) -> (k_bins, Q)
+
+Quadrature spectrum ``Q_{fg}(k) = -\\mathrm{Im}\\,S_{fg}(k)`` — the 90°-out-of-phase part.
+"""
+function quadspectrum(ks_phys::Tuple, coeffs_f, coeffs_g; num_bins::Int = 0)
+    k_bins, S = cross_spectrum(ks_phys, coeffs_f, coeffs_g; num_bins = num_bins)
+    return k_bins, -imag.(S)
 end
 
 """
@@ -115,39 +236,51 @@ function transect_spectrum(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
-    # Compute energy density at each mode
-    # E = 1/2 * sum |C|^2
-    energy_grid = zeros(T, ms...)
-    for I in CartesianIndices(ms)
-        val = zero(T)
-        for c in 1:NU
-            val += abs2(coeffs[I, c])
-        end
-        energy_grid[I] = T(0.5) * val
-    end
+    keep_dims = Tuple(d for d in 1:D if !(d in dims))
+    sum_dims = Tuple(d for d in 1:D if d in dims)
 
-    # Dimensions to sum over
-    sum_dims = filter(d -> d in dims, 1:D)
-    keep_dims = filter(d -> !(d in dims), 1:D)
-
-    # Sum along dims
-    reduced_energy = sum(energy_grid, dims=Tuple(sum_dims))
-
-    # Wavenumber spacing for summed dimensions to convert sum to integration density
-    for d in sum_dims
-        dk_d = ks_phys[d][2] - ks_phys[d][1]
-        reduced_energy .*= dk_d
-    end
-
-    # Reshape and extract
+    # Allocate only the reduced output (no full ms-sized intermediate grid).
     out_shape = Tuple(ms[d] for d in keep_dims)
-    E_reduced = reshape(reduced_energy, out_shape...)
-    ks_reduced = Tuple(ks_phys[d] for d in keep_dims)
+    E_reduced = zeros(T, out_shape)
 
+    dk_prod = one(T)
+    for d in sum_dims
+        dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
+    end
+
+    _accumulate_transect!(E_reduced, coeffs, ms, NU, keep_dims, out_shape)
+    E_reduced .*= dk_prod
+
+    ks_reduced = Tuple(ks_phys[d] for d in keep_dims)
     return ks_reduced, E_reduced
+end
+
+# Accumulate 1/2 Σ|C|^2 from an (ms..., NU) coeff array into the reduced output indexed by the
+# kept dimensions. Uses precomputed strides + linear indexing — allocation-free, no per-mode
+# tuple construction (so it scales to large 3D grids).
+function _accumulate_transect!(E_reduced::AbstractArray{T}, coeffs, ms::NTuple{D, Int}, NU::Int,
+        keep_dims::Tuple, out_shape::Tuple) where {T, D}
+    # Column-major linear index into E_reduced built with an incremental stride (no heap
+    # temporaries); E_reduced is addressed by linear index directly (no `vec` reshape).
+    @inbounds for I in CartesianIndices(ms)
+        e = zero(T)
+        for c in 1:NU
+            e += abs2(coeffs[I, c])
+        end
+        lin = 1
+        stride = 1
+        kk = 0
+        for d in keep_dims
+            kk += 1
+            lin += (I[d] - 1) * stride
+            stride *= out_shape[kk]
+        end
+        E_reduced[lin] += T(0.5) * e
+    end
+    return E_reduced
 end
 
 """
@@ -184,7 +317,7 @@ function spherical_energy_spectrum(
     for l in 0:lmax
         energy = zero(T)
         for m in -l:l
-            idx = sph_mode_index(l, m)
+            idx = DirectSum.sph_mode_index(l, m)
             for c in 1:NU
                 energy += abs2(coeffs[idx, c])
             end
@@ -227,12 +360,22 @@ function isotropic_spectrum!(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    # Spectral extents from the type parameter (N_dim - 1 == D), so this is type-stable and
+    # allocation-free (a runtime `size(coeffs)[1:D]` slice would box a tuple of unknown length).
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
-    # Calculate wavenumber magnitude for each grid point
-    max_ks = [maximum(abs.(ks_phys[d])) for d in 1:D]
-    k_max = minimum(max_ks)
+    # Maximum resolved isotropic wavenumber (min over axes of each axis's max |k|), computed
+    # without allocating per-axis temporaries.
+    k_max = T(Inf)
+    @inbounds for d in 1:D
+        axmax = zero(T)
+        for v in ks_phys[d]
+            a = abs(T(v))
+            axmax = ifelse(a > axmax, a, axmax)
+        end
+        k_max = min(k_max, axmax)
+    end
 
     if num_bins <= 0
         num_bins = minimum(ms) ÷ 2
@@ -252,11 +395,12 @@ function isotropic_spectrum!(
     # Zero out E_k (in case of reuse)
     fill!(E_k, zero(T))
 
-    # Accumulate energy in bins
+    # Accumulate energy in bins (squared wavenumbers formed inline — no per-axis allocation).
     @inbounds for I in CartesianIndices(ms)
         k_mag = zero(T)
         for d in 1:D
-            k_mag += ks_phys[d][I[d]]^2
+            kv = T(ks_phys[d][I[d]])
+            k_mag += kv * kv
         end
         k_mag = sqrt(k_mag)
 
@@ -280,7 +424,8 @@ end
 """
     transect_spectrum!(E_reduced, ks_reduced, ks_phys, coeffs, dims)
 
-In-place version of `transect_spectrum`. Note: this function allocates internally for intermediate grid reductions.
+In-place version of `transect_spectrum`. The energy accumulation kernel is allocation-free; only
+the `ks_reduced` axis bookkeeping (small, independent of grid size) touches the heap.
 """
 function transect_spectrum!(
     E_reduced::AbstractArray{T},
@@ -292,36 +437,24 @@ function transect_spectrum!(
     D = length(ks_phys)
     @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
 
-    ms = size(coeffs)[1:D]
+    ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
-    # Compute energy density
-    energy_grid = zeros(T, ms...)
-    for I in CartesianIndices(ms)
-        val = zero(T)
-        for c in 1:NU
-            val += abs2(coeffs[I, c])
-        end
-        energy_grid[I] = T(0.5) * val
-    end
-
-    sum_dims = filter(d -> d in dims, 1:D)
-    keep_dims = filter(d -> !(d in dims), 1:D)
-
-    reduced_energy = sum(energy_grid, dims=Tuple(sum_dims))
-
-    for d in sum_dims
-        dk_d = ks_phys[d][2] - ks_phys[d][1]
-        reduced_energy .*= dk_d
-    end
+    keep_dims = Tuple(d for d in 1:D if !(d in dims))
+    sum_dims = Tuple(d for d in 1:D if d in dims)
 
     out_shape = Tuple(ms[d] for d in keep_dims)
     @assert size(E_reduced) == out_shape "E_reduced size mismatch"
 
-    # Copy to output
-    copyto!(E_reduced, reshape(reduced_energy, out_shape))
+    dk_prod = one(T)
+    for d in sum_dims
+        dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
+    end
 
-    # Fill ks_reduced
+    fill!(E_reduced, zero(T))
+    _accumulate_transect!(E_reduced, coeffs, ms, NU, keep_dims, out_shape)
+    E_reduced .*= dk_prod
+
     empty!(ks_reduced)
     for d in keep_dims
         push!(ks_reduced, ks_phys[d])
@@ -364,7 +497,7 @@ function spherical_energy_spectrum!(
     @inbounds for l in 0:lmax
         energy = zero(T)
         for m in -l:l
-            idx = sph_mode_index(l, m)
+            idx = DirectSum.sph_mode_index(l, m)
             for c in 1:NU
                 energy += abs2(coeffs[idx, c])
             end

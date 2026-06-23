@@ -1,6 +1,6 @@
 module FlowFieldSpectraKernelAbstractionsExt
 
-using KernelAbstractions: KernelAbstractions as KA, @index, @atomic, @Const
+using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using FlowFieldSpectra: FlowFieldSpectra as FFS, GPUBackend
 
 # =============================================================================
@@ -16,103 +16,79 @@ function _array_on_backend(a, backend::KA.Backend)
 end
 
 # =============================================================================
-# GPU DirectSum Dispatch
+# GPU entry points — coordinate system fixed by caller (grid dispatch in core).
 # =============================================================================
 
-function FFS._calculate_spectrum_gpu(
-    gpu_backend::GPUBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...
-)
-    backend = gpu_backend.backend
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    FT = eltype(coords_vecs[1])
-
-    # Determine coordinate type (Spherical or Cartesian)
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical
-        lmax = ms[1] - 1
-        Nθ = lmax + 1
-        Nφ = 2 * lmax + 1
-        coeffs_dev = KA.zeros(backend, Complex{FT}, Nθ, Nφ, NU)
-        ks = FFS._calculate_spectrum_gpu!(coeffs_dev, gpu_backend, coords_vecs, fields_vecs, ms; kwargs...)
-        coeffs = Array(coeffs_dev)
-        return (coeffs, ks)
-    else
-        # Cartesian
-        coeffs_dev = KA.zeros(backend, Complex{FT}, ms..., NU)
-        ks = FFS._calculate_spectrum_gpu!(coeffs_dev, gpu_backend, coords_vecs, fields_vecs, ms; kwargs...)
-        coeffs = Array(coeffs_dev)
-        return (coeffs, ks)
+# Stage host vectors to the device (no-op if already resident there).
+function _stage_to_device(backend::KA.Backend, vecs::Tuple, ::Type{FT}, N::Int) where {FT}
+    _array_on_backend(vecs[1], backend) && return vecs
+    return ntuple(length(vecs)) do i
+        dev = KA.allocate(backend, FT, N)
+        copyto!(dev, collect(vecs[i]))
+        dev
     end
 end
 
-function FFS._calculate_spectrum_gpu!(
-    coeffs::AbstractArray{Complex{FT}},
+function FFS._calculate_spectrum_gpu_cartesian(
     gpu_backend::GPUBackend,
     coords_vecs::Tuple,
     fields_vecs::Tuple,
-    ms::Tuple;
-    iflag::Int = 1,
-    domain_size::Union{Nothing, Tuple} = nothing,
-    weights::Union{Nothing, AbstractVector} = nothing,
-) where {FT}
+    ms::Tuple,
+    iflag::Int,
+    domain_size,
+)
     backend = gpu_backend.backend
-    D = length(coords_vecs)
+    FT = eltype(coords_vecs[1])
     NU = length(fields_vecs)
     N = length(coords_vecs[1])
-
-    for d in 1:D
+    for d in 1:length(coords_vecs)
         length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
     end
     for u_idx in 1:NU
         length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
 
-    # Stage inputs to device if they are not already on the backend
-    is_gpu = _array_on_backend(coords_vecs[1], backend)
+    coords_dev = _stage_to_device(backend, coords_vecs, FT, N)
+    fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
+    coeffs_dev = KA.zeros(backend, Complex{FT}, ms..., NU)
+    ks = _calculate_spectrum_cartesian_gpu!(coeffs_dev, backend, coords_dev, fields_dev, ms, iflag, domain_size)
+    return Array(coeffs_dev), ks
+end
 
-    coords_dev = is_gpu ? coords_vecs : ntuple(d -> begin
-        dev_arr = KA.allocate(backend, FT, N)
-        copyto!(dev_arr, collect(coords_vecs[d]))
-        dev_arr
-    end, D)
-
-    fields_dev = is_gpu ? fields_vecs : ntuple(u -> begin
-        dev_arr = KA.allocate(backend, FT, N)
-        copyto!(dev_arr, collect(fields_vecs[u]))
-        dev_arr
-    end, NU)
-
-    if D == 2 && all(extrema(coords_vecs[1]) .<= (π + 1e-3)) && all(extrema(coords_vecs[1]) .>= -1e-5) &&
-       all(extrema(coords_vecs[2]) .<= (2π + 1e-3)) && all(extrema(coords_vecs[2]) .>= -1e-5) &&
-       (ms[2] == 2 * ms[1] - 1)
-        # Spherical coordinate path
-        lmax = ms[1] - 1
-        
-        weights_dev = if weights === nothing
-            w_host = fill(FT(4π) / N, N)
-            w_dev = KA.allocate(backend, FT, N)
-            copyto!(w_dev, w_host)
-            w_dev
-        else
-            is_gpu ? weights : begin
-                w_dev = KA.allocate(backend, FT, N)
-                copyto!(w_dev, collect(weights))
-                w_dev
-            end
-        end
-
-        return _calculate_spectrum_spherical_gpu!(coeffs, backend, coords_dev, fields_dev, lmax, weights_dev)
-    else
-        # Cartesian coordinate path
-        return _calculate_spectrum_cartesian_gpu!(coeffs, backend, coords_dev, fields_dev, ms, iflag, domain_size)
+function FFS._calculate_spectrum_gpu_spherical(
+    gpu_backend::GPUBackend,
+    coords_vecs::Tuple,
+    fields_vecs::Tuple,
+    lmax::Int,
+    weights,
+)
+    backend = gpu_backend.backend
+    FT = eltype(coords_vecs[1])
+    NU = length(fields_vecs)
+    N = length(coords_vecs[1])
+    for u_idx in 1:NU
+        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
     end
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+
+    coords_dev = _stage_to_device(backend, coords_vecs, FT, N)
+    fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
+    weights_dev = if weights === nothing
+        w = KA.allocate(backend, FT, N)
+        copyto!(w, fill(FT(4π) / N, N))
+        w
+    elseif _array_on_backend(weights, backend)
+        weights
+    else
+        w = KA.allocate(backend, FT, N)
+        copyto!(w, collect(weights))
+        w
+    end
+
+    coeffs_dev = KA.zeros(backend, Complex{FT}, Nθ, Nφ, NU)
+    ks = _calculate_spectrum_spherical_gpu!(coeffs_dev, backend, coords_dev, fields_dev, lmax, weights_dev)
+    return Array(coeffs_dev), ks
 end
 
 # =============================================================================
@@ -247,56 +223,56 @@ function _calculate_spectrum_spherical_gpu!(
     θ_dev = coords_dev[1]
     φ_dev = coords_dev[2]
 
-    # Reinterpret complex array as a real array to support atomic operations
-    coeffs_real = reinterpret(reshape, FT, coeffs)
-
-    # Launch kernel - one thread per point
+    # One thread per output mode (row, col): each thread exclusively owns its coefficient
+    # slice across all components, so accumulation needs no atomics. Unused (row, col) slots
+    # (those with l > lmax) are skipped and stay zero.
     kernel! = _spherical_direct_sum_kernel!(backend)
-    kernel!(coeffs_real, θ_dev, φ_dev, fields_dev, weights_dev, lmax, Nφ, NU; ndrange = N)
+    kernel!(coeffs, θ_dev, φ_dev, fields_dev, weights_dev, lmax, N, NU; ndrange = Nθ * Nφ)
     KA.synchronize(backend)
 
     return (0:lmax, -lmax:lmax)
 end
 
 KA.@kernel function _spherical_direct_sum_kernel!(
-    coeffs_real,
+    coeffs,
     @Const(θ),
     @Const(φ),
     @Const(fields),
     @Const(w),
     lmax::Int,
-    Nφ::Int,
+    N::Int,
     NU::Int,
 )
-    j = @index(Global)
-    
-    if j <= length(θ)
-        θj = θ[j]
-        φj = φ[j]
-        wj = w[j]
+    idx = @index(Global)
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
 
-        xj = cos(θj)
-        sj = sin(θj)
+    if idx <= Nθ * Nφ
+        # Column-major decode of the (row, col) coefficient slot this thread owns.
+        col = (idx - 1) ÷ Nθ + 1
+        row = (idx - 1) % Nθ + 1
 
-        for l in 0:lmax
-            for m in -l:l
-                abs_m = abs(m)
-                P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
+        # Invert sph_mode_index: recover (m, |m|) from the column, then ℓ from the row.
+        m = col == 1 ? 0 : (iseven(col) ? -(col ÷ 2) : (col - 1) ÷ 2)
+        abs_m = abs(m)
+        l = row - 1 + abs_m
 
-                factor = (m < 0 && isodd(abs_m)) ? -one(typeof(P_l_m)) : one(typeof(P_l_m))
-                phase = cis(m * φj)
-                Y_lm = factor * P_l_m * phase
-
-                row = l - abs_m + 1
-                col = m == 0 ? 1 : (m < 0 ? 2 * abs_m : 2 * m + 1)
-                
-                fj_conj_Ylm_wj = conj(Y_lm) * wj
-                for u_idx in 1:NU
-                    contrib = fields[u_idx][j] * fj_conj_Ylm_wj
-                    # Use atomics for thread-safe accumulation on real and imaginary parts
-                    @atomic coeffs_real[1, row, col, u_idx] += real(contrib)
-                    @atomic coeffs_real[2, row, col, u_idx] += imag(contrib)
+        if l <= lmax
+            FT = eltype(θ)
+            CT = eltype(coeffs)
+            factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+            # Accumulate each component in a register, then store once — no atomics, no
+            # global read-modify-write. (Legendre is recomputed per component; NU is small.)
+            @inbounds for u_idx in 1:NU
+                acc = zero(CT)
+                for j in 1:N
+                    xj = cos(θ[j])
+                    sj = sin(θ[j])
+                    P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
+                    Y_lm = factor * P_l_m * cis(m * φ[j])
+                    acc += fields[u_idx][j] * conj(Y_lm) * w[j]
                 end
+                coeffs[row, col, u_idx] = acc
             end
         end
     end

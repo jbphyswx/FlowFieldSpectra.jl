@@ -3,113 +3,238 @@ module FlowFieldSpectra
 using PrecompileTools: @setup_workload, @compile_workload
 
 include("Types.jl")
+include("Grids.jl")
+include("Preprocessing.jl")
+include("Normalization.jl")
+include("Problem.jl")
+include("Plans.jl")
+include("SphericalKernels.jl")
 include("DirectSum.jl")
 include("Reductions.jl")
+include("Operators.jl")
+include("Averaging.jl")
+include("LombScargle.jl")
 
 using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
-using .DirectSum: calculate_spectrum_direct, calculate_spectrum_direct!, sph_mode_index
-using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
+using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
+using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
+using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
+using .Problem: TransformProblem
+using .Plans: AbstractSpectralPlan, plan_spectrum
+using .DirectSum: sph_mode_index
+using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
+using .Operators: spectral_divergence, spectral_vorticity, compensate, band_energy
+using .Averaging: welch_power_spectrum, coherence_spectrum
+using .LombScargle: lomb_scargle
 
 # Export Types
 export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
 
+# Export Grids
+export AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid
+export AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
+
+# Export Preprocessing & Normalization (typed configuration)
+export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
+export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
+export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
+export TransformProblem
+export AbstractSpectralPlan, plan_spectrum
+
 # Export APIs
-export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
+export calculate_spectrum, calculate_spectrum!, synthesize, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
+export spectral_divergence, spectral_vorticity, compensate, band_energy
+export cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
+export welch_power_spectrum, coherence_spectrum, lomb_scargle
 export plot_spectrum, compare_spectra, compare_spectral_analysis
 
 
 """
-    calculate_spectrum(backend::AbstractSpectralBackend, coords_vecs::Tuple, fields_vecs::Tuple, ms::Tuple; kwargs...)
-    calculate_spectrum(coords_vecs::Tuple, fields_vecs::Tuple, ms::Tuple; backend=DirectSumBackend(), kwargs...)
+    calculate_spectrum(backend::AbstractSpectralBackend, grid::AbstractGrid, fields, ms::Tuple; kwargs...)
+    calculate_spectrum(grid::AbstractGrid, fields, ms::Tuple; backend=DirectSumBackend(), kwargs...)
 
-Calculate the spectral coefficients and physical wavenumbers for one or more fields.
+Calculate the spectral coefficients and physical wavenumbers for one or more fields sampled on
+an explicit `grid`. The coordinate system is determined by the grid type — there is no
+coordinate guessing.
 
 # Arguments
-- `backend::AbstractSpectralBackend`: The spectral backend to use (default is `DirectSumBackend()`).
-- `coords_vecs::Tuple`: Tuple of coordinate vectors. 
-  - For Cartesian: `(xv, yv, ...)` where each is a vector of coordinates of length `N`.
-  - For Spherical: `(theta_nodes, phi_nodes)` in radians.
-- `fields_vecs::Tuple`: Tuple of fields to analyze (e.g., `(u, v)`). Each field is a vector of values of length `N` matching the coordinates.
-- `ms::Tuple`: Target spectral resolution.
-  - For Cartesian: `(mx, my, ...)` defining the number of modes along each dimension.
-  - For Spherical: `(Ntheta, Nphi)` where `lmax = Ntheta - 1`.
+- `backend::AbstractSpectralBackend`: spectral backend (default `DirectSumBackend()`).
+- `grid::AbstractGrid`: the sampling grid. Construct one of:
+  - `UniformCartesianGrid`, `NonuniformCartesianGrid`, `ScatteredCartesianGrid` (Cartesian), or
+  - `StructuredSphericalGrid`, `ScatteredSphericalGrid` (spherical, ``(\\theta, \\phi)`` in radians).
+  Domain size (Cartesian) and quadrature weights (spherical) are carried on the grid.
+- `fields`: a `Tuple` of field vectors `(u, v, …)`, each of length `npoints(grid)`.
+- `ms::Tuple`: target spectral resolution. Cartesian: `(mx, my, …)` modes per axis. Spherical:
+  `(Nθ, Nφ)` with `lmax = Nθ - 1`.
 
 # Keyword Arguments
-- `iflag::Int`: Direction of Cartesian Fourier transform (1 for forwards/analysis, -1 for backwards/synthesis; default is 1).
-- `domain_size::Union{Nothing, Tuple}`: Physical size of the domain along each Cartesian dimension. If not specified, inferred from the bounding box of coordinates.
-- `weights::Union{Nothing, AbstractVector}`: Optional quadrature/area weights for spherical transforms.
-- `tol::Real`: Accuracy tolerance for non-uniform transforms (NUFFT/NUFSHT) (default is `1e-8`).
-- `solve::Bool`: (For `NUFSHTBackend`) If `true`, solves the SHT as a linear system using an iterative CG solver rather than a raw adjoint projection.
-- `maxiter::Int`: Maximum iterations for CG solvers (default is `500`).
-- `rtol::Real`: Relative residual tolerance for CG solver convergence (default is `1e-6`).
+- `iflag::Int`: Cartesian transform direction (`1` analysis, `-1` synthesis; default `1`).
+- `tol`/`eps::Real`: accuracy for non-uniform transforms (NUFFT/NUFSHT).
+- `solve::Bool`, `maxiter::Int`, `rtol::Real`: iterative-solve controls for `NUFSHTBackend`.
 
 # Returns
-- `coeffs`: Array of size `(ms..., NU)` containing the complex spectral coefficients, where `NU = length(fields_vecs)`.
-- `ks_phys`: A tuple of physical wavenumber coordinates along each dimension, or spherical coordinates `(0:lmax, -lmax:lmax)`.
+- `coeffs`: complex coefficients of size `(ms..., NU)`, `NU = length(fields)`.
+- `ks_phys`: physical wavenumber coordinates per axis, or `(0:lmax, -lmax:lmax)` for spherical.
 
-# Example (Cartesian FFT)
+# Example
 ```julia
-using FlowFieldSpectra
-using FFTW
+using FlowFieldSpectra, FFTW
 
-L = 2π
-N = 16
-x = range(0.0, stop=L, length=N+1)[1:N]
-y = range(0.0, stop=L, length=N+1)[1:N]
-xv = vec([x_val for x_val in x, y_val in y])
-yv = vec([y_val for x_val in x, y_val in y])
+L = 2π; N = 16
+x = range(0, L, N + 1)[1:N]
+xv = vec([xi for xi in x, yi in x]); yv = vec([yi for xi in x, yi in x])
+u = cos.(xv) .+ sin.(yv); v = zero(u)
 
-u = cos.(xv) .+ sin.(yv)
-v = zeros(length(xv))
-
-# Computes coefficients using fast FFTW backend
-coeffs, ks = calculate_spectrum(FFTBackend(), (xv, yv), (u, v), (N, N); domain_size=(L, L))
+grid = UniformCartesianGrid((xv, yv); domain_size = (L, L))
+coeffs, ks = calculate_spectrum(FFTBackend(), grid, (u, v), (N, N))
 ```
 """
 function calculate_spectrum(
-    coords_vecs::Tuple,
+    grid::AbstractGrid,
     fields_vecs::Tuple,
     ms::Tuple;
     backend::AbstractSpectralBackend = DirectSumBackend(),
     kwargs...,
 )
-    return calculate_spectrum(backend, coords_vecs, fields_vecs, ms; kwargs...)
+    return calculate_spectrum(backend, grid, fields_vecs, ms; kwargs...)
 end
 
-# Backend dispatches
+# =============================================================================
+# Canonical (backend, grid) dispatch — coordinate system is the grid type.
+# =============================================================================
+
+# Per-grid keyword bundle forwarded to backend implementations.
+_grid_kwargs(g::AbstractCartesianGrid) = (; domain_size = g.domain_size)
+_grid_kwargs(g::AbstractSphericalGrid) = (; weights = g.weights)
+
+# ---- DirectSum: route directly to the Cartesian / spherical kernels ----
 function calculate_spectrum(
     ::DirectSumBackend,
-    coords_vecs::Tuple,
+    g::AbstractCartesianGrid{FT, D},
     fields_vecs::Tuple,
-    ms::Tuple;
+    ms::NTuple{D, Int};
+    iflag::Int = 1,
     kwargs...,
-)
-    return calculate_spectrum_direct(coords_vecs, fields_vecs, ms; kwargs...)
+) where {FT, D}
+    NU = length(fields_vecs)
+    coeffs = zeros(Complex{FT}, ms..., NU)
+    ks = DirectSum._calculate_spectrum_cartesian_direct!(
+        coeffs, g.coords, fields_vecs, ms, iflag, g.domain_size,
+    )
+    return coeffs, ks
+end
+
+function calculate_spectrum(
+    ::DirectSumBackend,
+    g::AbstractSphericalGrid{FT},
+    fields_vecs::Tuple,
+    ms::NTuple{2, Int};
+    kwargs...,
+) where {FT}
+    NU = length(fields_vecs)
+    lmax = ms[1] - 1
+    coeffs = zeros(Complex{FT}, lmax + 1, 2 * lmax + 1, NU)
+    ks = DirectSum._calculate_spectrum_spherical_direct!(
+        coeffs, g.coords, fields_vecs, lmax, g.weights,
+    )
+    return coeffs, ks
+end
+
+# ---- Cartesian fast backends (extensions implement the `_calculate_spectrum_*`) ----
+function calculate_spectrum(::FFTBackend, g::AbstractCartesianGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    return _calculate_spectrum_fft(g.coords, fields_vecs, ms; domain_size = g.domain_size, kwargs...)
+end
+
+function calculate_spectrum(::NUFFTBackend, g::AbstractCartesianGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    return _calculate_spectrum_nufft(g.coords, fields_vecs, ms; domain_size = g.domain_size, kwargs...)
+end
+
+# ---- Spherical fast backends ----
+function calculate_spectrum(::SHTBackend, g::AbstractSphericalGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    return _calculate_spectrum_sht(g.coords, fields_vecs, ms; kwargs...)
+end
+
+function calculate_spectrum(::NUFSHTBackend, g::AbstractSphericalGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    return _calculate_spectrum_nufsht(g.coords, fields_vecs, ms; kwargs...)
+end
+
+# ---- Threaded (extension dispatches on grid type; no coordinate heuristic) ----
+function calculate_spectrum(::ThreadedBackend, g::AbstractCartesianGrid{FT, D}, fields_vecs::Tuple, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {FT, D}
+    NU = length(fields_vecs)
+    coeffs = zeros(Complex{FT}, ms..., NU)
+    ks = _calculate_spectrum_threaded_cartesian!(coeffs, g.coords, fields_vecs, ms, iflag, g.domain_size)
+    return coeffs, ks
+end
+
+function calculate_spectrum(::ThreadedBackend, g::AbstractSphericalGrid{FT}, fields_vecs::Tuple, ms::NTuple{2, Int}; kwargs...) where {FT}
+    NU = length(fields_vecs)
+    lmax = ms[1] - 1
+    coeffs = zeros(Complex{FT}, lmax + 1, 2 * lmax + 1, NU)
+    ks = _calculate_spectrum_threaded_spherical!(coeffs, g.coords, fields_vecs, lmax, g.weights)
+    return coeffs, ks
+end
+
+# ---- GPU (extension dispatches on grid type; no coordinate heuristic) ----
+function calculate_spectrum(b::GPUBackend, g::AbstractCartesianGrid{FT, D}, fields_vecs::Tuple, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {FT, D}
+    return _calculate_spectrum_gpu_cartesian(b, g.coords, fields_vecs, ms, iflag, g.domain_size)
+end
+
+function calculate_spectrum(b::GPUBackend, g::AbstractSphericalGrid{FT}, fields_vecs::Tuple, ms::NTuple{2, Int}; kwargs...) where {FT}
+    return _calculate_spectrum_gpu_spherical(b, g.coords, fields_vecs, ms[1] - 1, g.weights)
+end
+
+# ---- AutoBackend ----
+function calculate_spectrum(::AutoBackend, g::AbstractGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    if isdefined(Main, :OhMyThreads) && Threads.nthreads() > 1
+        return calculate_spectrum(ThreadedBackend(), g, fields_vecs, ms; kwargs...)
+    else
+        return calculate_spectrum(DirectSumBackend(), g, fields_vecs, ms; kwargs...)
+    end
+end
+
+# ---- Friendly error for unsupported (backend, grid) combinations ----
+function calculate_spectrum(b::AbstractSpectralBackend, g::AbstractGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    throw(ArgumentError(
+        "$(nameof(typeof(b))) does not support a $(nameof(typeof(g))). " *
+        "FFTBackend/NUFFTBackend require a Cartesian grid; SHTBackend/NUFSHTBackend require a spherical grid.",
+    ))
 end
 
 """
-    calculate_spectrum!(coeffs, backend::AbstractSpectralBackend, coords_vecs, fields_vecs, ms; kwargs...)
+    synthesize(grid::AbstractGrid, coeffs, ms::Tuple; real_output=true, iflag=1)
 
-In-place version of `calculate_spectrum`. Computes spectral coefficients into preallocated `coeffs` array.
+Inverse transform: reconstruct field values at the `grid` points from spectral coefficients
+`coeffs` (shape `(ms..., NU)` Cartesian, `(Nθ, Nφ, NU)` spherical) — the inverse of
+[`calculate_spectrum`](@ref). Returns a tuple of `NU` field vectors of length `npoints(grid)`.
+Useful for spectral filtering (zero out modes, then synthesize) and round-trip validation. With
+`real_output=true` the real part is returned (appropriate for real fields). Uses the direct-sum
+inverse, so it works for any grid.
+"""
+function synthesize(g::AbstractCartesianGrid{FT, D}, coeffs::AbstractArray, ms::NTuple{D, Int};
+        real_output::Bool = true, iflag::Int = 1) where {FT, D}
+    out = DirectSum._synthesize_cartesian_direct(coeffs, g.coords, ms, iflag, g.domain_size)
+    return real_output ? map(v -> real.(v), out) : out
+end
 
-# Arguments
-- `coeffs`: Preallocated output array. Size must match expected output for the backend.
-- `backend::AbstractSpectralBackend`: The spectral backend to use.
-- `coords_vecs::Tuple`: Tuple of coordinate vectors.
-- `fields_vecs::Tuple`: Tuple of fields to analyze.
-- `ms::Tuple`: Target spectral resolution.
+function synthesize(g::AbstractSphericalGrid, coeffs::AbstractArray, ms::NTuple{2, Int};
+        real_output::Bool = true)
+    out = DirectSum._synthesize_spherical_direct(coeffs, g.coords, ms[1] - 1)
+    return real_output ? map(v -> real.(v), out) : out
+end
 
-# Returns
-- `ks_phys`: A tuple of physical wavenumber coordinates.
+"""
+    calculate_spectrum!(coeffs, backend, grid::AbstractGrid, fields, ms; kwargs...)
+
+In-place version of [`calculate_spectrum`](@ref): writes coefficients into the preallocated
+`coeffs` array (shape `(ms..., NU)` Cartesian, `(Nθ, Nφ, NU)` spherical) and returns `ks_phys`.
+Supported in-place for `DirectSumBackend` and `ThreadedBackend`; other backends should use the
+allocating `calculate_spectrum`.
 
 # Example
 ```julia
-# Preallocate once
-coeffs = zeros(Complex{Float64}, 64, 64, 2)
-
-# Reuse in time loop
+coeffs = zeros(ComplexF64, 64, 64, 2)
 for t in 1:nt
-    ks = calculate_spectrum!(coeffs, DirectSumBackend(), coords, fields[t], (64, 64))
+    calculate_spectrum!(coeffs, DirectSumBackend(), grid, fields[t], (64, 64))
     # ... analyze coeffs ...
 end
 ```
@@ -117,213 +242,68 @@ end
 function calculate_spectrum!(
     coeffs::AbstractArray{Complex{T}},
     backend::AbstractSpectralBackend,
-    coords_vecs::Tuple,
+    grid::AbstractGrid,
     fields_vecs::Tuple,
     ms::Tuple;
     kwargs...,
 ) where {T}
-    return _calculate_spectrum!(coeffs, backend, coords_vecs, fields_vecs, ms; kwargs...)
+    return _calculate_spectrum!(coeffs, backend, grid, fields_vecs, ms; kwargs...)
 end
 
-# Backend-specific !() implementations
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::DirectSumBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    return calculate_spectrum_direct!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
+# ---- DirectSum (in-place, routes by grid type) ----
+function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::DirectSumBackend,
+        g::AbstractCartesianGrid{FT, D}, fields_vecs::Tuple, ms::NTuple{D, Int};
+        iflag::Int = 1, kwargs...) where {T, FT, D}
+    return DirectSum._calculate_spectrum_cartesian_direct!(coeffs, g.coords, fields_vecs, ms, iflag, g.domain_size)
 end
 
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::FFTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    throw(ArgumentError("FFTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::DirectSumBackend,
+        g::AbstractSphericalGrid, fields_vecs::Tuple, ms::NTuple{2, Int}; kwargs...) where {T}
+    return DirectSum._calculate_spectrum_spherical_direct!(coeffs, g.coords, fields_vecs, ms[1] - 1, g.weights)
 end
 
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::NUFFTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    throw(ArgumentError("NUFFTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+# ---- Threaded (in-place, routes by grid type) ----
+function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::ThreadedBackend,
+        g::AbstractCartesianGrid{FT, D}, fields_vecs::Tuple, ms::NTuple{D, Int};
+        iflag::Int = 1, kwargs...) where {T, FT, D}
+    return _calculate_spectrum_threaded_cartesian!(coeffs, g.coords, fields_vecs, ms, iflag, g.domain_size)
 end
 
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::SHTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    throw(ArgumentError("SHTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
+function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::ThreadedBackend,
+        g::AbstractSphericalGrid, fields_vecs::Tuple, ms::NTuple{2, Int}; kwargs...) where {T}
+    return _calculate_spectrum_threaded_spherical!(coeffs, g.coords, fields_vecs, ms[1] - 1, g.weights)
 end
 
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::NUFSHTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    throw(ArgumentError("NUFSHTBackend in-place calculation not yet implemented. Use calculate_spectrum() to allocate new arrays."))
-end
-
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::ThreadedBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    return _calculate_spectrum_threaded!(coeffs, coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    backend::GPUBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
-    return _calculate_spectrum_gpu!(coeffs, backend, coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function _calculate_spectrum!(
-    coeffs::AbstractArray{Complex{T}},
-    ::AutoBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-) where {T}
+# ---- AutoBackend (in-place) ----
+function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::AutoBackend,
+        grid::AbstractGrid, fields_vecs::Tuple, ms::Tuple; kwargs...) where {T}
     if isdefined(Main, :OhMyThreads) && Threads.nthreads() > 1
-        return _calculate_spectrum!(coeffs, ThreadedBackend(), coords_vecs, fields_vecs, ms; kwargs...)
+        return _calculate_spectrum!(coeffs, ThreadedBackend(), grid, fields_vecs, ms; kwargs...)
     else
-        return _calculate_spectrum!(coeffs, DirectSumBackend(), coords_vecs, fields_vecs, ms; kwargs...)
+        return _calculate_spectrum!(coeffs, DirectSumBackend(), grid, fields_vecs, ms; kwargs...)
     end
 end
 
-# Internal stub helpers for extensions
-function _calculate_spectrum_fft(args...; kwargs...)
-    throw(ArgumentError("FFTBackend is not loaded. Run `using FFTW` to load the FFTW extension."))
+# ---- Backends without an in-place path (use the allocating calculate_spectrum) ----
+function _calculate_spectrum!(::AbstractArray, backend::AbstractSpectralBackend,
+        grid::AbstractGrid, fields_vecs::Tuple, ms::Tuple; kwargs...)
+    throw(ArgumentError(
+        "$(nameof(typeof(backend))) does not support in-place calculate_spectrum! on a " *
+        "$(nameof(typeof(grid))). Use the allocating calculate_spectrum.",
+    ))
 end
 
-function _calculate_spectrum_nufft(args...; kwargs...)
-    throw(ArgumentError("NUFFTBackend is not loaded. Run `using FINUFFT` to load the FINUFFT extension."))
-end
-
-function _calculate_spectrum_sht(args...; kwargs...)
-    throw(ArgumentError("SHTBackend is not loaded. Run `using FastSphericalHarmonics` to load the FastSphericalHarmonics extension."))
-end
-
-function _calculate_spectrum_nufsht(args...; kwargs...)
-    throw(ArgumentError("NUFSHTBackend is not loaded. Run `using NUFSHT` to load the NUFSHT extension."))
-end
-
-function _calculate_spectrum_threaded(args...; kwargs...)
-    throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads` to load the OhMyThreads extension."))
-end
-
-function _calculate_spectrum_threaded!(args...; kwargs...)
-    throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads` to load the OhMyThreads extension."))
-end
-
-function _calculate_spectrum_gpu(args...; kwargs...)
-    throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions` to load the KernelAbstractions extension."))
-end
-
-function _calculate_spectrum_gpu!(args...; kwargs...)
-    throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions` to load the KernelAbstractions extension."))
-end
-
-function calculate_spectrum(
-    ::FFTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    return _calculate_spectrum_fft(coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function calculate_spectrum(
-    ::NUFFTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    return _calculate_spectrum_nufft(coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function calculate_spectrum(
-    ::SHTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    return _calculate_spectrum_sht(coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function calculate_spectrum(
-    ::NUFSHTBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    return _calculate_spectrum_nufsht(coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function calculate_spectrum(
-    ::ThreadedBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    return _calculate_spectrum_threaded(coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function calculate_spectrum(
-    backend::GPUBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    return _calculate_spectrum_gpu(backend, coords_vecs, fields_vecs, ms; kwargs...)
-end
-
-function calculate_spectrum(
-    ::AutoBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    if isdefined(Main, :OhMyThreads) && Threads.nthreads() > 1
-        return calculate_spectrum(ThreadedBackend(), coords_vecs, fields_vecs, ms; kwargs...)
-    else
-        return calculate_spectrum(DirectSumBackend(), coords_vecs, fields_vecs, ms; kwargs...)
-    end
-end
+# ============================================================================
+# Internal extension entry points — error until the relevant extension loads.
+# ============================================================================
+_calculate_spectrum_fft(args...; kwargs...) = throw(ArgumentError("FFTBackend is not loaded. Run `using FFTW`."))
+_calculate_spectrum_nufft(args...; kwargs...) = throw(ArgumentError("NUFFTBackend is not loaded. Run `using FINUFFT`."))
+_calculate_spectrum_sht(args...; kwargs...) = throw(ArgumentError("SHTBackend is not loaded. Run `using FastSphericalHarmonics`."))
+_calculate_spectrum_nufsht(args...; kwargs...) = throw(ArgumentError("NUFSHTBackend is not loaded. Run `using NUFSHT`."))
+_calculate_spectrum_threaded_cartesian!(args...; kwargs...) = throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads`."))
+_calculate_spectrum_threaded_spherical!(args...; kwargs...) = throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads`."))
+_calculate_spectrum_gpu_cartesian(args...; kwargs...) = throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions`."))
+_calculate_spectrum_gpu_spherical(args...; kwargs...) = throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions`."))
 
 # Stubs for plotting extension
 """
@@ -382,7 +362,8 @@ end
     
     @compile_workload begin
         # Compile Cartesian 2D DirectSum
-        c, k = calculate_spectrum(DirectSumBackend(), (xv, yv), (u, v), (4, 4))
+        cart = ScatteredCartesianGrid((xv, yv); domain_size = (10.0, 10.0))
+        c, k = calculate_spectrum(DirectSumBackend(), cart, (u, v), (4, 4))
         # Compile reductions
         isotropic_spectrum(k, c; num_bins=2)
         transect_spectrum(k, c, (1,))
@@ -390,7 +371,8 @@ end
         # Compile Spherical 2D DirectSum (theta, phi)
         theta = rand(T, 8) .* π
         phi = rand(T, 8) .* 2π
-        cs, ks = calculate_spectrum(DirectSumBackend(), (theta, phi), (rand(T, 8),), (2, 3))
+        sph = ScatteredSphericalGrid(theta, phi)
+        cs, ks = calculate_spectrum(DirectSumBackend(), sph, (rand(T, 8),), (2, 3))
         spherical_energy_spectrum(cs; lmax=1)
     end
 end

@@ -269,6 +269,30 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(sum(Co_fg) * dk, 0.5 * cov; rtol = 1e-6)
     end
 
+    Test.@testset "Anisotropy-resolved spectrum E(k,θ)" begin
+        L = 2π
+        N = 16
+        dx = L / N
+        xs = range(0.0, stop = L - dx, length = N)
+        xv = vec([x for x in xs, y in xs])
+        yv = vec([y for x in xs, y in xs])
+        f = @. cos(3 * xv) + 0.7 * sin(2 * yv)
+        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+        c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (N, N))
+
+        kb, θb, E = FFS.anisotropic_spectrum(ks, c; num_k_bins = 6, num_θ_bins = 12)
+        Test.@test size(E) == (6, 12)
+        Test.@test all(E .>= 0)
+
+        # Integrating over θ recovers the isotropic spectrum (away from the DC bin).
+        dθ = θb[2] - θb[1]
+        E_iso_from_aniso = vec(sum(E; dims = 2)) .* dθ
+        _, Ek = FFS.isotropic_spectrum(ks, c; num_bins = 6)
+        for ik in 2:6
+            Test.@test isapprox(E_iso_from_aniso[ik], Ek[ik]; rtol = 1e-8)
+        end
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

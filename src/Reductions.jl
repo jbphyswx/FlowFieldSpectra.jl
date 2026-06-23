@@ -5,7 +5,7 @@ using ..DirectSum: sph_mode_index
 
 export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!,
     spherical_energy_spectrum, spherical_energy_spectrum!,
-    cross_spectrum, cospectrum, quadspectrum
+    cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 
 """
     isotropic_spectrum(ks_phys::Tuple, coeffs::AbstractArray; num_bins::Int=minimum(size(coeffs)[1:end-1]) ÷ 2)
@@ -82,6 +82,54 @@ function isotropic_spectrum(
     E_k ./= dk
 
     return k_bins, E_k
+end
+
+"""
+    anisotropic_spectrum(ks_phys::Tuple, coeffs; num_k_bins=0, num_θ_bins=16)
+
+Anisotropy-resolved 2D energy spectrum ``E(k, \\theta)`` for a 2D Cartesian field: bin the
+energy ``\\tfrac12\\sum_c|C|^2`` by wavenumber magnitude ``k=|\\mathbf k|`` and polar angle
+``\\theta=\\mathrm{atan}(k_y, k_x)\\in(-\\pi,\\pi]``. Returns `(k_bins, θ_bins, E)` where `E` is
+`(num_k_bins, num_θ_bins)`, normalized as a density (per `dk·dθ`). Integrating over `θ` recovers
+the isotropic spectrum.
+"""
+function anisotropic_spectrum(
+    ks_phys::Tuple,
+    coeffs::AbstractArray{Complex{T}, N_dim};
+    num_k_bins::Int = 0,
+    num_θ_bins::Int = 16,
+) where {T<:AbstractFloat, N_dim}
+    D = length(ks_phys)
+    D == 2 || throw(ArgumentError("anisotropic_spectrum is defined for 2D fields (D=2), got D=$D"))
+    @assert N_dim == 3 "coeffs must have shape (mx, my, NU)"
+    ms = size(coeffs)[1:2]
+    NU = size(coeffs, 3)
+
+    k_max = minimum((maximum(abs.(ks_phys[1])), maximum(abs.(ks_phys[2]))))
+    num_k_bins <= 0 && (num_k_bins = minimum(ms) ÷ 2)
+
+    dk = k_max / num_k_bins
+    dθ = T(2π) / num_θ_bins
+    k_bins = [T(0.5) * dk + (i - 1) * dk for i in 1:num_k_bins]
+    θ_bins = [-T(π) + (j - T(0.5)) * dθ for j in 1:num_θ_bins]
+    E = zeros(T, num_k_bins, num_θ_bins)
+
+    @inbounds for I in CartesianIndices(ms)
+        kx = T(ks_phys[1][I[1]])
+        ky = T(ks_phys[2][I[2]])
+        k_mag = sqrt(kx^2 + ky^2)
+        (k_mag > k_max || k_mag == 0) && continue
+        ik = clamp(floor(Int, k_mag / dk) + 1, 1, num_k_bins)
+        θ = atan(ky, kx)                       # (-π, π]
+        iθ = clamp(floor(Int, (θ + T(π)) / dθ) + 1, 1, num_θ_bins)
+        energy = zero(T)
+        for c in 1:NU
+            energy += abs2(coeffs[I, c])
+        end
+        E[ik, iθ] += T(0.5) * energy
+    end
+    E ./= (dk * dθ)
+    return k_bins, θ_bins, E
 end
 
 """

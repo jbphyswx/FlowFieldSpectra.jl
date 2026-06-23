@@ -204,6 +204,44 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(P_1_1, -sqrt(FT(3) / (FT(8) * FT(π))) * s, atol = 1e-15)
     end
 
+    Test.@testset "Derived-quantity spectra (vorticity / divergence / compensated)" begin
+        # 2D incompressible flow: u = sin x cos y, v = -cos x sin y  (∇·u = 0),
+        # vorticity ω = ∂v/∂x - ∂u/∂y = 2 sin x sin y.
+        L = 2π
+        N = 16
+        dx = L / N
+        xs = range(0.0, stop = L - dx, length = N)
+        xv = vec([x for x in xs, y in xs])
+        yv = vec([y for x in xs, y in xs])
+        u = @. sin(xv) * cos(yv)
+        v = @. -cos(xv) * sin(yv)
+        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+        c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
+
+        # Divergence of an incompressible field is ~0.
+        divc = FFS.spectral_divergence(ks, c)
+        Test.@test maximum(abs.(divc)) < 1e-12
+
+        # Spectral vorticity matches the transform of the analytic vorticity field.
+        omega = @. 2 * sin(xv) * sin(yv)
+        co, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (omega,), (N, N))
+        vortc = FFS.spectral_vorticity(ks, c)
+        Test.@test isapprox(vortc[:, :, 1], co[:, :, 1]; atol = 1e-12)
+
+        # Enstrophy / energy obey Z(k) = k^2 E(k) on the active shell (k^2 = 2 here).
+        kb, Ek = FFS.isotropic_spectrum(ks, c; num_bins = 6)
+        _, Zk = FFS.isotropic_spectrum(ks, vortc; num_bins = 6)
+        active = findall(>(1e-12), Ek)
+        Test.@test !isempty(active)
+        for i in active
+            Test.@test isapprox(Zk[i] / Ek[i], 2.0; rtol = 1e-6)
+        end
+
+        # Compensated + band-integrated helpers.
+        Test.@test FFS.compensate(kb, Ek, 2.0) ≈ (kb .^ 2) .* Ek
+        Test.@test FFS.band_energy(kb, Ek, 0.0, maximum(kb)) >= 0.0
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

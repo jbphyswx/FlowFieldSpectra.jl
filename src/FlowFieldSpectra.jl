@@ -11,6 +11,7 @@ include("Plans.jl")
 include("SphericalKernels.jl")
 include("DirectSum.jl")
 include("Reductions.jl")
+include("Operators.jl")
 
 using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
 using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, physical_wavenumbers, spatial_dims, npoints
@@ -20,6 +21,7 @@ using .Problem: TransformProblem
 using .Plans: AbstractSpectralPlan, plan_spectrum
 using .DirectSum: sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
+using .Operators: spectral_divergence, spectral_vorticity, compensate, band_energy
 
 # Export Types
 export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
@@ -37,6 +39,7 @@ export AbstractSpectralPlan, plan_spectrum
 
 # Export APIs
 export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
+export spectral_divergence, spectral_vorticity, compensate, band_energy
 export plot_spectrum, compare_spectra, compare_spectral_analysis
 
 

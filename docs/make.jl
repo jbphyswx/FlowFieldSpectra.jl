@@ -27,8 +27,8 @@ makedocs(;
             "Spherical harmonics"      => "examples/spherical.md",
         ],
         "API Reference"          => "api.md",
+        "Internals"              => "internals.md",
     ],
-    warnonly = [:missing_docs, :docs_block],
 )
 
 deploydocs(;

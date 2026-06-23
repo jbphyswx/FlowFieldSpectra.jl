@@ -16,7 +16,7 @@ include("Operators.jl")
 using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
 using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, physical_wavenumbers, spatial_dims, npoints
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
-using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, Density, Power, SpectralConvention
+using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 using .Problem: TransformProblem
 using .Plans: AbstractSpectralPlan, plan_spectrum
 using .DirectSum: sph_mode_index
@@ -33,7 +33,7 @@ export AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
 # Export Preprocessing & Normalization (typed configuration)
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
 export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
-export AbstractSidedness, OneSided, TwoSided, AbstractScaling, Density, Power, SpectralConvention
+export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 export TransformProblem
 export AbstractSpectralPlan, plan_spectrum
 

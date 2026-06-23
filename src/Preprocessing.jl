@@ -12,7 +12,7 @@ export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey,
     AbstractWindow
 
 Supertype for apodization tapers applied per spectral axis before transforming. Concrete
-windows dispatch [`window_function!`](@ref). Reduces spectral leakage for non-periodic data;
+windows dispatch `window_function!`. Reduces spectral leakage for non-periodic data;
 only meaningful on uniform axes.
 """
 abstract type AbstractWindow end
@@ -126,7 +126,7 @@ end
     AbstractDetrend
 
 Supertype for detrending operations applied before transforming. Concrete subtypes dispatch
-[`detrend!`](@ref).
+`detrend!`.
 """
 abstract type AbstractDetrend end
 
@@ -189,7 +189,7 @@ Preprocessing applied to a field (per spectral axis) before transforming. Fields
 - `pad::Float64`: zero-padding factor (`≥ 1`); `1.0` means none.
 
 Window power/amplitude corrections for variance preservation are applied by the normalization
-layer via [`window_correction`](@ref).
+layer via `window_correction`.
 """
 struct Preprocess{D<:AbstractDetrend, W<:AbstractWindow}
     detrend::D

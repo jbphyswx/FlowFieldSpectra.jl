@@ -1,7 +1,7 @@
 module Normalization
 
 export AbstractSidedness, OneSided, TwoSided,
-    AbstractScaling, Density, Power,
+    AbstractScaling, DensityScaling, PowerScaling,
     SpectralConvention, sided_factor
 
 # =============================================================================
@@ -12,7 +12,7 @@ export AbstractSidedness, OneSided, TwoSided,
     AbstractSidedness
 
 Whether a spectrum keeps both signs of wavenumber (`TwoSided`) or folds negatives onto
-positives (`OneSided`). Dispatches [`sided_factor`](@ref).
+positives (`OneSided`). Dispatches `sided_factor`.
 """
 abstract type AbstractSidedness end
 
@@ -42,29 +42,29 @@ end
 """
     AbstractScaling
 
-Whether a reduced spectrum is reported as a spectral *density* (`Density`, divided by the bin
-width so `∫E dk` recovers variance) or as per-bin/per-mode `Power`.
+Whether a reduced spectrum is reported as a spectral *density* (`DensityScaling`, divided by the
+bin width so `∫E dk` recovers variance) or as per-bin/per-mode `PowerScaling`.
 """
 abstract type AbstractScaling end
 
-"""`Density()` — spectral density (per unit wavenumber); `∫E dk = Var(f)`."""
-struct Density <: AbstractScaling end
+"""`DensityScaling()` — spectral density (per unit wavenumber); `∫E dk = Var(f)`."""
+struct DensityScaling <: AbstractScaling end
 
-"""`Power()` — per-bin/per-mode power (no `dk` division)."""
-struct Power <: AbstractScaling end
+"""`PowerScaling()` — per-bin/per-mode power (no `dk` division)."""
+struct PowerScaling <: AbstractScaling end
 
 # =============================================================================
 # Convention object
 # =============================================================================
 
 """
-    SpectralConvention(; sided=OneSided(), scaling=Density(), parseval_check=false)
+    SpectralConvention(; sided=OneSided(), scaling=DensityScaling(), parseval_check=false)
 
 Convention governing how spectral coefficients become reported spectra, so the package never
 silently guesses normalization. Fields are typed for compile-time dispatch.
 
 - `sided::AbstractSidedness`: `OneSided()` (default) or `TwoSided()`.
-- `scaling::AbstractScaling`: `Density()` (default) or `Power()`.
+- `scaling::AbstractScaling`: `DensityScaling()` (default) or `PowerScaling()`.
 - `parseval_check::Bool`: when `true`, callers assert `Σ E·Δk ≈ Var(field)` (after mean
   removal) as a correctness self-test.
 
@@ -78,7 +78,7 @@ struct SpectralConvention{S<:AbstractSidedness, C<:AbstractScaling}
 end
 
 function SpectralConvention(; sided::AbstractSidedness = OneSided(),
-        scaling::AbstractScaling = Density(), parseval_check::Bool = false)
+        scaling::AbstractScaling = DensityScaling(), parseval_check::Bool = false)
     return SpectralConvention(sided, scaling, parseval_check)
 end
 

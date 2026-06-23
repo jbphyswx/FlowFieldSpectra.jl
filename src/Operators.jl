@@ -10,7 +10,7 @@ export spectral_divergence, spectral_vorticity, compensate, band_energy
 
 Spectral divergence ``\\widehat{\\nabla\\cdot u} = i\\,\\sum_d k_d\\,\\hat u_d`` of a `D`-component
 vector field whose Fourier coefficients are `coeffs` of shape `(ms..., D)`. Returns a
-`(ms..., 1)` coefficient array; take its [`isotropic_spectrum`](@ref) for the divergence
+`(ms..., 1)` coefficient array; take its `isotropic_spectrum` for the divergence
 (compressive) spectrum. Defined for `D = 1, 2, 3`.
 """
 function spectral_divergence(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}) where {T, N}
@@ -38,7 +38,7 @@ Spectral vorticity ``\\hat\\omega = i\\,k \\times \\hat u`` of a vector field wi
 - `D = 2`: scalar out-of-plane vorticity → `(ms..., 1)`.
 - `D = 3`: 3-component vorticity vector → `(ms..., 3)`.
 
-Take the [`isotropic_spectrum`](@ref) of the result for the enstrophy spectrum
+Take the `isotropic_spectrum` of the result for the enstrophy spectrum
 ``Z(k) = \\tfrac12 |\\hat\\omega|^2``. (`D = 1` has no curl.)
 """
 function spectral_vorticity(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}) where {T, N}

@@ -392,6 +392,46 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             FFS.FFTBackend(), cg, ([1.0, 2, 3],), (4, 4))
     end
 
+    Test.@testset "Welch averaging + coherence / phase" begin
+        Random.seed!(2024)
+        L = 2π
+        N = 64
+        dx = L / N
+        x = collect(range(0.0, stop = L - dx, length = N))
+        grid = FFS.UniformCartesianGrid((x,); domain_size = (L,))
+
+        nens = 60
+        kc = 5                               # shared (coherent) wavenumber
+        cf = zeros(ComplexF64, N, nens)
+        cg = zeros(ComplexF64, N, nens)
+        for e in 1:nens
+            ϕ = 2π * rand()                  # common phase for this realization
+            shared = cos.(kc .* x .+ ϕ)
+            f = shared .+ 0.3 .* randn(N)     # f: coherent part + own noise
+            g = 0.8 .* shared .+ 0.3 .* randn(N)  # g: correlated at kc + own noise
+            ce, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (N,))
+            cge, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (g,), (N,))
+            cf[:, e] .= ce[:, 1]
+            cg[:, e] .= cge[:, 1]
+        end
+        ks = (FFS.calculate_spectrum(FFS.FFTBackend(), grid, (x,), (N,))[2][1],)
+
+        kb, γ², φ = FFS.coherence_spectrum(ks, cf, cg; num_bins = 16)
+        Test.@test all(0 .<= γ² .<= 1)
+        # The coherent bin (containing k = kc) should have high coherence.
+        ic = argmin(abs.(kb .- kc))
+        Test.@test γ²[ic] > 0.7
+        # A noise-only bin (well away from kc) should be markedly less coherent.
+        inoise = argmin(abs.(kb .- (kc + 6)))
+        Test.@test γ²[inoise] < γ²[ic]
+        Test.@test length(φ) == length(kb)
+
+        # Welch power spectrum: non-negative, peaks at the coherent wavenumber.
+        kbw, Ew = FFS.welch_power_spectrum(ks, cf; num_bins = 16)
+        Test.@test all(Ew .>= 0)
+        Test.@test argmin(abs.(kbw .- kc)) == argmax(Ew)
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

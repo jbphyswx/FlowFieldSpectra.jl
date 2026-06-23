@@ -49,6 +49,13 @@ cospectrum
 quadspectrum
 ```
 
+## Averaging (variance reduction, coherence & phase)
+
+```@docs
+welch_power_spectrum
+coherence_spectrum
+```
+
 ## Derived quantities & post-processing
 
 ```@docs

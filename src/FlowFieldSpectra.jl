@@ -20,7 +20,7 @@ using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, De
 using .Problem: TransformProblem
 using .Plans: AbstractSpectralPlan, plan_spectrum
 using .DirectSum: sph_mode_index
-using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
+using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum
 using .Operators: spectral_divergence, spectral_vorticity, compensate, band_energy
 
 # Export Types
@@ -40,6 +40,7 @@ export AbstractSpectralPlan, plan_spectrum
 # Export APIs
 export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
 export spectral_divergence, spectral_vorticity, compensate, band_energy
+export cross_spectrum, cospectrum, quadspectrum
 export plot_spectrum, compare_spectra, compare_spectral_analysis
 
 

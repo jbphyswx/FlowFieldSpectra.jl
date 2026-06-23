@@ -242,6 +242,33 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test FFS.band_energy(kb, Ek, 0.0, maximum(kb)) >= 0.0
     end
 
+    Test.@testset "Cross-spectrum / co-spectrum (flux by scale)" begin
+        L = 2π
+        N = 16
+        dx = L / N
+        xs = range(0.0, stop = L - dx, length = N)
+        xv = vec([x for x in xs, y in xs])
+        yv = vec([y for x in xs, y in xs])
+        f = @. cos(2 * xv) + 0.5 * sin(3 * yv)
+        g = @. cos(2 * xv) - 0.3 * cos(yv)
+        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+        cf, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (N, N))
+        cg, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (g,), (N, N))
+
+        # Auto-cross-spectrum equals the energy spectrum (self-consistency); auto-quad is zero.
+        kb, Co_ff = FFS.cospectrum(ks, cf, cf; num_bins = 6)
+        _, Ek = FFS.isotropic_spectrum(ks, cf; num_bins = 6)
+        Test.@test isapprox(Co_ff, Ek; rtol = 1e-10)
+        _, Q_ff = FFS.quadspectrum(ks, cf, cf; num_bins = 6)
+        Test.@test maximum(abs.(Q_ff)) < 1e-10
+
+        # Integrated co-spectrum recovers 1/2 * covariance <f g> (energy-like convention).
+        _, Co_fg = FFS.cospectrum(ks, cf, cg; num_bins = 6)
+        dk = kb[2] - kb[1]
+        cov = Statistics.mean(f .* g)
+        Test.@test isapprox(sum(Co_fg) * dk, 0.5 * cov; rtol = 1e-6)
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

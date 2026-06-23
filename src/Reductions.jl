@@ -3,7 +3,9 @@ module Reductions
 using Statistics: mean
 using ..DirectSum: sph_mode_index
 
-export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!
+export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!,
+    spherical_energy_spectrum, spherical_energy_spectrum!,
+    cross_spectrum, cospectrum, quadspectrum
 
 """
     isotropic_spectrum(ks_phys::Tuple, coeffs::AbstractArray; num_bins::Int=minimum(size(coeffs)[1:end-1]) ÷ 2)
@@ -80,6 +82,80 @@ function isotropic_spectrum(
     E_k ./= dk
 
     return k_bins, E_k
+end
+
+"""
+    cross_spectrum(ks_phys::Tuple, coeffs_f, coeffs_g; num_bins=0)
+
+Radially-binned **cross-spectrum** ``S_{fg}(k) = \\tfrac{1}{2}\\sum_{c}\\hat f_c\\,\\overline{\\hat g_c}``
+of two fields whose coefficients `coeffs_f`, `coeffs_g` share shape `(ms..., NU)`. Returns
+`(k_bins, S)` with `S` complex.
+
+Its real part is the **co-spectrum** ([`cospectrum`](@ref)) — the scale-by-scale covariance whose
+integral recovers ``\\langle f\\,g\\rangle`` (e.g. the momentum-flux co-spectrum ``\\langle u'w'\\rangle``);
+its negative imaginary part is the **quadrature spectrum** ([`quadspectrum`](@ref)). Coherence and
+phase additionally require segment/ensemble averaging to be meaningful.
+"""
+function cross_spectrum(
+    ks_phys::Tuple,
+    coeffs_f::AbstractArray{Complex{T}, N_dim},
+    coeffs_g::AbstractArray{Complex{T}, N_dim};
+    num_bins::Int = 0,
+) where {T<:AbstractFloat, N_dim}
+    D = length(ks_phys)
+    @assert N_dim == D + 1 "coeffs must have shape (m1, ..., mD, NU)"
+    size(coeffs_f) == size(coeffs_g) || throw(DimensionMismatch("coeffs_f and coeffs_g must match"))
+
+    ms = size(coeffs_f)[1:D]
+    NU = size(coeffs_f, N_dim)
+
+    max_ks = [maximum(abs.(ks_phys[d])) for d in 1:D]
+    k_max = minimum(max_ks)
+    num_bins <= 0 && (num_bins = minimum(ms) ÷ 2)
+
+    bin_edges = range(zero(T), stop = k_max, length = num_bins + 1)
+    dk = k_max / num_bins
+    k_bins = [T(0.5) * (bin_edges[i] + bin_edges[i+1]) for i in 1:num_bins]
+    S = zeros(Complex{T}, num_bins)
+
+    kd2 = [T.(ks_phys[d]) .^ 2 for d in 1:D]
+    @inbounds for I in CartesianIndices(ms)
+        k_mag = zero(T)
+        for d in 1:D
+            k_mag += kd2[d][I[d]]
+        end
+        k_mag = sqrt(k_mag)
+        if k_mag <= k_max
+            bin_idx = clamp(floor(Int, k_mag / dk) + 1, 1, num_bins)
+            acc = zero(Complex{T})
+            for c in 1:NU
+                acc += coeffs_f[I, c] * conj(coeffs_g[I, c])
+            end
+            S[bin_idx] += T(0.5) * acc
+        end
+    end
+    S ./= dk
+    return k_bins, S
+end
+
+"""
+    cospectrum(ks_phys, coeffs_f, coeffs_g; num_bins=0) -> (k_bins, Co)
+
+Co-spectrum ``\\mathrm{Co}_{fg}(k) = \\mathrm{Re}\\,S_{fg}(k)`` — the in-phase, flux-carrying part.
+"""
+function cospectrum(ks_phys::Tuple, coeffs_f, coeffs_g; num_bins::Int = 0)
+    k_bins, S = cross_spectrum(ks_phys, coeffs_f, coeffs_g; num_bins = num_bins)
+    return k_bins, real.(S)
+end
+
+"""
+    quadspectrum(ks_phys, coeffs_f, coeffs_g; num_bins=0) -> (k_bins, Q)
+
+Quadrature spectrum ``Q_{fg}(k) = -\\mathrm{Im}\\,S_{fg}(k)`` — the 90°-out-of-phase part.
+"""
+function quadspectrum(ks_phys::Tuple, coeffs_f, coeffs_g; num_bins::Int = 0)
+    k_bins, S = cross_spectrum(ks_phys, coeffs_f, coeffs_g; num_bins = num_bins)
+    return k_bins, -imag.(S)
 end
 
 """

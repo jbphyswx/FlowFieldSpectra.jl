@@ -1,8 +1,7 @@
 module DirectSum
 
-using ..Types: DirectSumBackend
-using ..Grids: physical_wavenumbers
-using ..SphericalKernels: legendre_tables, fill_legendre!
+using ..Grids: Grids
+using ..SphericalKernels: SphericalKernels
 
 export sph_mode_index
 
@@ -45,7 +44,7 @@ function _calculate_spectrum_cartesian_direct!(
     end
 
     # Generate physical wavenumbers consistent with FFTW/FINUFFT (shared definition)
-    ks_phys = physical_wavenumbers(ranges, ms, FT)
+    ks_phys = Grids.physical_wavenumbers(ranges, ms, FT)
 
     # Zero out coeffs (in case of reuse)
     fill!(coeffs, zero(Complex{FT}))
@@ -99,7 +98,7 @@ function _calculate_spectrum_spherical_direct!(
     fill!(coeffs, zero(Complex{FT}))
 
     # Precompute recurrence coefficients once; reuse a per-point Legendre table buffer.
-    tables = legendre_tables(FT, lmax)
+    tables = SphericalKernels.legendre_tables(FT, lmax)
     Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
 
     @inbounds for j in 1:N
@@ -111,7 +110,7 @@ function _calculate_spectrum_spherical_direct!(
         sj = sin(θj)
 
         # Fill P_l^m(cos θj) for all (l, m≥0) once for this point.
-        fill_legendre!(Plm, tables, xj, sj, lmax)
+        SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
 
         for l in 0:lmax
             for m in -l:l

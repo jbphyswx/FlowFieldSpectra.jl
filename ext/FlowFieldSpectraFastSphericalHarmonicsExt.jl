@@ -1,7 +1,7 @@
 module FlowFieldSpectraFastSphericalHarmonicsExt
 
 using FastSphericalHarmonics: FastSphericalHarmonics
-using FlowFieldSpectra: FlowFieldSpectra as FFS, SHTBackend, sph_mode_index
+using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 """
     calculate_spectrum(::SHTBackend, coords_vecs, fields_vecs, ms; ...)
@@ -43,7 +43,7 @@ function FFS._calculate_spectrum_sht(
         # Map to complex coefficients coeffs
         for l in 0:lmax
             for m in -l:l
-                idx = sph_mode_index(l, m)
+                idx = FFS.sph_mode_index(l, m)
                 # FastSphericalHarmonics.sph_mode(l, m) returns the CartesianIndex of the real coefficient
                 fsh_idx = FastSphericalHarmonics.sph_mode(l, m)
                 coeffs[idx, k] = grid_data[fsh_idx]

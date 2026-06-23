@@ -3,6 +3,7 @@ using Random: Random
 using Statistics: Statistics
 using LinearAlgebra: LinearAlgebra as LA
 using Aqua: Aqua as Aqua
+using ExplicitImports: ExplicitImports as EI
 
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW
@@ -15,6 +16,24 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
     Test.@testset "Aqua Code Quality Analysis" begin
         # Test code quality, exports, and namespace cleanliness
         Aqua.test_all(FFS; ambiguities = false)
+    end
+
+    Test.@testset "Explicit imports (no implicit / no stale)" begin
+        # Enforce the package style: no reliance on bare `using` re-exports, no dead imports.
+        # Checks the core module and every loaded backend extension.
+        Test.@test (EI.check_no_implicit_imports(FFS); true)
+        Test.@test (EI.check_no_stale_explicit_imports(FFS); true)
+        for extname in (
+            :FlowFieldSpectraFFTWExt,
+            :FlowFieldSpectraFINUFFTExt,
+            :FlowFieldSpectraFastSphericalHarmonicsExt,
+            :FlowFieldSpectraNUFSHTExt,
+        )
+            ext = Base.get_extension(FFS, extname)
+            ext === nothing && continue
+            Test.@test (EI.check_no_implicit_imports(ext); true)
+            Test.@test (EI.check_no_stale_explicit_imports(ext); true)
+        end
     end
 
     Test.@testset "Cartesian Uniform Parity (Direct vs FFTW)" begin

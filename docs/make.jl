@@ -1,12 +1,15 @@
-using Documenter
+using Documenter: Documenter
+# `using FlowFieldSpectra` (bare) is intentional: Documenter's `@docs` blocks resolve the
+# exported names in this module's scope. Every other package is loaded module-qualified
+# (`using X: X`) purely to activate its extension, so no foreign exports leak in to clash.
 using FlowFieldSpectra
-using FFTW
-using FINUFFT
-using FastSphericalHarmonics
-using NUFSHT
-using CairoMakie
+using FFTW: FFTW
+using FINUFFT: FINUFFT
+using FastSphericalHarmonics: FastSphericalHarmonics
+using NUFSHT: NUFSHT
+using CairoMakie: CairoMakie
 
-makedocs(;
+Documenter.makedocs(;
     modules  = [FlowFieldSpectra],
     sitename = "FlowFieldSpectra.jl",
     authors  = "Jordan Benjamin",
@@ -31,7 +34,7 @@ makedocs(;
     ],
 )
 
-deploydocs(;
+Documenter.deploydocs(;
     repo   = "github.com/jbphyswx/FlowFieldSpectra.jl",
     target = "build",
     branch = "gh-pages",

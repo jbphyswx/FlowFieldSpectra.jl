@@ -1,6 +1,6 @@
 module Problem
 
-using ..Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, spatial_dims, npoints
+using ..Grids: AbstractGrid
 
 export TransformProblem, n_spectral, n_batch, batch_size, output_size,
     pack_fields, coeff_eltype

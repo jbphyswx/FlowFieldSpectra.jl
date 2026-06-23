@@ -1,7 +1,6 @@
 module Reductions
 
-using Statistics: mean
-using ..DirectSum: sph_mode_index
+using ..DirectSum: DirectSum
 
 export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!,
     spherical_energy_spectrum, spherical_energy_spectrum!,
@@ -320,7 +319,7 @@ function spherical_energy_spectrum(
     for l in 0:lmax
         energy = zero(T)
         for m in -l:l
-            idx = sph_mode_index(l, m)
+            idx = DirectSum.sph_mode_index(l, m)
             for c in 1:NU
                 energy += abs2(coeffs[idx, c])
             end
@@ -491,7 +490,7 @@ function spherical_energy_spectrum!(
     @inbounds for l in 0:lmax
         energy = zero(T)
         for m in -l:l
-            idx = sph_mode_index(l, m)
+            idx = DirectSum.sph_mode_index(l, m)
             for c in 1:NU
                 energy += abs2(coeffs[idx, c])
             end

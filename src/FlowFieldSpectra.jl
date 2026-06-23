@@ -14,7 +14,7 @@ include("Reductions.jl")
 include("Operators.jl")
 
 using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
-using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, physical_wavenumbers, spatial_dims, npoints
+using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 using .Problem: TransformProblem

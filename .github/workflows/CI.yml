@@ -16,7 +16,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1.11', '1.12', '1']
+        # 1.11 is the floor: Project.toml [sources]/[workspace] (used for the unregistered
+        # NUFSHT.jl) require Julia >= 1.11. Add '1.10' back once those packages are registered.
+        version: ['1.11', '1.12', '1']
         os: [ubuntu-latest]
         arch: [x64]
         include:

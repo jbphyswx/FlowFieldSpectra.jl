@@ -47,6 +47,13 @@ using Pkg
 Pkg.add("FlowFieldSpectra")
 ```
 
+> **Julia 1.11+.** The package uses Project.toml `[sources]`/`[workspace]` (a Julia 1.11 feature) to
+> pull in the spherical backend [NUFSHT.jl](https://github.com/jbphyswx/NUFSHT.jl), which is not yet
+> in the General registry. Nothing in the source actually needs 1.11 — once NUFSHT and the sibling
+> packages are registered, the floor can drop back to 1.10 (possibly 1.9). If you only need the
+> Cartesian backends, or you `dev` NUFSHT locally, older Julia versions will likely work, but that is
+> untested.
+
 ---
 
 ## Extension Architecture: Unlocking Fast Paths

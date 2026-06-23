@@ -34,6 +34,12 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
   `docs/generate_assets/generate_assets.jl`.
 
 ### Changed
+- **Minimum Julia is now 1.11.** The package uses Project.toml `[sources]`/`[workspace]` (added in
+  Julia 1.11) to pull in the as-yet-unregistered NUFSHT.jl; on 1.10 those tables are ignored and the
+  test/extension environment cannot resolve NUFSHT. Nothing in the source itself requires 1.11 — once
+  NUFSHT (and the sibling packages) are registered in the General registry, the floor can drop back to
+  1.10 (possibly 1.9). Users who `dev` NUFSHT locally can likely run on older Julia, but that path is
+  untested.
 - `calculate_spectrum`/`calculate_spectrum!` now dispatch on `(backend, grid, fields, ms)`. The
   coordinate system is determined by the grid type — the fragile coordinate-range heuristic that
   guessed Cartesian-vs-spherical is removed entirely (no guessing, no warnings, no fallbacks).

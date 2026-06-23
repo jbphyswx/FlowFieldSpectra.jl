@@ -293,6 +293,86 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         end
     end
 
+    Test.@testset "Parseval invariant + D=1/2/3 coverage (DirectSum vs FFT)" begin
+        Random.seed!(11)
+        for D in 1:3
+            N = D == 3 ? 8 : 16
+            L = 2π
+            dx = L / N
+            ax = collect(range(0.0, stop = L - dx, length = N))
+            grids = ntuple(d -> ax, D)
+            mesh = Iterators.product(grids...)
+            coords = ntuple(d -> [pt[d] for pt in mesh] |> vec, D)
+            # Real demeaned field built from a few low wavenumbers.
+            f = zeros(N^D)
+            for pt_i in 1:length(coords[1])
+                s = 0.0
+                for d in 1:D
+                    s += cos((d + 1) * coords[d][pt_i]) + 0.3 * sin((d) * coords[d][pt_i])
+                end
+                f[pt_i] = s
+            end
+            f .-= Statistics.mean(f)
+            ms = ntuple(_ -> N, D)
+            domain = ntuple(_ -> L, D)
+            grid = FFS.UniformCartesianGrid(coords; domain_size = domain)
+
+            c_fft, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), ms)
+            c_dir, _ = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (f,), ms)
+            # D-dimensional parity.
+            Test.@test isapprox(c_fft, c_dir; atol = 1e-10)
+            # Parseval: sum|C|^2 (1/N-normalized coeffs) == mean(f^2) == var(f).
+            Test.@test isapprox(sum(abs2, c_fft), Statistics.mean(abs2, f); rtol = 1e-10)
+        end
+    end
+
+    Test.@testset "Plan reuse parity + batch (FFTW / FINUFFT)" begin
+        Random.seed!(99)
+        L = 2π
+        N = 16
+        dx = L / N
+        ax = range(0.0, stop = L - dx, length = N)
+        xv = vec([x for x in ax, y in ax])
+        yv = vec([y for x in ax, y in ax])
+        u = @. cos(2xv) + sin(3yv)
+        v = @. sin(xv)
+        ug = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+
+        # FFTW plan reuse == one-shot.
+        c1, _ = FFS.calculate_spectrum(FFS.FFTBackend(), ug, (u, v), (N, N))
+        plan = FFS.plan_spectrum(FFS.FFTBackend(), ug, Float64, (N, N); n_transf = 2)
+        cc = zeros(ComplexF64, N, N, 2)
+        FFS.calculate_spectrum!(cc, plan, (u, v))
+        Test.@test cc ≈ c1
+
+        # FINUFFT batched plan: each slice matches an independent single-field transform.
+        xs = rand(64) .* L
+        ys = rand(64) .* L
+        sg = FFS.ScatteredCartesianGrid((xs, ys); domain_size = (L, L))
+        nb = 5
+        stack = zeros(64, nb)
+        for b in 1:nb
+            @. stack[:, b] = cos(b * xs) + sin(b * ys)
+        end
+        bplan = FFS.plan_spectrum(FFS.NUFFTBackend(), sg, Float64, (N, N); n_transf = nb, eps = 1e-10)
+        C = zeros(ComplexF64, N, N, nb)
+        FFS.calculate_spectrum!(C, bplan, stack)
+        for b in (1, nb)
+            cb, _ = FFS.calculate_spectrum(FFS.NUFFTBackend(), sg, (stack[:, b],), (N, N); eps = 1e-10)
+            Test.@test C[:, :, b] ≈ cb[:, :, 1]
+        end
+    end
+
+    Test.@testset "Grid dispatch errors (no silent misroute)" begin
+        sg = FFS.ScatteredSphericalGrid([0.1, 0.2, 0.3], [0.1, 0.2, 0.3])
+        cg = FFS.ScatteredCartesianGrid(([0.0, 1, 2], [0.0, 1, 2]))
+        # FFT on a spherical grid is unsupported and must error clearly.
+        Test.@test_throws ArgumentError FFS.calculate_spectrum(FFS.FFTBackend(), sg, ([1.0, 2, 3],), (2, 3))
+        # In-place FFT (needs a plan) is not a (backend, grid) in-place method.
+        Test.@test_throws ArgumentError FFS.calculate_spectrum!(zeros(ComplexF64, 4, 4, 1),
+            FFS.FFTBackend(), cg, ([1.0, 2, 3],), (4, 4))
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

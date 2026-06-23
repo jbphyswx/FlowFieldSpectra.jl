@@ -8,6 +8,7 @@ include("Preprocessing.jl")
 include("Normalization.jl")
 include("Problem.jl")
 include("Plans.jl")
+include("SphericalKernels.jl")
 include("DirectSum.jl")
 include("Reductions.jl")
 

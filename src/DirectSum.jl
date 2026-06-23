@@ -2,6 +2,7 @@ module DirectSum
 
 using ..Types: DirectSumBackend
 using ..Grids: physical_wavenumbers
+using ..SphericalKernels: legendre_tables, fill_legendre!
 
 export sph_mode_index
 
@@ -97,7 +98,10 @@ function _calculate_spectrum_spherical_direct!(
     # Zero out coeffs (in case of reuse)
     fill!(coeffs, zero(Complex{FT}))
 
-    # Compute SHT direct summation - SERIAL with on-the-fly Legendre
+    # Precompute recurrence coefficients once; reuse a per-point Legendre table buffer.
+    tables = legendre_tables(FT, lmax)
+    Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
+
     @inbounds for j in 1:N
         θj = θ[j]
         φj = φ[j]
@@ -106,10 +110,13 @@ function _calculate_spectrum_spherical_direct!(
         xj = cos(θj)
         sj = sin(θj)
 
+        # Fill P_l^m(cos θj) for all (l, m≥0) once for this point.
+        fill_legendre!(Plm, tables, xj, sj, lmax)
+
         for l in 0:lmax
             for m in -l:l
                 abs_m = abs(m)
-                P_l_m = _normalized_legendre(l, abs_m, xj, sj)
+                P_l_m = Plm[l+1, abs_m+1]
 
                 factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
                 phase = cis(m * φj)
@@ -125,39 +132,6 @@ function _calculate_spectrum_spherical_direct!(
     end
 
     return (0:lmax, -lmax:lmax)
-end
-
-"""
-    _normalized_legendre(l, m, x, s)
-
-Compute normalized associated Legendre polynomial P_l^m(x) using recurrence.
-On-the-fly computation avoids storing the full matrix.
-"""
-@inline function _normalized_legendre(l::Int, m::Int, x::FT, s::FT)::FT where FT
-    m > l && return zero(FT)
-
-    # P_m^m via sectoral recurrence
-    P_mm = one(FT) / sqrt(FT(4π))
-    @inbounds for mm in 1:m
-        P_mm *= -sqrt(FT(2mm + 1) / (2mm)) * s
-    end
-
-    l == m && return P_mm
-
-    # P_{m+1}^m using first-step recurrence
-    P_lm = x * sqrt(FT(2m + 3)) * P_mm
-    P_lminus1_m = P_mm
-
-    l == m + 1 && return P_lm
-
-    # Standard recurrence for higher l
-    @inbounds for ll in (m+2):l
-        coeff1 = sqrt(FT(4ll^2 - 1) / (ll^2 - m^2))
-        coeff2 = sqrt(FT(2ll + 1) * ((ll - 1)^2 - m^2) / ((2ll - 3) * (ll^2 - m^2)))
-        P_lminus1_m, P_lm = P_lm, x * coeff1 * P_lm - coeff2 * P_lminus1_m
-    end
-
-    return P_lm
 end
 
 end # module DirectSum

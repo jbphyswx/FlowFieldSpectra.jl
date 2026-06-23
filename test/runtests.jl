@@ -195,9 +195,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         x = FT(0.5)
         s = sqrt(one(FT) - x^2)
         
-        P_0_0 = FFS.DirectSum._normalized_legendre(0, 0, x, s)
-        P_1_0 = FFS.DirectSum._normalized_legendre(1, 0, x, s)
-        P_1_1 = FFS.DirectSum._normalized_legendre(1, 1, x, s)
+        P_0_0 = FFS.SphericalKernels.normalized_legendre(0, 0, x, s)
+        P_1_0 = FFS.SphericalKernels.normalized_legendre(1, 0, x, s)
+        P_1_1 = FFS.SphericalKernels.normalized_legendre(1, 1, x, s)
         
         Test.@test isapprox(P_0_0, one(FT) / sqrt(FT(4π)), atol = 1e-15)
         Test.@test isapprox(P_1_0, sqrt(FT(3) / (FT(4) * FT(π))) * x, atol = 1e-15)

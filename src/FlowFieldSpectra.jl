@@ -13,10 +13,11 @@ include("DirectSum.jl")
 include("Reductions.jl")
 include("Operators.jl")
 include("Averaging.jl")
+include("LombScargle.jl")
 
 using .Types: AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
 using .Grids: AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
-using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
+using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 using .Problem: TransformProblem
 using .Plans: AbstractSpectralPlan, plan_spectrum
@@ -24,6 +25,7 @@ using .DirectSum: sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 using .Operators: spectral_divergence, spectral_vorticity, compensate, band_energy
 using .Averaging: welch_power_spectrum, coherence_spectrum
+using .LombScargle: lomb_scargle
 
 # Export Types
 export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend, ThreadedBackend, GPUBackend, AutoBackend
@@ -34,7 +36,7 @@ export AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular
 
 # Export Preprocessing & Normalization (typed configuration)
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
-export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess
+export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 export TransformProblem
 export AbstractSpectralPlan, plan_spectrum
@@ -43,7 +45,7 @@ export AbstractSpectralPlan, plan_spectrum
 export calculate_spectrum, calculate_spectrum!, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index
 export spectral_divergence, spectral_vorticity, compensate, band_energy
 export cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
-export welch_power_spectrum, coherence_spectrum
+export welch_power_spectrum, coherence_spectrum, lomb_scargle
 export plot_spectrum, compare_spectra, compare_spectral_analysis
 
 

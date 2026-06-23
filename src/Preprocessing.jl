@@ -1,8 +1,10 @@
 module Preprocessing
 
+using LinearAlgebra: SymTridiagonal, eigen
+
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey,
     AbstractDetrend, NoDetrend, Demean, LinearDetrend,
-    Preprocess, window_function, window_function!, window_correction, detrend!
+    Preprocess, window_function, window_function!, window_correction, detrend!, dpss
 
 # =============================================================================
 # Window tapers (dispatch on type, not Symbol)
@@ -200,6 +202,42 @@ end
 function Preprocess(; detrend::AbstractDetrend = Demean(), window::AbstractWindow = NoWindow(),
         pad::Real = 1.0)
     return Preprocess(detrend, window, Float64(pad))
+end
+
+# =============================================================================
+# Multitaper: discrete prolate spheroidal sequences (Slepian tapers)
+# =============================================================================
+
+"""
+    dpss(N::Integer, NW::Real, K::Integer = floor(Int, 2NW) - 1; T = Float64) -> Matrix{T}
+
+Discrete prolate spheroidal sequences (Slepian tapers): the `K` length-`N` sequences with maximal
+spectral concentration in the half-bandwidth `W = NW/N`, returned as an `N×K` orthonormal matrix
+whose column `k` is the order-`(k-1)` taper. `NW` is the time–bandwidth product (typical `2.5`–`4`);
+`K ≈ 2·NW − 1` tapers are usefully concentrated.
+
+Multitaper power spectral estimation reuses the ensemble machinery: apply each taper to the
+(demeaned) signal, transform the `K` tapered copies as a batch, and average their periodograms
+with [`welch_power_spectrum`]. The tapers are the eigenvectors of a symmetric tridiagonal matrix
+(Percival & Walden), computed here with `LinearAlgebra.eigen`.
+"""
+function dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1);
+        T::Type = Float64)
+    N >= 2 || throw(ArgumentError("N must be ≥ 2"))
+    1 <= K <= N || throw(ArgumentError("need 1 ≤ K ≤ N"))
+    W = T(NW) / N
+    diag = T[((N - 1 - 2 * n) / 2)^2 * cospi(2W) for n in 0:(N-1)]
+    offd = T[(n * (N - n)) / 2 for n in 1:(N-1)]
+    F = eigen(SymTridiagonal(diag, offd))
+    # eigenvalues ascending → DPSS orders 0..K-1 are the K largest (take last K, reverse).
+    V = Matrix{T}(F.vectors[:, (N-K+1):N][:, end:-1:1])
+    # Polarity convention: even orders have positive sum; odd orders a positive leading lobe.
+    @inbounds for k in 1:K
+        v = @view V[:, k]
+        s = isodd(k) ? sum(v) : sum(j -> (j - (N + 1) / 2) * v[j], 1:N)
+        s < 0 && (v .*= -one(T))
+    end
+    return V
 end
 
 end # module Preprocessing

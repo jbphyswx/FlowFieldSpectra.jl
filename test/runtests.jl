@@ -432,6 +432,45 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test argmin(abs.(kbw .- kc)) == argmax(Ew)
     end
 
+    Test.@testset "Multitaper (DPSS) tapers + estimate" begin
+        N = 128
+        K = 7
+        V = FFS.dpss(N, 4.0, K)
+        Test.@test size(V) == (N, K)
+        Test.@test maximum(abs.(V' * V - Matrix(LA.I(K)))) < 1e-8   # orthonormal
+        Test.@test_throws ArgumentError FFS.dpss(N, 4.0, N + 1)
+
+        # Multitaper PSD of a pure tone peaks at the tone (reuses the Welch averaging path).
+        L = 2π
+        dx = L / N
+        x = collect(range(0.0, stop = L - dx, length = N))
+        k0 = 7
+        sig = cos.(k0 .* x)
+        grid = FFS.UniformCartesianGrid((x,); domain_size = (L,))
+        C = zeros(ComplexF64, N, K)
+        for k in 1:K
+            c, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (V[:, k] .* sig,), (N,))
+            C[:, k] .= c[:, 1]
+        end
+        ks = (FFS.calculate_spectrum(FFS.FFTBackend(), grid, (x,), (N,))[2][1],)
+        kb, E = FFS.welch_power_spectrum(ks, C; num_bins = 16)
+        Test.@test argmin(abs.(kb .- k0)) == argmax(E)
+    end
+
+    Test.@testset "Lomb–Scargle (irregular sampling)" begin
+        Random.seed!(7)
+        N = 200
+        t = sort(rand(N) .* 10.0)            # irregular sample times in [0, 10]
+        f0 = 1.3
+        y = sin.(2π * f0 .* t) .+ 0.2 .* randn(N)
+        freqs = collect(range(0.1, stop = 4.0, length = 256))
+        P = FFS.lomb_scargle(t, y, freqs)
+        Test.@test length(P) == length(freqs)
+        Test.@test all(P .>= 0)
+        Test.@test abs(freqs[argmax(P)] - f0) < 0.1     # peak at the true frequency
+        Test.@test_throws ArgumentError FFS.lomb_scargle(t, y, [0.0, 1.0])
+    end
+
     # GPU/KA tests
     include("test_gpu.jl")
 

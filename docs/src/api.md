@@ -54,6 +54,7 @@ quadspectrum
 ```@docs
 welch_power_spectrum
 coherence_spectrum
+lomb_scargle
 ```
 
 ## Derived quantities & post-processing
@@ -79,6 +80,7 @@ AbstractDetrend
 NoDetrend
 Demean
 LinearDetrend
+dpss
 SpectralConvention
 AbstractSidedness
 OneSided

@@ -10,6 +10,8 @@ using FFTW: FFTW
 using FINUFFT: FINUFFT
 using FastSphericalHarmonics: FastSphericalHarmonics
 using NUFSHT: NUFSHT
+using OhMyThreads: OhMyThreads
+using KernelAbstractions: KernelAbstractions as KA
 
 Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
@@ -34,6 +36,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             :FlowFieldSpectraFINUFFTExt,
             :FlowFieldSpectraFastSphericalHarmonicsExt,
             :FlowFieldSpectraNUFSHTExt,
+            :FlowFieldSpectraOhMyThreadsExt,
+            :FlowFieldSpectraKernelAbstractionsExt,
+            :FlowFieldSpectraGPUFFTExt,
         )
             ext = Base.get_extension(FFS, extname)
             ext === nothing && continue
@@ -64,10 +69,10 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
 
         # 1. Compute via DirectSumBackend
-        c_direct, k_direct = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (u, v), ms)
+        c_direct, k_direct = FFS.calculate_spectrum(grid, (u, v), ms; transform = FFS.DirectSumBackend())
 
         # 2. Compute via FFTBackend (requires FFTW)
-        c_fft, k_fft = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), ms)
+        c_fft, k_fft = FFS.calculate_spectrum(grid, (u, v), ms; transform = FFS.FFTBackend())
 
         # Test bit-wise parity (FFT and Direct summation are mathematically equivalent)
         Test.@test isapprox(c_direct, c_fft, atol = 1e-12)
@@ -112,11 +117,11 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         grid = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
 
         # 1. Compute via DirectSumBackend
-        c_direct, k_direct = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (u, v), ms)
+        c_direct, k_direct = FFS.calculate_spectrum(grid, (u, v), ms; transform = FFS.DirectSumBackend())
 
         # 2. Compute via NUFFTBackend (requires FINUFFT)
         c_nufft, k_nufft =
-            FFS.calculate_spectrum(FFS.NUFFTBackend(), grid, (u, v), ms; eps = 1e-12)
+            FFS.calculate_spectrum(grid, (u, v), ms; transform = FFS.NUFFTBackend(), eps = 1e-12)
 
         Test.@test isapprox(c_direct, c_nufft, atol = 1e-10)
         Test.@test all(isapprox(k_direct[d], k_nufft[d], rtol = 1e-12) for d in 1:2)
@@ -142,16 +147,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
         # 1. Structured transform via SHTBackend
         sgrid = FFS.StructuredSphericalGrid(theta_nodes, phi_nodes)
-        c_sht, _ = FFS.calculate_spectrum(FFS.SHTBackend(), sgrid, (f_val,), (Nθ, Nφ))
+        c_sht, _ = FFS.calculate_spectrum(sgrid, (f_val,), (Nθ, Nφ); transform = FFS.SHTBackend())
 
-        # 2. Direct transform via DirectSumBackend
-        # Clenshaw-Curtis quadrature weights
-        w = NUFSHT.make_plan(theta_nodes, phi_nodes, lmax).sph_plan_synth' * ones(Nθ, Nφ)
-        # Note: FastSphericalHarmonics uses a specific quadrature normalization.
-        # DirectSum SHT uses weights to compute projection.
-        # Let's verify that the structure of the recovered coefficients is correct
-        # and match c_sht exactly.
-        
         # Test that the SHTBackend recovered the correct coefficients
         for l in 0:lmax
             for m in -l:l
@@ -196,14 +193,14 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
         # 1. NUFSHT adjoint transform
         c_nufsht_adj, _ =
-            FFS.calculate_spectrum(FFS.NUFSHTBackend(), usgrid, (f_val,), (Nθ, Nφ); solve = false)
+            FFS.calculate_spectrum(usgrid, (f_val,), (Nθ, Nφ); transform = FFS.NUFSHTBackend(), solve = false)
 
         # 2. NUFSHT CG solve transform
         c_nufsht_sol, _ = FFS.calculate_spectrum(
-            FFS.NUFSHTBackend(),
             usgrid,
             (f_val,),
             (Nθ, Nφ);
+            transform = FFS.NUFSHTBackend(),
             solve = true,
             rtol = 1e-8,
             maxiter = 1000,
@@ -219,14 +216,103 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         FT = Float64
         x = FT(0.5)
         s = sqrt(one(FT) - x^2)
-        
+
         P_0_0 = FFS.SphericalKernels.normalized_legendre(0, 0, x, s)
         P_1_0 = FFS.SphericalKernels.normalized_legendre(1, 0, x, s)
         P_1_1 = FFS.SphericalKernels.normalized_legendre(1, 1, x, s)
-        
+
         Test.@test isapprox(P_0_0, one(FT) / sqrt(FT(4π)), atol = 1e-15)
         Test.@test isapprox(P_1_0, sqrt(FT(3) / (FT(4) * FT(π))) * x, atol = 1e-15)
         Test.@test isapprox(P_1_1, -sqrt(FT(3) / (FT(8) * FT(π))) * s, atol = 1e-15)
+    end
+
+    Test.@testset "Execution-axis parity (Serial / Threaded / Auto / GPU-CPU)" begin
+        # The execution axis must not change the result: for every transform, Serial / Threaded /
+        # Auto / GPU(KA.CPU()) agree, and unsupported combinations error clearly (no silent fallback).
+        Random.seed!(314)
+        L = 2π
+        ms = (16, 16)
+        dx = L / ms[1]
+        dy = L / ms[2]
+        xs = range(0.0, stop = L - dx, length = ms[1])
+        ys = range(0.0, stop = L - dy, length = ms[2])
+        xv = vec([x for x in xs, y in ys])
+        yv = vec([y for x in xs, y in ys])
+        u = @. cos(2xv) + 0.5 * sin(3yv)
+        v = @. sin(xv)
+        ug = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+        sc = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
+
+        # DirectSum: Serial vs Threaded / Auto / GPU(KA.CPU()) — Cartesian.
+        ref, kref = FFS.calculate_spectrum(sc, (u, v), ms; transform = FFS.DirectSumBackend(), execution = FFS.SerialBackend())
+        for exec in (FFS.ThreadedBackend(), FFS.AutoBackend(), FFS.GPUBackend(KA.CPU()))
+            c, k = FFS.calculate_spectrum(sc, (u, v), ms; transform = FFS.DirectSumBackend(), execution = exec)
+            Test.@test isapprox(c, ref; atol = 1e-12)
+            Test.@test all(isapprox(collect(k[d]), collect(kref[d]); rtol = 1e-12) for d in 1:2)
+        end
+
+        # FFT: Serial vs Threaded parity, and vs DirectSum.
+        cf_s, _ = FFS.calculate_spectrum(ug, (u, v), ms; transform = FFS.FFTBackend(), execution = FFS.SerialBackend())
+        cf_t, _ = FFS.calculate_spectrum(ug, (u, v), ms; transform = FFS.FFTBackend(), execution = FFS.ThreadedBackend())
+        cd, _ = FFS.calculate_spectrum(ug, (u, v), ms; transform = FFS.DirectSumBackend())
+        Test.@test isapprox(cf_s, cf_t; atol = 1e-12)
+        Test.@test isapprox(cf_s, cd; atol = 1e-12)
+
+        # NUFFT: Serial vs Threaded parity.
+        cn_s, _ = FFS.calculate_spectrum(sc, (u, v), ms; transform = FFS.NUFFTBackend(), execution = FFS.SerialBackend(), eps = 1e-12)
+        cn_t, _ = FFS.calculate_spectrum(sc, (u, v), ms; transform = FFS.NUFFTBackend(), execution = FFS.ThreadedBackend(), eps = 1e-12)
+        Test.@test isapprox(cn_s, cn_t; atol = 1e-10)
+
+        # In-place DirectSum: Serial vs Threaded parity, and vs the allocating result.
+        c_ip_s = zeros(ComplexF64, ms..., 2)
+        c_ip_t = zeros(ComplexF64, ms..., 2)
+        FFS.calculate_spectrum!(c_ip_s, sc, (u, v), ms; execution = FFS.SerialBackend())
+        FFS.calculate_spectrum!(c_ip_t, sc, (u, v), ms; execution = FFS.ThreadedBackend())
+        Test.@test isapprox(c_ip_s, c_ip_t; atol = 1e-12)
+        Test.@test isapprox(c_ip_s, ref; atol = 1e-12)
+
+        # Spherical DirectSum: Serial vs Threaded / GPU(KA.CPU()).
+        Random.seed!(20)
+        θ = rand(60) .* π
+        φ = rand(60) .* 2π
+        fθ = rand(60)
+        sph = FFS.ScatteredSphericalGrid(θ, φ)
+        cs_s, _ = FFS.calculate_spectrum(sph, (fθ,), (6, 11); transform = FFS.DirectSumBackend(), execution = FFS.SerialBackend())
+        for exec in (FFS.ThreadedBackend(), FFS.GPUBackend(KA.CPU()))
+            cs, _ = FFS.calculate_spectrum(sph, (fθ,), (6, 11); transform = FFS.DirectSumBackend(), execution = exec)
+            Test.@test isapprox(cs_s, cs; atol = 1e-10)
+        end
+
+        # SHT: the execution axis is a documented no-op (Serial == Threaded, identical output).
+        lmaxs = 4
+        Nθs = lmaxs + 1
+        Nφs = 2 * lmaxs + 1
+        pts = FastSphericalHarmonics.sph_points(Nθs)
+        tn = vec([θ for θ in pts[1], φ in pts[2]])
+        pn = vec([φ for θ in pts[1], φ in pts[2]])
+        Ct = zeros(Nθs, Nφs)
+        Ct[FastSphericalHarmonics.sph_mode(2, 1)] = 1.0
+        fv = vec(FastSphericalHarmonics.sph_evaluate(Ct))
+        sgs = FFS.StructuredSphericalGrid(tn, pn)
+        csht_s, _ = FFS.calculate_spectrum(sgs, (fv,), (Nθs, Nφs); transform = FFS.SHTBackend(), execution = FFS.SerialBackend())
+        csht_t, _ = FFS.calculate_spectrum(sgs, (fv,), (Nθs, Nφs); transform = FFS.SHTBackend(), execution = FFS.ThreadedBackend())
+        Test.@test csht_s == csht_t
+
+        # Synthesize: Serial vs Threaded round-trip parity.
+        coeffs, _ = FFS.calculate_spectrum(ug, (u,), ms; transform = FFS.DirectSumBackend())
+        rs = FFS.synthesize(ug, coeffs, ms; execution = FFS.SerialBackend())
+        rt = FFS.synthesize(ug, coeffs, ms; execution = FFS.ThreadedBackend())
+        Test.@test isapprox(rs[1], rt[1]; atol = 1e-12)
+        Test.@test isapprox(rs[1], u; atol = 1e-10)
+
+        # GPU FFT is device-generic (via AbstractFFTs): FFTBackend × GPUBackend(KA.CPU()) stages to a
+        # host Array and transforms with FFTW, matching the serial FFT — so the GPU-FFT wiring is
+        # exercised on CI without a real GPU (on CUDA the identical path uses CUFFT).
+        cf_gpu, _ = FFS.calculate_spectrum(ug, (u, v), ms; transform = FFS.FFTBackend(), execution = FFS.GPUBackend(KA.CPU()))
+        Test.@test isapprox(cf_gpu, cf_s; atol = 1e-12)
+        # GPU NUFFT is genuinely CUDA-only (cuFINUFFT; no portable equivalent in FINUFFT.jl), so a
+        # non-CUDA KA device must raise rather than silently fall back to a direct sum.
+        Test.@test_throws ArgumentError FFS.calculate_spectrum(sc, (u,), ms; transform = FFS.NUFFTBackend(), execution = FFS.GPUBackend(KA.CPU()))
     end
 
     Test.@testset "Derived-quantity spectra (vorticity / divergence / compensated)" begin
@@ -241,7 +327,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         u = @. sin(xv) * cos(yv)
         v = @. -cos(xv) * sin(yv)
         grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-        c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
+        c, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
 
         # Divergence of an incompressible field is ~0.
         divc = FFS.spectral_divergence(ks, c)
@@ -249,7 +335,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
         # Spectral vorticity matches the transform of the analytic vorticity field.
         omega = @. 2 * sin(xv) * sin(yv)
-        co, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (omega,), (N, N))
+        co, _ = FFS.calculate_spectrum(grid, (omega,), (N, N); transform = FFS.FFTBackend())
         vortc = FFS.spectral_vorticity(ks, c)
         Test.@test isapprox(vortc[:, :, 1], co[:, :, 1]; atol = 1e-12)
 
@@ -277,8 +363,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         f = @. cos(2 * xv) + 0.5 * sin(3 * yv)
         g = @. cos(2 * xv) - 0.3 * cos(yv)
         grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-        cf, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (N, N))
-        cg, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (g,), (N, N))
+        cf, ks = FFS.calculate_spectrum(grid, (f,), (N, N); transform = FFS.FFTBackend())
+        cg, _ = FFS.calculate_spectrum(grid, (g,), (N, N); transform = FFS.FFTBackend())
 
         # Auto-cross-spectrum equals the energy spectrum (self-consistency); auto-quad is zero.
         kb, Co_ff = FFS.cospectrum(ks, cf, cf; num_bins = 6)
@@ -303,7 +389,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         yv = vec([y for x in xs, y in xs])
         f = @. cos(3 * xv) + 0.7 * sin(2 * yv)
         grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-        c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (N, N))
+        c, ks = FFS.calculate_spectrum(grid, (f,), (N, N); transform = FFS.FFTBackend())
 
         kb, θb, E = FFS.anisotropic_spectrum(ks, c; num_k_bins = 6, num_θ_bins = 12)
         Test.@test size(E) == (6, 12)
@@ -342,8 +428,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             domain = ntuple(_ -> L, D)
             grid = FFS.UniformCartesianGrid(coords; domain_size = domain)
 
-            c_fft, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), ms)
-            c_dir, _ = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (f,), ms)
+            c_fft, _ = FFS.calculate_spectrum(grid, (f,), ms; transform = FFS.FFTBackend())
+            c_dir, _ = FFS.calculate_spectrum(grid, (f,), ms; transform = FFS.DirectSumBackend())
             # D-dimensional parity.
             Test.@test isapprox(c_fft, c_dir; atol = 1e-10)
             # Parseval: sum|C|^2 (1/N-normalized coeffs) == mean(f^2) == var(f).
@@ -367,9 +453,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             f1 = [sum(cos((d + 1) * coords[d][i]) for d in 1:D) for i in 1:N^D]
             f2 = [sum(sin(d * coords[d][i]) for d in 1:D) for i in 1:N^D]
             # Real input → rfft branch; complex input (identical values) → full-FFT branch.
-            c_real, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f1, f2), ms)
-            c_cplx, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid,
-                (ComplexF64.(f1), ComplexF64.(f2)), ms)
+            c_real, _ = FFS.calculate_spectrum(grid, (f1, f2), ms; transform = FFS.FFTBackend())
+            c_cplx, _ = FFS.calculate_spectrum(grid,
+                (ComplexF64.(f1), ComplexF64.(f2)), ms; transform = FFS.FFTBackend())
             Test.@test isapprox(c_real, c_cplx; atol = 1e-12)
         end
     end
@@ -385,8 +471,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         f = @. cos(2xv) + 0.5f0 * sin(3yv)
         ug = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
 
-        c_dir, _ = FFS.calculate_spectrum(FFS.DirectSumBackend(), ug, (f,), (N, N))
-        c_fft, ks = FFS.calculate_spectrum(FFS.FFTBackend(), ug, (f,), (N, N))
+        c_dir, _ = FFS.calculate_spectrum(ug, (f,), (N, N); transform = FFS.DirectSumBackend())
+        c_fft, ks = FFS.calculate_spectrum(ug, (f,), (N, N); transform = FFS.FFTBackend())
         # Coefficient eltype stays single precision through the whole pipeline.
         Test.@test eltype(c_dir) === ComplexF32
         Test.@test eltype(c_fft) === ComplexF32
@@ -401,10 +487,10 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         ys = rand(Float32, 80) .* L
         fs = @. cos(xs) + sin(2ys)
         sg = FFS.ScatteredCartesianGrid((xs, ys); domain_size = (L, L))
-        c32, _ = FFS.calculate_spectrum(FFS.NUFFTBackend(), sg, (fs,), (N, N))
+        c32, _ = FFS.calculate_spectrum(sg, (fs,), (N, N); transform = FFS.NUFFTBackend())
         Test.@test eltype(c32) === ComplexF32
         sg64 = FFS.ScatteredCartesianGrid((Float64.(xs), Float64.(ys)); domain_size = (Float64(L), Float64(L)))
-        c64, _ = FFS.calculate_spectrum(FFS.NUFFTBackend(), sg64, (Float64.(fs),), (N, N))
+        c64, _ = FFS.calculate_spectrum(sg64, (Float64.(fs),), (N, N); transform = FFS.NUFFTBackend())
         Test.@test isapprox(ComplexF64.(c32), c64; atol = 1e-3)
     end
 
@@ -421,8 +507,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         ug = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
 
         # FFTW plan reuse == one-shot.
-        c1, _ = FFS.calculate_spectrum(FFS.FFTBackend(), ug, (u, v), (N, N))
-        plan = FFS.plan_spectrum(FFS.FFTBackend(), ug, Float64, (N, N); n_transf = 2)
+        c1, _ = FFS.calculate_spectrum(ug, (u, v), (N, N); transform = FFS.FFTBackend())
+        plan = FFS.plan_spectrum(ug, Float64, (N, N); transform = FFS.FFTBackend(), n_transf = 2)
         cc = zeros(ComplexF64, N, N, 2)
         FFS.calculate_spectrum!(cc, plan, (u, v))
         Test.@test cc ≈ c1
@@ -436,11 +522,11 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         for b in 1:nb
             @. stack[:, b] = cos(b * xs) + sin(b * ys)
         end
-        bplan = FFS.plan_spectrum(FFS.NUFFTBackend(), sg, Float64, (N, N); n_transf = nb, eps = 1e-10)
+        bplan = FFS.plan_spectrum(sg, Float64, (N, N); transform = FFS.NUFFTBackend(), n_transf = nb, eps = 1e-10)
         C = zeros(ComplexF64, N, N, nb)
         FFS.calculate_spectrum!(C, bplan, stack)
         for b in (1, nb)
-            cb, _ = FFS.calculate_spectrum(FFS.NUFFTBackend(), sg, (stack[:, b],), (N, N); eps = 1e-10)
+            cb, _ = FFS.calculate_spectrum(sg, (stack[:, b],), (N, N); transform = FFS.NUFFTBackend(), eps = 1e-10)
             Test.@test C[:, :, b] ≈ cb[:, :, 1]
         end
     end
@@ -449,10 +535,10 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         sg = FFS.ScatteredSphericalGrid([0.1, 0.2, 0.3], [0.1, 0.2, 0.3])
         cg = FFS.ScatteredCartesianGrid(([0.0, 1, 2], [0.0, 1, 2]))
         # FFT on a spherical grid is unsupported and must error clearly.
-        Test.@test_throws ArgumentError FFS.calculate_spectrum(FFS.FFTBackend(), sg, ([1.0, 2, 3],), (2, 3))
-        # In-place FFT (needs a plan) is not a (backend, grid) in-place method.
+        Test.@test_throws ArgumentError FFS.calculate_spectrum(sg, ([1.0, 2, 3],), (2, 3); transform = FFS.FFTBackend())
+        # In-place FFT (needs a plan) is not a (transform, execution, grid) in-place method.
         Test.@test_throws ArgumentError FFS.calculate_spectrum!(zeros(ComplexF64, 4, 4, 1),
-            FFS.FFTBackend(), cg, ([1.0, 2, 3],), (4, 4))
+            cg, ([1.0, 2, 3],), (4, 4); transform = FFS.FFTBackend())
     end
 
     Test.@testset "Welch averaging + coherence / phase" begin
@@ -472,12 +558,12 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             shared = cos.(kc .* x .+ ϕ)
             f = shared .+ 0.3 .* randn(N)     # f: coherent part + own noise
             g = 0.8 .* shared .+ 0.3 .* randn(N)  # g: correlated at kc + own noise
-            ce, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (N,))
-            cge, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (g,), (N,))
+            ce, _ = FFS.calculate_spectrum(grid, (f,), (N,); transform = FFS.FFTBackend())
+            cge, _ = FFS.calculate_spectrum(grid, (g,), (N,); transform = FFS.FFTBackend())
             cf[:, e] .= ce[:, 1]
             cg[:, e] .= cge[:, 1]
         end
-        ks = (FFS.calculate_spectrum(FFS.FFTBackend(), grid, (x,), (N,))[2][1],)
+        ks = (FFS.calculate_spectrum(grid, (x,), (N,); transform = FFS.FFTBackend())[2][1],)
 
         kb, γ², φ = FFS.coherence_spectrum(ks, cf, cg; num_bins = 16)
         Test.@test all(0 .<= γ² .<= 1)
@@ -512,10 +598,10 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         grid = FFS.UniformCartesianGrid((x,); domain_size = (L,))
         C = zeros(ComplexF64, N, K)
         for k in 1:K
-            c, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (V[:, k] .* sig,), (N,))
+            c, _ = FFS.calculate_spectrum(grid, (V[:, k] .* sig,), (N,); transform = FFS.FFTBackend())
             C[:, k] .= c[:, 1]
         end
-        ks = (FFS.calculate_spectrum(FFS.FFTBackend(), grid, (x,), (N,))[2][1],)
+        ks = (FFS.calculate_spectrum(grid, (x,), (N,); transform = FFS.FFTBackend())[2][1],)
         kb, E = FFS.welch_power_spectrum(ks, C; num_bins = 16)
         Test.@test argmin(abs.(kb .- k0)) == argmax(E)
     end
@@ -544,7 +630,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         yv = vec([y for x in xs, y in xs])
         u = @. cos(2xv) + 0.5 * sin(3yv) - 0.3 * cos(xv + 2yv)
         grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-        coeffs, _ = FFS.calculate_spectrum(FFS.DirectSumBackend(), grid, (u,), (N, N))
+        coeffs, _ = FFS.calculate_spectrum(grid, (u,), (N, N); transform = FFS.DirectSumBackend())
         urec = FFS.synthesize(grid, coeffs, (N, N))
         Test.@test urec isa Tuple
         Test.@test isapprox(urec[1], u; atol = 1e-10)
@@ -571,63 +657,18 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test all(isfinite, fs[1])
     end
 
-    Test.@testset "Allocations (in-place reductions + steady-state plans ≈ 0)" begin
-        # Measure through function barriers (typed args) so `@allocated` reflects the kernel,
-        # not closure-capture boxing of global testset variables.
-        _iso(Ek, kb, ks, c, nb) =
-            @allocated FFS.isotropic_spectrum!(Ek, kb, ks, c; num_bins = nb)
-        _tr(Er, c, ms) = @allocated FFS.Reductions._accumulate_transect!(Er, c, ms, 1, (1,), (ms[2],))
-        _sph(El, C, l) = @allocated FFS.spherical_energy_spectrum!(El, C; lmax = l)
-        _exec(out, plan, f) = @allocated FFS.calculate_spectrum!(out, plan, (f,))
+    # Allocation guarantees: every in-place / prebuilt-plan path allocates exactly zero
+    # (grid-independent), and the must-allocate ops allocate only ~their output.
+    include("test_allocs.jl")
 
-        Random.seed!(5)
-        N = 16
-        L = 2π
-        dx = L / N
-        xs = range(0.0, stop = L - dx, length = N)
-        xv = vec([x for x in xs, y in xs])
-        yv = vec([y for x in xs, y in xs])
-        u = @. cos(2xv) + sin(3yv)
-        grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-        c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u,), (N, N))
-
-        # --- In-place reductions: genuinely zero steady-state allocation. ---
-        nb = 6
-        E_k = zeros(Float64, nb)
-        k_bins = zeros(Float64, nb)
-        _iso(E_k, k_bins, ks, c, nb)                      # warmup
-        Test.@test _iso(E_k, k_bins, ks, c, nb) == 0
-
-        E_red = zeros(Float64, N)
-        _tr(E_red, c, (N, N))
-        Test.@test _tr(E_red, c, (N, N)) == 0
-
-        lmax = 8
-        Csph = zeros(ComplexF64, lmax + 1, 2lmax + 1, 1)
-        Csph[FFS.sph_mode_index(3, 1), 1] = 1.0
-        E_l = zeros(Float64, lmax + 1)
-        _sph(E_l, Csph, lmax)
-        Test.@test _sph(E_l, Csph, lmax) == 0
-
-        # --- Steady-state plan execution: small, constant (does not scale with data). ---
-        fplan = FFS.plan_spectrum(FFS.FFTBackend(), grid, Float64, (N, N); n_transf = 1)
-        cc = zeros(ComplexF64, N, N, 1)
-        _exec(cc, fplan, u)
-        Test.@test _exec(cc, fplan, u) < 1024            # broadcast/reshape wrappers only
-
-        Random.seed!(6)
-        M = 200
-        px = rand(M) .* L
-        py = rand(M) .* L
-        fs = @. cos(px) + sin(2py)
-        sg = FFS.ScatteredCartesianGrid((px, py); domain_size = (L, L))
-        nplan = FFS.plan_spectrum(FFS.NUFFTBackend(), sg, Float64, (N, N); n_transf = 1)
-        cn = zeros(ComplexF64, N, N, 1)
-        _exec(cn, nplan, fs)
-        Test.@test _exec(cn, nplan, fs) < 512
-    end
-
-    # GPU/KA tests
+    # GPU/KA tests (portable KA path on KA.CPU(); real-device parity lives in gpu/)
     include("test_gpu.jl")
+
+    # Distributed execution parity (in-process workers). Loads `Distributed` last so the earlier
+    # execution-axis testset sees the distribution stubs unloaded.
+    include("test_distributed.jl")
+
+    # MPI execution parity (mpiexec subprocess; guarded/skips if MPI is not functional here).
+    include("test_mpi.jl")
 
 end

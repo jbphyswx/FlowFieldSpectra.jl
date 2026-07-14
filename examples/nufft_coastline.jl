@@ -31,7 +31,7 @@ function run_nufft_coastline_example()
 
     # Reference spectrum: FFT on the full uniform grid.
     grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-    c_fft, k_fft = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f_grid,), (N, N))
+    c_fft, k_fft = FFS.calculate_spectrum(grid, (f_grid,), (N, N); transform = FFS.FFTBackend())
     k_ref, E_ref = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 24)
 
     # 2. Jitter the sample locations off the grid (non-uniform sampling).
@@ -51,7 +51,7 @@ function run_nufft_coastline_example()
 
     # 4. NUFFT on the irregular ocean-only cloud → retrieved spectrum.
     ocean_grid = FFS.ScatteredCartesianGrid((xo, yo); domain_size = (L, L))
-    c_nufft, k_nufft = FFS.calculate_spectrum(FFS.NUFFTBackend(), ocean_grid, (fo,), (N, N); eps = 1e-9)
+    c_nufft, k_nufft = FFS.calculate_spectrum(ocean_grid, (fo,), (N, N); transform = FFS.NUFFTBackend(), eps = 1e-9)
     k_nu, E_nu = FFS.isotropic_spectrum(k_nufft, c_nufft; num_bins = 24)
 
     # 5. Figure: masked sample cloud + retrieved vs reference spectrum.

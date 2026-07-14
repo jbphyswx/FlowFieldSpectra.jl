@@ -1,8 +1,14 @@
 module FlowFieldSpectraFFTWExt
 
 using FFTW: FFTW
-using LinearAlgebra: mul!
-using FlowFieldSpectra: FlowFieldSpectra as FFS, FFTBackend
+using LinearAlgebra: LinearAlgebra as LA
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+
+# Internal library thread count selected by the execution backend: ThreadedBackend → all threads,
+# every other (Serial, …) → single-threaded. FFTW bakes the thread count into the plan, so this is
+# applied before planning.
+_exec_nthreads(::FFS.ThreadedBackend) = Threads.nthreads()
+_exec_nthreads(::FFS.AbstractExecutionBackend) = 1
 
 # =============================================================================
 # Reusable FFTW plan for uniform Cartesian grids.
@@ -24,7 +30,8 @@ struct FFTWCartesianPlan{T, D, N, P, KS} <: FFS.AbstractSpectralPlan
 end
 
 function _fftw_plan(::Type{T}, ms::NTuple{D, Int}, domain_size::NTuple{D},
-        n_transf::Int, iflag::Int) where {T, D}
+        n_transf::Int, iflag::Int, nthreads::Int) where {T, D}
+    FFTW.set_num_threads(nthreads)
     inbuf = zeros(Complex{T}, ms..., n_transf)
     outbuf = similar(inbuf)
     fwd = iflag == 1 ? FFTW.plan_fft(inbuf, 1:D) : FFTW.plan_bfft(inbuf, 1:D)
@@ -37,9 +44,10 @@ function _fftw_plan(::Type{T}, ms::NTuple{D, Int}, domain_size::NTuple{D},
     )
 end
 
-function FFS.plan_spectrum(::FFTBackend, g::FFS.AbstractCartesianGrid, ::Type{T},
-        ms::NTuple{D, Int}; n_transf::Int = 1, iflag::Int = 1) where {T, D}
-    return _fftw_plan(T, ms, g.domain_size, n_transf, iflag)
+function FFS.plan_spectrum(::FFS.FFTBackend, exec::FFS.AbstractExecutionBackend,
+        g::FFS.AbstractCartesianGrid, ::Type{T}, ms::NTuple{D, Int};
+        n_transf::Int = 1, iflag::Int = 1) where {T, D}
+    return _fftw_plan(T, ms, g.domain_size, n_transf, iflag, _exec_nthreads(exec))
 end
 
 # Fill the plan's input buffer from a tuple of field vectors (each length prod(ms)).
@@ -47,12 +55,28 @@ function _load_input!(plan::FFTWCartesianPlan{T, D}, fields_vecs::Tuple) where {
     length(fields_vecs) == plan.n_transf ||
         throw(DimensionMismatch("expected $(plan.n_transf) fields, got $(length(fields_vecs))"))
     M = prod(plan.ms)
-    @inbounds for u in 1:length(fields_vecs)
-        length(fields_vecs[u]) == M ||
-            throw(DimensionMismatch("field $u length $(length(fields_vecs[u])) != prod(ms)=$M"))
-        copyto!(selectdim(plan.inbuf, D + 1, u), fields_vecs[u])
+    # `enumerate` (not `fields_vecs[u]` with a runtime index) keeps the per-field element type
+    # concrete for a heterogeneous `Tuple`, so the copy is type-stable and does not box. The linear
+    # offset copy into the batch slice avoids a `selectdim` SubArray, and converts real→Complex.
+    @inbounds for (u, fu) in enumerate(fields_vecs)
+        length(fu) == M ||
+            throw(DimensionMismatch("field $u length $(length(fu)) != prod(ms)=$M"))
+        copyto!(plan.inbuf, (u - 1) * M + 1, fu, 1, M)
     end
     return plan
+end
+
+# Fused fftshift (circshift by `shifts` over the spectral dims) + `norm` scale, writing `src` → `dst`
+# in one allocation-free pass. Replaces `circshift!(dst, src, shifts); dst .*= norm`, which allocated
+# a small constant per call inside Base's `circshift!` and made a second pass over the data.
+function _fftshift_scale!(dst::AbstractArray{Complex{T}, N}, src::AbstractArray{Complex{T}, N},
+        shifts::NTuple{N, Int}, norm::T) where {T, N}
+    sz = size(src)
+    @inbounds for I in CartesianIndices(src)
+        J = CartesianIndex(ntuple(d -> mod(I[d] - 1 - shifts[d], sz[d]) + 1, Val(N)))
+        dst[I] = src[J] * norm
+    end
+    return dst
 end
 
 # Fill from a packed array of shape (ms..., batch...) (batch flattened to n_transf).
@@ -75,9 +99,8 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::FFTWCa
     size(coeffs) == (plan.ms..., plan.n_transf) ||
         throw(DimensionMismatch("coeffs size $(size(coeffs)) != $((plan.ms..., plan.n_transf))"))
     _load_input!(plan, fields)
-    mul!(plan.outbuf, plan.fwd, plan.inbuf)
-    circshift!(coeffs, plan.outbuf, plan.shifts)
-    coeffs .*= plan.norm
+    LA.mul!(plan.outbuf, plan.fwd, plan.inbuf)
+    _fftshift_scale!(coeffs, plan.outbuf, plan.shifts, plan.norm)
     return plan.ks_phys
 end
 
@@ -123,8 +146,10 @@ function _rfft_spectrum(::Type{T}, fields_vecs::Tuple, ms::NTuple{D, Int}, ds) w
     return coeffs, FFS.Grids.physical_wavenumbers(ds, ms, T)
 end
 
-# One-shot allocating entry (called by the core (backend, grid) dispatch).
+# One-shot allocating entry (called by the core (transform, execution, grid) dispatch). The
+# execution backend selects the FFTW internal thread count (applied before any transform/plan).
 function FFS._calculate_spectrum_fft(
+    exec::FFS.AbstractExecutionBackend,
     coords_vecs::Tuple,
     fields_vecs::Tuple,
     ms::Tuple;
@@ -132,6 +157,8 @@ function FFS._calculate_spectrum_fft(
     domain_size::Union{Nothing, Tuple} = nothing,
     kwargs...,
 )
+    nth = _exec_nthreads(exec)
+    FFTW.set_num_threads(nth)
     D = length(ms)
     NU = length(fields_vecs)
     T = float(real(eltype(fields_vecs[1])))
@@ -142,7 +169,7 @@ function FFS._calculate_spectrum_fft(
     if iflag == 1 && all(f -> eltype(f) <: Real, fields_vecs)
         return _rfft_spectrum(T, fields_vecs, NTuple{D, Int}(ms), ds)
     end
-    plan = _fftw_plan(T, NTuple{D, Int}(ms), ds, NU, iflag)
+    plan = _fftw_plan(T, NTuple{D, Int}(ms), ds, NU, iflag, nth)
     coeffs = zeros(Complex{T}, ms..., NU)
     ks = FFS.calculate_spectrum!(coeffs, plan, fields_vecs)
     return coeffs, ks

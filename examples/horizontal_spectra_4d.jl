@@ -38,7 +38,7 @@ function run_horizontal_spectra_4d_example()
     end
 
     # Build the plan ONCE for the fixed points, transform the whole z*t stack in one exec.
-    plan = FFS.plan_spectrum(FFS.NUFFTBackend(), hgrid, Float64, ms; n_transf = nb, eps = 1e-9)
+    plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.NUFFTBackend(), n_transf = nb, eps = 1e-9)
     coeffs = zeros(ComplexF64, ms..., nb)
     ks = FFS.calculate_spectrum!(coeffs, plan, stack)
 

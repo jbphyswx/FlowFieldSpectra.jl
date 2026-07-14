@@ -251,20 +251,20 @@ function transect_spectrum(
         dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
     end
 
-    _accumulate_transect!(E_reduced, coeffs, ms, NU, keep_dims, out_shape)
+    _accumulate_transect!(E_reduced, coeffs, ms, NU, dims)
     E_reduced .*= dk_prod
 
     ks_reduced = Tuple(ks_phys[d] for d in keep_dims)
     return ks_reduced, E_reduced
 end
 
-# Accumulate 1/2 Σ|C|^2 from an (ms..., NU) coeff array into the reduced output indexed by the
-# kept dimensions. Uses precomputed strides + linear indexing — allocation-free, no per-mode
-# tuple construction (so it scales to large 3D grids).
+# Accumulate 1/2 Σ|C|^2 from an (ms..., NU) coeff array into the reduced output indexed by the kept
+# (non-summed) dimensions. The reduced column-major linear index is built inline from the summed-dim
+# set `dims` and the original `ms` (kept dim `d` contributes stride ∏_{kept d'<d} ms[d'], which is
+# exactly the size of the corresponding `E_reduced` axis) — allocation-free, no `keep_dims`/
+# `out_shape` tuples, no per-mode temporaries, so it scales to large 3D grids.
 function _accumulate_transect!(E_reduced::AbstractArray{T}, coeffs, ms::NTuple{D, Int}, NU::Int,
-        keep_dims::Tuple, out_shape::Tuple) where {T, D}
-    # Column-major linear index into E_reduced built with an incremental stride (no heap
-    # temporaries); E_reduced is addressed by linear index directly (no `vec` reshape).
+        dims::Tuple) where {T, D}
     @inbounds for I in CartesianIndices(ms)
         e = zero(T)
         for c in 1:NU
@@ -272,11 +272,11 @@ function _accumulate_transect!(E_reduced::AbstractArray{T}, coeffs, ms::NTuple{D
         end
         lin = 1
         stride = 1
-        kk = 0
-        for d in keep_dims
-            kk += 1
-            lin += (I[d] - 1) * stride
-            stride *= out_shape[kk]
+        for d in 1:D
+            if !(d in dims)
+                lin += (I[d] - 1) * stride
+                stride *= ms[d]
+            end
         end
         E_reduced[lin] += T(0.5) * e
     end
@@ -422,14 +422,17 @@ function isotropic_spectrum!(
 end
 
 """
-    transect_spectrum!(E_reduced, ks_reduced, ks_phys, coeffs, dims)
+    transect_spectrum!(E_reduced, ks_phys, coeffs, dims) -> nothing
 
-In-place version of `transect_spectrum`. The energy accumulation kernel is allocation-free; only
-the `ks_reduced` axis bookkeeping (small, independent of grid size) touches the heap.
+In-place, **fully allocation-free** version of [`transect_spectrum`](@ref): fills the preallocated
+reduced-energy buffer `E_reduced` (shape = the kept `ms` dimensions) from `coeffs`, so it can be
+reused across many transforms (e.g. each time step of an `(x, y, z, t)` field) with zero
+steady-state heap traffic. The reduced wavenumber axes are simply `ks_phys` at the kept dims
+(`ks_phys[d]` for `d ∉ dims`) — obtain them once from [`transect_spectrum`](@ref) outside the loop;
+they are loop-invariant and never rebuilt here.
 """
 function transect_spectrum!(
     E_reduced::AbstractArray{T},
-    ks_reduced::Vector,
     ks_phys::Tuple,
     coeffs::AbstractArray{Complex{T}, N_dim},
     dims::Tuple,
@@ -440,25 +443,25 @@ function transect_spectrum!(
     ms = ntuple(d -> size(coeffs, d), Val(N_dim - 1))
     NU = size(coeffs, N_dim)
 
-    keep_dims = Tuple(d for d in 1:D if !(d in dims))
-    sum_dims = Tuple(d for d in 1:D if d in dims)
-
-    out_shape = Tuple(ms[d] for d in keep_dims)
-    @assert size(E_reduced) == out_shape "E_reduced size mismatch"
-
+    # Validate the output length and accumulate the per-summed-axis `dk` product with only scalar
+    # temporaries (no `keep_dims`/`out_shape` tuple — filtering `dims` by runtime value cannot be
+    # type-stable, so a materialized filtered tuple would box). `_accumulate_transect!` takes `dims`
+    # directly and is fully allocation-free.
+    expected_len = 1
     dk_prod = one(T)
-    for d in sum_dims
-        dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
+    @inbounds for d in 1:D
+        if d in dims
+            dk_prod *= T(ks_phys[d][2] - ks_phys[d][1])
+        else
+            expected_len *= ms[d]
+        end
     end
+    length(E_reduced) == expected_len ||
+        throw(DimensionMismatch("E_reduced has $(length(E_reduced)) entries, expected $expected_len"))
 
     fill!(E_reduced, zero(T))
-    _accumulate_transect!(E_reduced, coeffs, ms, NU, keep_dims, out_shape)
+    _accumulate_transect!(E_reduced, coeffs, ms, NU, dims)
     E_reduced .*= dk_prod
-
-    empty!(ks_reduced)
-    for d in keep_dims
-        push!(ks_reduced, ks_phys[d])
-    end
 
     return nothing
 end

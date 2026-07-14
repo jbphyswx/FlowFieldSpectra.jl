@@ -92,7 +92,9 @@ PowerScaling
 TransformProblem
 ```
 
-## Backend types
+## Transform backends (which spectral math)
+
+The two backend axes are orthogonal and compose: pass one `transform=` and one `execution=`.
 
 ```@docs
 AbstractSpectralBackend
@@ -101,8 +103,17 @@ FFTBackend
 NUFFTBackend
 SHTBackend
 NUFSHTBackend
+```
+
+## Execution backends (where/how it runs)
+
+```@docs
+AbstractExecutionBackend
+SerialBackend
 ThreadedBackend
 GPUBackend
+DistributedBackend
+MPIBackend
 AutoBackend
 ```
 

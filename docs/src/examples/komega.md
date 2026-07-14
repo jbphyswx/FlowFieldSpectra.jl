@@ -8,11 +8,10 @@ Here we superpose a propagating wave on a slower background. The package's synth
 `f = Σ C(k,ω) e^{+i(k·x + ω·t)}`, so a wave written as `cos(k₀x + ω₀t)` has its spectral peaks on
 the `ω = k` diagonal (phase speed `c = ω₀/k₀`); a mode with a different phase speed lies off it.
 
-```@example komega
+```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW                          # activates the FFTBackend extension
-using CairoMakie: CairoMakie as Mke
-import Random
+using Random: Random
 Random.seed!(0)
 
 Nx, Nt = 64, 64
@@ -30,18 +29,12 @@ f = wave .+ background
 
 # dim 1 = space (→ k), dim 2 = time (→ ω)
 grid = FFS.UniformCartesianGrid((xv, tv); domain_size = (Lx, Lt))
-coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (Nx, Nt))
+coeffs, ks = FFS.calculate_spectrum(grid, (f,), (Nx, Nt); transform = FFS.FFTBackend())
 kx, kω = ks
 Ekω = abs2.(coeffs[:, :, 1])
-
-fig = Mke.Figure(size = (660, 480))
-ax = Mke.Axis(fig[1, 1]; title = "E(k, ω)", xlabel = "k", ylabel = "ω")
-hm = Mke.heatmap!(ax, kx, kω, Ekω)
-Mke.lines!(ax, kx, kx; color = :white, linestyle = :dash, label = "ω = k (c = 1)")
-Mke.Colorbar(fig[1, 2], hm)
-Mke.axislegend(ax)
-fig
 ```
+
+![Wavenumber–frequency spectrum E(k, ω) with the dominant peak on the ω = k dispersion line](../assets/komega.png)
 
 The dominant peak sits on the `ω = k` dispersion line at `(k₀, ω₀) = (6, 6)` (and its conjugate at
 `(−6, −6)`); the weaker background mode lies off the line at a slower phase speed. Building the same

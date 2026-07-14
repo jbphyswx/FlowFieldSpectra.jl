@@ -1,10 +1,16 @@
 module FlowFieldSpectraKernelAbstractionsExt
 
+# `@index` and `@Const` are imported UNQUALIFIED on purpose: they are `@kernel` DSL keywords that
+# the KernelAbstractions `@kernel` macro only recognizes by their bare names inside a kernel body
+# (a qualified `KA.@index` is not rewritten and expands to the wrong `__index_*` call). Everything
+# else stays module-qualified via `KA.`.
 using KernelAbstractions: KernelAbstractions as KA, @index, @Const
-using FlowFieldSpectra: FlowFieldSpectra as FFS, GPUBackend
+using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 # =============================================================================
-# Helper Utility
+# GPUBackend execution of the DirectSum transform. Pure KernelAbstractions: device-agnostic, runs
+# on any KA backend object `exec.backend` (incl. `KA.CPU()` for CI parity, `CUDABackend()`, ...).
+# The coordinate system is fixed by the caller (grid dispatch in core).
 # =============================================================================
 
 function _array_on_backend(a, backend::KA.Backend)
@@ -15,9 +21,14 @@ function _array_on_backend(a, backend::KA.Backend)
     end
 end
 
-# =============================================================================
-# GPU entry points — coordinate system fixed by caller (grid dispatch in core).
-# =============================================================================
+# Device-generic device→host copy. Does NOT assume `Array(::DeviceArray)` is defined for an
+# arbitrary KA backend — allocates a host `Array` and uses `copyto!`, which every KA / GPUArrays
+# backend provides (and which is a no-op-cost plain copy on `KA.CPU()`).
+function _to_host(dev::AbstractArray{T}) where {T}
+    host = Array{T}(undef, size(dev)...)
+    copyto!(host, dev)
+    return host
+end
 
 # Stage host vectors to the device (no-op if already resident there).
 function _stage_to_device(backend::KA.Backend, vecs::Tuple, ::Type{FT}, N::Int) where {FT}
@@ -29,15 +40,15 @@ function _stage_to_device(backend::KA.Backend, vecs::Tuple, ::Type{FT}, N::Int) 
     end
 end
 
-function FFS._calculate_spectrum_gpu_cartesian(
-    gpu_backend::GPUBackend,
+function FFS._gpu_directsum_cartesian(
+    exec::FFS.GPUBackend,
     coords_vecs::Tuple,
     fields_vecs::Tuple,
     ms::Tuple,
     iflag::Int,
     domain_size,
 )
-    backend = gpu_backend.backend
+    backend = exec.backend
     FT = eltype(coords_vecs[1])
     NU = length(fields_vecs)
     N = length(coords_vecs[1])
@@ -52,17 +63,17 @@ function FFS._calculate_spectrum_gpu_cartesian(
     fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
     coeffs_dev = KA.zeros(backend, Complex{FT}, ms..., NU)
     ks = _calculate_spectrum_cartesian_gpu!(coeffs_dev, backend, coords_dev, fields_dev, ms, iflag, domain_size)
-    return Array(coeffs_dev), ks
+    return _to_host(coeffs_dev), ks
 end
 
-function FFS._calculate_spectrum_gpu_spherical(
-    gpu_backend::GPUBackend,
+function FFS._gpu_directsum_spherical(
+    exec::FFS.GPUBackend,
     coords_vecs::Tuple,
     fields_vecs::Tuple,
     lmax::Int,
     weights,
 )
-    backend = gpu_backend.backend
+    backend = exec.backend
     FT = eltype(coords_vecs[1])
     NU = length(fields_vecs)
     N = length(coords_vecs[1])
@@ -88,7 +99,7 @@ function FFS._calculate_spectrum_gpu_spherical(
 
     coeffs_dev = KA.zeros(backend, Complex{FT}, Nθ, Nφ, NU)
     ks = _calculate_spectrum_spherical_gpu!(coeffs_dev, backend, coords_dev, fields_dev, lmax, weights_dev)
-    return Array(coeffs_dev), ks
+    return _to_host(coeffs_dev), ks
 end
 
 # =============================================================================
@@ -116,7 +127,7 @@ function _calculate_spectrum_cartesian_gpu!(
         if domain_size !== nothing
             return domain_size[d]
         else
-            c_host = coords_dev[d] isa Array ? coords_dev[d] : Array(coords_dev[d])
+            c_host = coords_dev[d] isa Array ? coords_dev[d] : _to_host(coords_dev[d])
             min_x, max_x = extrema(c_host)
             return max_x - min_x
         end

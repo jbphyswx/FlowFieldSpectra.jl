@@ -1,7 +1,12 @@
 module FlowFieldSpectraFINUFFTExt
 
 using FINUFFT: FINUFFT
-using FlowFieldSpectra: FlowFieldSpectra as FFS, NUFFTBackend
+using FlowFieldSpectra: FlowFieldSpectra as FFS
+
+# Internal FINUFFT thread count selected by the execution backend: ThreadedBackend → all threads,
+# every other (Serial, …) → single-threaded. Baked into the guru plan at construction.
+_exec_nthreads(::FFS.ThreadedBackend) = Threads.nthreads()
+_exec_nthreads(::FFS.AbstractExecutionBackend) = 1
 
 # =============================================================================
 # Reusable FINUFFT (guru) plan for scattered Cartesian grids.
@@ -26,7 +31,7 @@ mutable struct NUFFTCartesianPlan{T, D, NM, PH, KS} <: FFS.AbstractSpectralPlan
 end
 
 function _nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_size::NTuple{D},
-        n_transf::Int, iflag::Int, eps::Real) where {T, D}
+        n_transf::Int, iflag::Int, eps::Real, nthreads::Int) where {T, D}
     M = length(coords[1])
     for d in 1:D
         length(coords[d]) == M || throw(DimensionMismatch("coordinate $d length mismatch"))
@@ -38,7 +43,7 @@ function _nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_size::
     scaled = ntuple(d -> T(2π) .* (T.(coords[d]) .- offsets[d]) ./ ranges[d], D)
 
     # FINUFFT type-1 plan; sign is -iflag to match the e^{-ik·x} analysis convention.
-    guru = FINUFFT.finufft_makeplan(1, collect(ms), -iflag, n_transf, T(eps); dtype = T)
+    guru = FINUFFT.finufft_makeplan(1, collect(ms), -iflag, n_transf, T(eps); dtype = T, nthreads = nthreads)
     if D == 1
         FINUFFT.finufft_setpts!(guru, scaled[1])
     elseif D == 2
@@ -50,15 +55,17 @@ function _nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_size::
         throw(ArgumentError("FINUFFT supports up to 3 dimensions; got $D"))
     end
 
-    # Centered integer modes (FINUFFT modeord=0) → translation-correction phase per axis.
+    # Centered integer modes (FINUFFT modeord=0) → translation-correction phase per axis. Stored
+    # pre-shaped as (ms..., 1) so the per-call broadcast against `fk` (ms..., n_transf) needs no
+    # `reshape` (a per-call `reshape` allocated a small constant each execution).
     k_ints = ntuple(d -> collect(-(ms[d] ÷ 2):((ms[d] - 1) ÷ 2)), D)
-    phase = Array{Complex{T}, D}(undef, ms...)
+    phase = Array{Complex{T}, D + 1}(undef, ms..., 1)
     @inbounds for I in CartesianIndices(ms)
         p = one(Complex{T})
         for d in 1:D
             p *= cis(-iflag * k_ints[d][I[d]] * (offsets[d] * T(2π) / ranges[d]))
         end
-        phase[I] = p
+        phase[I, 1] = p
     end
 
     ks_phys = FFS.Grids.physical_wavenumbers(ranges, ms, T)
@@ -76,22 +83,22 @@ end
 # uses a looser tolerance than double (FINUFFT warns and clamps if eps < eps(T)).
 _default_eps(::Type{T}) where {T} = T === Float32 ? 1.0e-6 : 1.0e-8
 
-function FFS.plan_spectrum(::NUFFTBackend, g::FFS.AbstractCartesianGrid, ::Type{T},
-        ms::NTuple{D, Int}; n_transf::Int = 1, iflag::Int = 1,
-        eps::Real = _default_eps(T)) where {T, D}
-    return _nufft_plan(T, g.coords, ms, g.domain_size, n_transf, iflag, eps)
+function FFS.plan_spectrum(::FFS.NUFFTBackend, exec::FFS.AbstractExecutionBackend,
+        g::FFS.AbstractCartesianGrid, ::Type{T}, ms::NTuple{D, Int};
+        n_transf::Int = 1, iflag::Int = 1, eps::Real = _default_eps(T)) where {T, D}
+    return _nufft_plan(T, g.coords, ms, g.domain_size, n_transf, iflag, eps, _exec_nthreads(exec))
 end
 
 function _load_strengths!(plan::NUFFTCartesianPlan{T}, fields_vecs::Tuple) where {T}
     length(fields_vecs) == plan.n_transf ||
         throw(DimensionMismatch("expected $(plan.n_transf) fields, got $(length(fields_vecs))"))
-    @inbounds for u in 1:length(fields_vecs)
-        length(fields_vecs[u]) == plan.M ||
-            throw(DimensionMismatch("field $u length $(length(fields_vecs[u])) != npoints=$(plan.M)"))
-        col = view(plan.cj, :, u)
-        for j in 1:plan.M
-            col[j] = fields_vecs[u][j]
-        end
+    # `enumerate` keeps each field's element type concrete for a heterogeneous `Tuple` (a runtime
+    # `fields_vecs[u]` index boxes); the linear offset copy into column `u` avoids a `view` SubArray,
+    # so steady-state execution is genuinely allocation-free and converts real→Complex inline.
+    @inbounds for (u, fu) in enumerate(fields_vecs)
+        length(fu) == plan.M ||
+            throw(DimensionMismatch("field $u length $(length(fu)) != npoints=$(plan.M)"))
+        copyto!(plan.cj, (u - 1) * plan.M + 1, fu, 1, plan.M)
     end
     return plan
 end
@@ -116,12 +123,14 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUFFTC
         throw(DimensionMismatch("coeffs size $(size(coeffs)) != $((plan.ms..., plan.n_transf))"))
     _load_strengths!(plan, fields)
     FINUFFT.finufft_exec!(plan.guru, plan.cj, plan.fk)
-    coeffs .= plan.fk .* reshape(plan.phase, plan.ms..., 1) .* plan.norm
+    coeffs .= plan.fk .* plan.phase .* plan.norm     # plan.phase is (ms..., 1): broadcasts, no reshape
     return plan.ks_phys
 end
 
-# One-shot allocating entry (called by the core (backend, grid) dispatch).
+# One-shot allocating entry (called by the core (transform, execution, grid) dispatch). The
+# execution backend selects the FINUFFT internal thread count.
 function FFS._calculate_spectrum_nufft(
+    exec::FFS.AbstractExecutionBackend,
     coords_vecs::Tuple,
     fields_vecs::Tuple,
     ms::Tuple;
@@ -137,7 +146,7 @@ function FFS._calculate_spectrum_nufft(
     ds = domain_size === nothing ?
          ntuple(d -> (e = extrema(coords_vecs[d]); T(e[2] - e[1])), D) :
          ntuple(d -> T(domain_size[d]), D)
-    plan = _nufft_plan(T, coords_vecs, NTuple{D, Int}(ms), ds, NU, iflag, epsv)
+    plan = _nufft_plan(T, coords_vecs, NTuple{D, Int}(ms), ds, NU, iflag, epsv, _exec_nthreads(exec))
     coeffs = zeros(Complex{T}, ms..., NU)
     ks = FFS.calculate_spectrum!(coeffs, plan, fields_vecs)
     return coeffs, ks

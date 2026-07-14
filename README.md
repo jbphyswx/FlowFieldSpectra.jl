@@ -22,7 +22,13 @@ Instead of writing custom FFT grid shifting, scaling, non-uniform coordinate map
   point clouds (e.g. masked by a coastline) — recovered correctly via non-uniform transforms.
 - **Zero-dependency baseline**: works out-of-the-box via direct-sum (`DirectSumBackend`) with no heavy
   C/C++ libraries; load `FFTW` / `FINUFFT` / `FastSphericalHarmonics` / `NUFSHT` to activate the fast
-  `O(N log N)` paths, plus `OhMyThreads` (threaded) and `KernelAbstractions` (GPU).
+  `O(N log N)` transforms.
+- **Two orthogonal backend axes**: a `transform=` axis (the spectral math above) and an
+  independent `execution=` axis — `SerialBackend`, `ThreadedBackend` (`OhMyThreads`),
+  `GPUBackend` (`KernelAbstractions`: device-generic FFT via `AbstractFFTs` — CUFFT / rocFFT /
+  CPU-FFTW — and portable direct-sum kernels on *any* KA device, plus cuFINUFFT for scattered NUFFT
+  on CUDA), `DistributedBackend` (`Distributed`), and `MPIBackend` (`MPI`, incl. multi-GPU) — that
+  compose freely.
 - **Reductions**: isotropic/radial binning, transects/slices, anisotropy-resolved `E(k, θ)`,
   wavenumber–frequency `E(k, ω)`, spherical degree spectra, compensated `kᵖE(k)` and band-integrated energy.
 - **Cross-analysis**: cross-/co-/quadrature spectra (flux by scale, e.g. `⟨u'w'⟩`), magnitude-squared
@@ -97,7 +103,7 @@ v = @. sin(2π * 2 * xv / L)
 # 3. Build an explicit grid and compute spectral coefficients via FFTW.
 #    The coordinate system is the grid type — there is no coordinate guessing.
 grid = FFS.UniformCartesianGrid((xv, yv); domain_size=(L, L))
-coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
 
 # 4. Reduce 2D Coefficients to a 1D Isotropic (Radial) Spectrum
 k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins=32)
@@ -174,6 +180,12 @@ capability has a runnable, rendered [example in the docs](https://jbphyswx.githu
 
 *DirectSum vs FFTW coefficients agree to machine precision — every fast backend is checked against the direct-sum reference.*
 
+### Execution-axis invariance (transform × execution)
+
+![Execution parity](docs/src/assets/execution_parity.png)
+
+*The two backend axes are orthogonal: one FFT transform run under `SerialBackend`, `ThreadedBackend`, and `GPUBackend(KA.CPU())` returns identical spectra to machine precision — the `execution=` axis changes only where/how it runs, never the result. See [`examples/execution_backends.jl`](examples/execution_backends.jl).*
+
 ---
 
 ## Core API Reference
@@ -181,8 +193,8 @@ capability has a runnable, rendered [example in the docs](https://jbphyswx.githu
 See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/) for the full surface.
 
 ### Spectral calculation
-- `calculate_spectrum(backend, grid, fields, ms; kwargs...)`: complex coefficients + physical wavenumber grids.
-- `calculate_spectrum!(coeffs, plan, fields)` / `plan_spectrum(backend, grid, T, ms; n_transf)`: reusable plans with batched trailing axes for allocation-free repeated transforms.
+- `calculate_spectrum(grid, fields, ms; transform=DirectSumBackend(), execution=AutoBackend(), kwargs...)`: complex coefficients + physical wavenumber grids. The two backend axes are orthogonal and compose (`transform` = which spectral math; `execution` = serial/threaded/GPU/distributed/MPI).
+- `calculate_spectrum!(coeffs, plan, fields)` / `plan_spectrum(grid, T, ms; transform, execution, n_transf)`: reusable plans with batched trailing axes for allocation-free repeated transforms.
 - `synthesize(grid, coeffs, ms)`: inverse transform (spectral filtering, round-trip).
 
 ### Reductions

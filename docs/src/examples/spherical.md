@@ -4,10 +4,9 @@ Project a field on the sphere onto spherical harmonics and read off the degree (
 spectrum. We synthesize a field from known modes `Y₂¹` and `Y₅⁻³` on a Clenshaw–Curtis grid and
 recover them with the structured `SHTBackend`.
 
-```@example sph
+```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
-using CairoMakie: CairoMakie as Mke
 
 lmax = 16
 Nθ = lmax + 1
@@ -23,15 +22,11 @@ C[FSH.sph_mode(5, -3)] = 0.5
 f = vec(FSH.sph_evaluate(C))
 
 grid = FFS.StructuredSphericalGrid(θnodes, φnodes)
-coeffs, _ = FFS.calculate_spectrum(FFS.SHTBackend(), grid, (f,), (Nθ, Nφ))
+coeffs, _ = FFS.calculate_spectrum(grid, (f,), (Nθ, Nφ); transform = FFS.SHTBackend())
 deg, E_l = FFS.spherical_energy_spectrum(coeffs)
-
-fig = Mke.Figure(size = (680, 420))
-ax = Mke.Axis(fig[1, 1]; title = "Degree energy spectrum E(ℓ)", xlabel = "degree ℓ", ylabel = "E(ℓ)")
-Mke.barplot!(ax, deg, E_l; color = :steelblue)
-Mke.xlims!(ax, -0.5, lmax + 0.5)
-fig
 ```
+
+![Degree energy spectrum E(ℓ) with energy only at ℓ = 2 and ℓ = 5](../assets/spherical_spectra.png)
 
 Energy appears only at degrees `ℓ = 2` and `ℓ = 5`, as expected. Scattered points on the sphere
 are handled the same way with `ScatteredSphericalGrid` and the `NUFSHTBackend` (use a

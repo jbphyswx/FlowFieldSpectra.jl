@@ -29,10 +29,9 @@ A complete example computing the isotropic energy spectrum of a 2D uniform flow 
 construct an explicit **grid** (the coordinate system is the grid type — there is no guessing)
 and pass it to `calculate_spectrum`.
 
-```@example quickstart
+```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW              # activates the FFTBackend extension
-using CairoMakie: CairoMakie  # activates the plotting extension
 
 # 1. Coordinate lists on a uniform grid
 L = 2π
@@ -48,11 +47,10 @@ v = @. sin(2 * xv)
 
 # 3. Build the grid and compute Fourier coefficients (FFTBackend needs FFTW)
 grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
 
 # 4. Radially integrate to a 1D isotropic energy spectrum
 k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 16)
-
-# 5. Plot
-FFS.plot_spectrum(ks, coeffs; title = "Flow Field Energy Spectrum")
 ```
+
+![Isotropic energy spectrum of a 2D flow field](assets/cartesian_spectra.png)

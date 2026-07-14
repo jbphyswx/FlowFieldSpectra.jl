@@ -3,6 +3,17 @@
 These functions and types are not part of the public API (they are not exported), but are
 documented here for contributors. They may change without notice.
 
+## Execution-backend helpers
+
+Introspection helpers for the execution axis (used internally and by the distribution extensions;
+reachable as `FlowFieldSpectra.Types.<name>`).
+
+```@docs
+FlowFieldSpectra.Types.local_backend
+FlowFieldSpectra.Types.is_distributed
+FlowFieldSpectra.Types.resolve_backend
+```
+
 ## Grids
 
 ```@docs

@@ -6,11 +6,10 @@ via spectral differentiation (`ik^α`), gives the spectra of **vorticity**, **di
 flow with a Kolmogorov `k⁻⁵ᐟ³` energy cascade — for which the enstrophy spectrum is
 `Z(k) = k² E(k) ∝ k⁺¹ᐟ³`.
 
-```@example derived
+```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW                          # activates the FFTBackend extension
-using CairoMakie: CairoMakie as Mke
-import Random
+using Random: Random
 
 L = 2π
 N = 128
@@ -33,7 +32,7 @@ u = vec(real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N])))
 v = vec(real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N])))
 
 grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (u, v), (N, N))
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
 
 # Spectral operators: divergence ≈ 0 (incompressible); vorticity → enstrophy spectrum.
 divc = FFS.spectral_divergence(ks, coeffs)
@@ -44,16 +43,9 @@ k, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = 40)
 _, Z = FFS.isotropic_spectrum(ks, vortc; num_bins = 40)
 
 rng = 2:findlast(<=(0.6 * maximum(k)), k)  # resolved inertial range
-fig = Mke.Figure(size = (720, 470))
-ax = Mke.Axis(fig[1, 1]; title = "Energy vs enstrophy spectra  (Z(k) = k² E(k))", xlabel = "k",
-    ylabel = "spectral density", xscale = log10, yscale = log10)
-Mke.lines!(ax, k[rng], E[rng]; linewidth = 3, label = "E(k) — energy  (∝ k⁻⁵ᐟ³)")
-Mke.lines!(ax, k[rng], Z[rng]; linewidth = 3, label = "Z(k) — enstrophy  (∝ k⁺¹ᐟ³)")
-Mke.scatter!(ax, k[rng], k[rng] .^ 2 .* E[rng]; color = :black, marker = :cross,
-    label = "k² E(k)  (identity check)")
-Mke.axislegend(ax; position = :lt)
-fig
 ```
+
+![Energy and enstrophy spectra with the Z(k) = k²E(k) identity check](../assets/derived_quantities.png)
 
 `E(k)` and `Z(k)` are well-separated power laws with opposite slopes, and the `k² E(k)` markers fall
 exactly on the directly-computed enstrophy `Z(k)` — the `Z = k²E` identity, a validation cross-check

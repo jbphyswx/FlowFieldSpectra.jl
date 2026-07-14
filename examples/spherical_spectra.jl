@@ -35,7 +35,7 @@ function run_spherical_example()
     # 2. Structured SHT (exact on the quadrature grid).
     println("Computing structured SHT via FastSphericalHarmonics...")
     sht_grid = FFS.StructuredSphericalGrid(theta_nodes, phi_nodes)
-    c_sht, _ = FFS.calculate_spectrum(FFS.SHTBackend(), sht_grid, (f_val,), (Nθ, Nφ))
+    c_sht, _ = FFS.calculate_spectrum(sht_grid, (f_val,), (Nθ, Nφ); transform = FFS.SHTBackend())
     deg, E_l = FFS.spherical_energy_spectrum(c_sht)
 
     # 3. Scattered NUFSHT: ~4x more points than modes, CG least-squares solve.
@@ -54,8 +54,8 @@ function run_spherical_example()
     NUFSHT.nusht_type2!(f_scat, C_true, plan)
 
     nufsht_grid = FFS.ScatteredSphericalGrid(theta_scat, phi_scat)
-    c_nufsht, _ = FFS.calculate_spectrum(FFS.NUFSHTBackend(), nufsht_grid, (f_scat,), (Nθ, Nφ);
-        solve = true, maxiter = 3000, rtol = 1e-10)
+    c_nufsht, _ = FFS.calculate_spectrum(nufsht_grid, (f_scat,), (Nθ, Nφ);
+        transform = FFS.NUFSHTBackend(), solve = true, maxiter = 3000, rtol = 1e-10)
     deg_scat, E_l_scat = FFS.spherical_energy_spectrum(c_nufsht)
 
     # 4. Plot the TWO samplings of the same field (structured grid vs scattered points) and the

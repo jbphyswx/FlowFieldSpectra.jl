@@ -9,6 +9,8 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW                                       # activates the FFTBackend extension
 using FINUFFT: FINUFFT                                 # activates the NUFFTBackend extension
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using KernelAbstractions: KernelAbstractions as KA     # activates GPUBackend (+ device-generic GPU FFT)
+using OhMyThreads: OhMyThreads                         # activates ThreadedBackend
 using CairoMakie: CairoMakie as Mke
 import Random
 
@@ -73,7 +75,7 @@ function generate_cartesian_figure()
     uv = (vec(u), vec(v))
 
     cart_grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-    c_fft, k_fft = FFS.calculate_spectrum(FFS.FFTBackend(), cart_grid, uv, (N, N))
+    c_fft, k_fft = FFS.calculate_spectrum(cart_grid, uv, (N, N); transform = FFS.FFTBackend())
     k_bins, E_k = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 40)
 
     fig = Mke.Figure(size = (1500, 460), fontsize = 15)
@@ -132,7 +134,7 @@ function generate_spherical_figure()
     f_val = vec(FSH.sph_evaluate(C_true))
 
     sht_grid = FFS.StructuredSphericalGrid(theta_nodes, phi_nodes)
-    c_sht, _ = FFS.calculate_spectrum(FFS.SHTBackend(), sht_grid, (f_val,), (Nθ, Nφ))
+    c_sht, _ = FFS.calculate_spectrum(sht_grid, (f_val,), (Nθ, Nφ); transform = FFS.SHTBackend())
     deg, E_l = FFS.spherical_energy_spectrum(c_sht)
 
     fig = Mke.Figure(size = (1200, 800), fontsize = 14)
@@ -167,8 +169,8 @@ function generate_parity_figure()
     # Broadband field so the coefficient maps show rich structure (not a few isolated dots).
     f = synthetic_field(N; slope = 5 / 3, seed = 2)
     parity_grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-    c_direct, ks = FFS.calculate_spectrum(FFS.DirectSumBackend(), parity_grid, (vec(f),), (N, N))
-    c_fft, _ = FFS.calculate_spectrum(FFS.FFTBackend(), parity_grid, (vec(f),), (N, N))
+    c_direct, ks = FFS.calculate_spectrum(parity_grid, (vec(f),), (N, N); transform = FFS.DirectSumBackend())
+    c_fft, _ = FFS.calculate_spectrum(parity_grid, (vec(f),), (N, N); transform = FFS.FFTBackend())
     diff = abs.(c_direct[:, :, 1] .- c_fft[:, :, 1])
 
     fig = Mke.Figure(size = (1320, 430), fontsize = 15)
@@ -214,7 +216,7 @@ function generate_nufft_coastline_figure()
         (x, y) -> f[clamp(round(Int, x / dx) + 1, 1, N), clamp(round(Int, y / dx) + 1, 1, N)]
     end
     grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-    c_ref, k_ref = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (vec(fld),), (N, N))
+    c_ref, k_ref = FFS.calculate_spectrum(grid, (vec(fld),), (N, N); transform = FFS.FFTBackend())
     kr, E_ref = FFS.isotropic_spectrum(k_ref, c_ref; num_bins = 28)
 
     # Jittered (off-grid) sample cloud, then carve out a synthetic landmass: corner island OR
@@ -228,7 +230,7 @@ function generate_nufft_coastline_figure()
     fo = interp.(xo, yo)
 
     sgrid = FFS.ScatteredCartesianGrid((xo, yo); domain_size = (L, L))
-    c_nu, k_nu = FFS.calculate_spectrum(FFS.NUFFTBackend(), sgrid, (fo,), (N, N); eps = 1e-9)
+    c_nu, k_nu = FFS.calculate_spectrum(sgrid, (fo,), (N, N); transform = FFS.NUFFTBackend(), eps = 1e-9)
     knu, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 28)
 
     rng = 2:findlast(<=(0.6 * maximum(kr)), kr)
@@ -264,7 +266,7 @@ function generate_anisotropy_figure()
     # fairly flat radial spectrum spreads energy across k so the preferred angle reads as a band.
     g = synthetic_field(N; slope = 0.6, aniso = 3.5, seed = 5)
     grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-    c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (vec(g),), (N, N))
+    c, ks = FFS.calculate_spectrum(grid, (vec(g),), (N, N); transform = FFS.FFTBackend())
     k_bins, θ_bins, E = FFS.anisotropic_spectrum(ks, c; num_k_bins = 32, num_θ_bins = 36)
 
     fig = Mke.Figure(size = (1180, 460), fontsize = 15)
@@ -308,8 +310,8 @@ function generate_cross_coherence_figure()
         a = 1.0 + 0.1 * randn()
         fr = @. a * exp(im * 2 * xv) + 0.5 * exp(im * (5 * xv) + im * 2π * rand())
         gr = @. a * exp(im * (2 * xv - ϕ)) + 0.5 * exp(im * (7 * yv) + im * 2π * rand())
-        cfr, ksr = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (fr,), (N, N))
-        cgr, _ = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (gr,), (N, N))
+        cfr, ksr = FFS.calculate_spectrum(grid, (fr,), (N, N); transform = FFS.FFTBackend())
+        cgr, _ = FFS.calculate_spectrum(grid, (gr,), (N, N); transform = FFS.FFTBackend())
         Cf[:, :, r] .= cfr[:, :, 1]
         Cg[:, :, r] .= cgr[:, :, 1]
         ks = ksr
@@ -345,7 +347,7 @@ function generate_derived_figure()
     xv = vec([x for x in xs, y in xs])
     yv = vec([y for x in xs, y in xs])
     grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-    c, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (vec(u), vec(v)), (N, N))
+    c, ks = FFS.calculate_spectrum(grid, (vec(u), vec(v)), (N, N); transform = FFS.FFTBackend())
     vort = FFS.spectral_vorticity(ks, c)                   # scalar vorticity coeffs (2D)
     k_bins, E_k = FFS.isotropic_spectrum(ks, c; num_bins = 40)
     _, Z_k = FFS.isotropic_spectrum(ks, vort; num_bins = 40)
@@ -381,7 +383,7 @@ function generate_komega_figure()
     tv = vec([ti for _ in x, ti in t])
     f = @. cos(k0 * xv + ω0 * tv) + 0.4 * cos(2 * xv + 1.0 * tv + 0.5)
     grid = FFS.UniformCartesianGrid((xv, tv); domain_size = (Lx, Lt))
-    coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (f,), (Nx, Nt))
+    coeffs, ks = FFS.calculate_spectrum(grid, (f,), (Nx, Nt); transform = FFS.FFTBackend())
     kx, kω = ks
 
     fig = Mke.Figure(size = (640, 480), fontsize = 14)
@@ -423,7 +425,7 @@ function generate_estimation_figure()
     C = zeros(ComplexF64, Nx, K)
     ks = nothing
     for k in 1:K
-        c, ksk = FFS.calculate_spectrum(FFS.FFTBackend(), grid, (V[:, k] .* sig,), (Nx,))
+        c, ksk = FFS.calculate_spectrum(grid, (V[:, k] .* sig,), (Nx,); transform = FFS.FFTBackend())
         C[:, k] .= c[:, 1]
         ks = ksk
     end
@@ -449,6 +451,71 @@ function generate_estimation_figure()
     println("Saved: $outpath")
 end
 
+# ─── Figure: execution-axis invariance (two orthogonal backend axes) ────────
+
+# The `execution=` axis says only WHERE/HOW a transform runs; it never changes the result. Here one
+# FFT transform is run under three execution backends — Serial, Threaded (OhMyThreads), and
+# GPUBackend(KA.CPU()) (the device-generic GPU FFT, which uses FFTW on the KA.CPU() host array
+# exactly as it would use CUFFT on a CUDA CuArray) — and the recovered spectra coincide to machine ε.
+function generate_execution_figure()
+    L = 2π
+    N = 96
+    dx = L / N
+    xs = range(0.0, stop = L - dx, length = N)
+    xv = vec([x for x in xs, y in xs])
+    yv = vec([y for x in xs, y in xs])
+    f = vec(synthetic_field(N; slope = 5 / 3, seed = 5))
+    grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+    ms = (N, N)
+
+    execs = [
+        ("Serial", FFS.SerialBackend()),
+        ("Threaded", FFS.ThreadedBackend()),
+        ("GPU (KA.CPU())", FFS.GPUBackend(KA.CPU())),
+    ]
+    results = [FFS.calculate_spectrum(grid, (f,), ms; transform = FFS.FFTBackend(), execution = e)
+               for (_, e) in execs]
+    ks = results[1][2]
+    cref = results[1][1]
+    specs = [FFS.isotropic_spectrum(ks, r[1]; num_bins = 40) for r in results]
+    maxdiff = [maximum(abs.(r[1] .- cref)) for r in results]
+
+    fig = Mke.Figure(size = (1360, 470), fontsize = 15)
+    Mke.Label(fig[0, 1:3],
+        "Execution axis is result-invariant — one FFT transform, three execution backends",
+        fontsize = 19, font = :bold)
+
+    kb1 = specs[1][1]
+    rng = 2:findlast(<=(0.6 * maximum(kb1)), kb1)
+    ax1 = Mke.Axis(fig[1, 1]; title = "Isotropic E(k) — the three curves coincide",
+        xlabel = "k", ylabel = "E(k)", xscale = log10, yscale = log10)
+    styles = [(:solid, 5), (:dash, 3), (:dot, 2)]
+    for (i, (name, _)) in enumerate(execs)
+        kb, Ek = specs[i]
+        Mke.lines!(ax1, kb[rng], Ek[rng] .+ 1e-30; linestyle = styles[i][1],
+            linewidth = styles[i][2], label = name)
+    end
+    Mke.axislegend(ax1; position = :lb)
+
+    # Right: the actual 2D spectral energy this transform recovers — identical for every execution
+    # backend (a bar chart of the ~0 differences would be misleading on a log axis; the caption below
+    # states them exactly instead).
+    ax2 = Mke.Axis(fig[1, 2]; title = "2D spectral energy  log₁₀|C(kₓ, k_y)|²",
+        xlabel = "kₓ", ylabel = "k_y", aspect = Mke.DataAspect())
+    hm = Mke.heatmap!(ax2, ks[1], ks[2], log10.(abs2.(cref[:, :, 1]) .+ 1e-30); colormap = :viridis)
+    Mke.Colorbar(fig[1, 3], hm)
+
+    diffstr = join(("$(n): $(round(d, sigdigits = 2))" for ((n, _), d) in zip(execs, maxdiff)), ",   ")
+    Mke.Label(fig[2, 1:3], "Max |coefficient difference| vs. Serial —  " * diffstr *
+        "   (all below machine ε · max|C| ≈ $(round(eps(Float64) * maximum(abs.(cref)), sigdigits = 2)))";
+        fontsize = 12, color = :gray35)
+    Mke.colgap!(fig.layout, 24)
+
+    outpath = joinpath(ASSETS_DIR, "execution_parity.png")
+    Mke.save(outpath, fig)
+    println("Saved: $outpath")
+end
+
 # ─── Execute ──────────────────────────────────────────────────────────────
 
 println("Generating static figure assets...")
@@ -461,4 +528,5 @@ generate_cross_coherence_figure()
 generate_derived_figure()
 generate_komega_figure()
 generate_estimation_figure()
+generate_execution_figure()
 println("Done!")

@@ -1,13 +1,10 @@
 using Documenter: Documenter
-# `using FlowFieldSpectra` (bare) is intentional: Documenter's `@docs` blocks resolve the
-# exported names in this module's scope. Every other package is loaded module-qualified
-# (`using X: X`) purely to activate its extension, so no foreign exports leak in to clash.
+# `using FlowFieldSpectra` (bare) is intentional: Documenter's `@docs` blocks resolve the exported
+# (and submodule) names in this module's scope. Nothing else is needed — the docs env is deliberately
+# lean (just Documenter + FlowFieldSpectra). The pages are static and embed figures pre-rendered by
+# `generate_assets/` (its own env carries CairoMakie + the transform backends); the build never runs
+# a live transform, so no backend packages are loaded here.
 using FlowFieldSpectra
-using FFTW: FFTW
-using FINUFFT: FINUFFT
-using FastSphericalHarmonics: FastSphericalHarmonics
-using NUFSHT: NUFSHT
-using CairoMakie: CairoMakie
 
 Documenter.makedocs(;
     modules  = [FlowFieldSpectra],

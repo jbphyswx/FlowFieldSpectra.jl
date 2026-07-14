@@ -16,6 +16,20 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
 - Reusable spectral plans (`plan_spectrum`) for FFTW and FINUFFT, with batched spectral/trailing
   axes (`n_transf`): build once, reuse across a z/t/component loop with allocation-free steady-state
   execution (FFTW guru `mul!`, FINUFFT guru `makeplan`/`setpts!`/`exec!`).
+- **Two orthogonal backend axes** matching the sibling packages: a `transform=` axis
+  (`DirectSumBackend`/`FFTBackend`/`NUFFTBackend`/`SHTBackend`/`NUFSHTBackend`) and a separate
+  `execution=` axis (`AbstractExecutionBackend`: `SerialBackend`, `ThreadedBackend`, `GPUBackend{B}`,
+  `DistributedBackend{Inner}`, `MPIBackend{Inner}`, `AutoBackend`) that compose freely
+  (`transform × execution`).
+- **GPU transforms** on any KernelAbstractions device: `FFTBackend`×`GPUBackend{B}` is device-generic
+  via `AbstractFFTs.plan_fft` (CUFFT on CUDA, rocFFT on AMDGPU, FFTW on `KA.CPU()`) through a new
+  `["KernelAbstractions","AbstractFFTs"]` extension with a reusable device plan; `NUFFTBackend`×
+  `GPUBackend(CUDABackend())` → cuFINUFFT (scattered grids — CUDA-only, no portable GPU NUFFT exists)
+  via a `["CUDA","FINUFFT"]` extension; the portable KA direct-sum kernels cover every other
+  transform×device pair (including all spherical grids — there is no fast GPU SHT).
+- **Distributed and MPI execution** (`Distributed`/`MPI` extensions): point-partitionable transforms
+  (DirectSum/NUFFT/NUFSHT-projection) split the point axis and sum α-weighted partial coefficients;
+  FFT/SHT split the batch axis. `MPIBackend(GPUBackend(dev))` targets a multi-GPU cluster.
 - Estimators: cross-spectrum family (`cross_spectrum`/`cospectrum`/`quadspectrum`), anisotropy-resolved
   `anisotropic_spectrum` `E(k,θ)`, derived-quantity spectra (`spectral_vorticity`/`spectral_divergence`),
   compensated/band-integrated wrappers (`compensate`/`band_energy`).
@@ -40,27 +54,44 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
   NUFSHT (and the sibling packages) are registered in the General registry, the floor can drop back to
   1.10 (possibly 1.9). Users who `dev` NUFSHT locally can likely run on older Julia, but that path is
   untested.
-- `calculate_spectrum`/`calculate_spectrum!` now dispatch on `(backend, grid, fields, ms)`. The
-  coordinate system is determined by the grid type — the fragile coordinate-range heuristic that
-  guessed Cartesian-vs-spherical is removed entirely (no guessing, no warnings, no fallbacks).
-- In-place `calculate_spectrum!` works for all backends via plans; unsupported `(backend, grid)`
-  combinations raise a clear error instead of misrouting.
+- `calculate_spectrum`/`calculate_spectrum!`/`plan_spectrum`/`synthesize` take the two orthogonal
+  `transform=` and `execution=` keywords and dispatch on `(transform, execution, grid, fields, ms)`.
+  **Clean break**: the old single positional `backend` / `backend=` keyword is removed (no shim). The
+  coordinate system is still the grid type — the fragile coordinate-range heuristic remains gone.
+- `AutoBackend` resolves the *execution* axis via `Base.get_extension` (loaded-extension detection),
+  never `isdefined(Main, …)`, and only ever to a local backend (`Serial`/`Threaded`) — GPU/Distributed/
+  MPI require explicit context.
+- Unsupported `(transform, execution, grid)` combinations raise a clear error instead of misrouting or
+  silently falling back (e.g. fast GPU FFT/NUFFT on a non-CUDA device errors rather than downgrading).
+- `transect_spectrum!` signature is now `(E_reduced, ks_phys, coeffs, dims)` — it fills only the
+  reusable numeric buffer and is fully allocation-free (previously it rebuilt a `ks_reduced` vector via
+  `empty!`/`push!` every call).
 
 ### Performance
 - Real-input FFT routes transparently through `rfft` (≈2× faster, half the transform memory),
   reconstructed to the identical full complex spectrum via Hermitian symmetry — no convention change.
 - GPU spherical transform rewritten to one-thread-per-output-mode with register accumulation and a
   single store — **no atomics** (was one-thread-per-point atomic accumulation).
-- In-place reductions (`isotropic_spectrum!`, `transect_spectrum!`, `spherical_energy_spectrum!`) are
-  allocation-free in steady state (type-stable spectral-extent derivation; inlined squared wavenumbers).
+- Every in-place / prebuilt-plan steady-state path is genuinely allocation-free, verified at two grid
+  sizes (grid-independent): `isotropic_spectrum!`, `transect_spectrum!`, `spherical_energy_spectrum!`,
+  serial-DirectSum `calculate_spectrum!`, and FFTW/FINUFFT plan execution. Removed hidden per-call
+  allocations from the plan paths — a fused allocation-free fftshift+normalize replaces `circshift!`,
+  the FINUFFT phase is stored pre-shaped so no per-call `reshape`, and batch-slice copies are type-stable
+  (`enumerate` + offset `copyto!`, no `selectdim`/`view` temporaries).
 - FINUFFT default tolerance is precision-aware (`1e-6` for `Float32`, `1e-8` for `Float64`), avoiding
   spurious tolerance warnings; full `Float32` support end-to-end.
 
 ### Tested
 - Parseval/variance invariant and DirectSum-vs-FFT parity at `D = 1, 2, 3`; plan-reuse and batched-axis
   parity; grid-dispatch errors; explicit-import policy (ExplicitImports) and Aqua; `Float32` end-to-end;
-  rfft-vs-full-FFT equivalence; GPU CPU-backend parity (no-atomics kernel); allocation (`@allocated≈0`)
-  for in-place reductions and bounded/constant steady-state plan execution.
+  rfft-vs-full-FFT equivalence; GPU CPU-backend parity (no-atomics kernel).
+- Execution-axis parity (Serial/Threaded/Auto and `GPUBackend(KA.CPU())`) for every transform;
+  Distributed (in-process workers) and MPI (2-rank via `mpiexec`) parity vs serial; a dedicated
+  allocation suite asserting **exactly zero** (grid-independent) for every in-place/plan path and
+  output-proportional bounds for the must-allocate operators.
+- The device-generic GPU paths — `FFTBackend` (AbstractFFTs) and `DirectSumBackend` (KA kernels) — are
+  exercised on CI via `GPUBackend(KA.CPU())`. The CUDA-specific paths (CUFFT on `CuArray`, cuFINUFFT)
+  are verified on real CUDA hardware via the `gpu/` project (`gpu/gpu_parity.jl`); CI has no GPU.
 
 ## [0.1.0]
 - Initial implementation: `calculate_spectrum` with DirectSum/FFT/NUFFT/SHT/NUFSHT/Threaded/GPU

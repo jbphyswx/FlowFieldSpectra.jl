@@ -6,10 +6,9 @@ plan and point-sorting are built **once** and the whole `z × t` stack is transf
 batched execution — then the plan is reused across the time loop. This is the fast path for
 per-level / per-time spectra of large geophysical datasets.
 
-```@example fourd
+```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FINUFFT: FINUFFT                    # activates the NUFFTBackend extension
-using CairoMakie: CairoMakie as Mke
 using Random: Random
 Random.seed!(42)
 
@@ -33,20 +32,14 @@ for (it, t) in enumerate(range(0, 1; length = nt)), (iz, k0) in enumerate(kz)
 end
 
 # ONE plan build; transform the entire z·t stack in a single exec.
-plan = FFS.plan_spectrum(FFS.NUFFTBackend(), hgrid, Float64, ms; n_transf = nb, eps = 1e-9)
+plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.NUFFTBackend(), n_transf = nb, eps = 1e-9)
 coeffs = zeros(ComplexF64, ms..., nb)
 ks = FFS.calculate_spectrum!(coeffs, plan, stack)
 
 # E(k) per level at the first time step.
 nbins = 18
-fig = Mke.Figure(size = (680, 430))
-ax = Mke.Axis(fig[1, 1]; title = "E(k) per z-level (t=0) — one plan reused for all z·t",
-    xlabel = "k", ylabel = "E(k)", yscale = log10)
 for iz in 1:nz
     slice = reshape(view(coeffs, :, :, iz), ms..., 1)
     kb, Ek = FFS.isotropic_spectrum(ks, slice; num_bins = nbins)
-    Mke.lines!(ax, kb, Ek .+ 1e-20; linewidth = 2, label = "z-level $iz")
 end
-Mke.axislegend(ax; position = :rt)
-fig
 ```

@@ -193,7 +193,8 @@ kx1, ky1 = 2π * 2 / L, 2π * 1 / L
 u = @. cos(kx1 * xv + ky1 * yv)
 v = @. sin(kx1 * xv + ky1 * yv)
 
-coeffs, ks = FFS.calculate_spectrum(FFS.FFTBackend(), (xv, yv), (u, v), ms; domain_size=(L, L))
+bench_grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
+coeffs, ks = FFS.calculate_spectrum(bench_grid, (u, v), ms; transform = FFS.FFTBackend())
 
 SUITE["reductions"]["isotropic_spectrum"] =
     @benchmarkable FFS.isotropic_spectrum($ks, $coeffs; num_bins=32)
@@ -211,7 +212,8 @@ phi_nodes = vec([φ for θ in pts[1], φ in pts[2]])
 C_true = zeros(Nθ, Nφ)
 C_true[FSH.sph_mode(2, 1)] = 1.0
 f_val = vec(FSH.sph_evaluate(C_true))
-c_sph, _ = FFS.calculate_spectrum(FFS.SHTBackend(), (theta_nodes, phi_nodes), (f_val,), (Nθ, Nφ))
+bench_sph_grid = FFS.StructuredSphericalGrid(theta_nodes, phi_nodes)
+c_sph, _ = FFS.calculate_spectrum(bench_sph_grid, (f_val,), (Nθ, Nφ); transform = FFS.SHTBackend())
 
 SUITE["reductions"]["spherical_energy_spectrum"] =
     @benchmarkable FFS.spherical_energy_spectrum($c_sph; lmax=$lmax)

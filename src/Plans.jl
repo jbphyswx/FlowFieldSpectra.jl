@@ -17,11 +17,14 @@ extensions); this module only declares the shared interface.
 abstract type AbstractSpectralPlan end
 
 """
-    plan_spectrum(backend, grid, ::Type{T}, ms; n_transf=1, kwargs...) -> AbstractSpectralPlan
+    plan_spectrum(grid, ::Type{T}, ms; transform=DirectSumBackend(), execution=AutoBackend(), n_transf=1, kwargs...)
+    plan_spectrum(transform, execution, grid, ::Type{T}, ms; n_transf=1, kwargs...)
 
-Construct a reusable [`AbstractSpectralPlan`](@ref) for `backend` on `grid` at spectral
-resolution `ms`, transforming `n_transf` co-located fields/slices of element type `T` in one
-batched execution. Requires the backend's extension to be loaded.
+Construct a reusable [`AbstractSpectralPlan`](@ref) for the `transform`×`execution` backend pair on
+`grid` at spectral resolution `ms`, transforming `n_transf` co-located fields/slices of element type
+`T` in one batched execution. The keyword form resolves `execution` and forwards to the canonical
+positional form implemented by the backend extensions. Requires the transform's extension to be
+loaded.
 
 Execute a plan with `calculate_spectrum!(coeffs, plan, fields)`.
 """

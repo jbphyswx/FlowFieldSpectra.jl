@@ -4,11 +4,13 @@ using OhMyThreads: OhMyThreads as OMT
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 # =============================================================================
-# Threaded entry points — coordinate system is fixed by the caller (grid type
-# dispatch happens in core), so there is no coordinate heuristic here.
+# ThreadedBackend execution of the DirectSum transform (forward + inverse). The coordinate system
+# is fixed by the caller (grid-type dispatch happens in core), so there is no coordinate heuristic
+# here — these are the `::ThreadedBackend` methods of the core execution hooks.
 # =============================================================================
 
-function FFS._calculate_spectrum_threaded_cartesian!(
+function FFS._directsum_cartesian!(
+    ::FFS.ThreadedBackend,
     coeffs::AbstractArray{Complex{FT}},
     coords_vecs::Tuple,
     fields_vecs::Tuple,
@@ -26,7 +28,8 @@ function FFS._calculate_spectrum_threaded_cartesian!(
     return _calculate_spectrum_cartesian_threaded!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
 end
 
-function FFS._calculate_spectrum_threaded_spherical!(
+function FFS._directsum_spherical!(
+    ::FFS.ThreadedBackend,
     coeffs::AbstractArray{Complex{FT}},
     coords_vecs::Tuple,
     fields_vecs::Tuple,
@@ -77,7 +80,7 @@ function _calculate_spectrum_cartesian_threaded!(
     # Zero out coeffs
     fill!(coeffs, zero(Complex{FT}))
 
-    # Threaded accumulation using OMT.@tasks (race-condition safe)
+    # Threaded accumulation using OMT.@tasks (each mode I owns its coeffs slice — race-free)
     OMT.@tasks for I in CartesianIndices(ms)
         @inbounds for j in 1:N
             phi = zero(FT)
@@ -162,6 +165,64 @@ function _calculate_spectrum_spherical_threaded!(
     end
 
     return (0:lmax, -lmax:lmax)
+end
+
+# =============================================================================
+# ThreadedBackend execution of the DirectSum INVERSE (synthesize). Output points are independent,
+# so we parallelize the outer point loop with per-task Legendre buffers (spherical).
+# =============================================================================
+
+function FFS._synthesize_cartesian(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        coords_vecs::Tuple, ms::NTuple{D, Int}, iflag::Int, domain_size) where {FT, D}
+    N = length(coords_vecs[1])
+    NU = size(coeffs, D + 1)
+    ranges = ntuple(d -> FT(domain_size[d]), D)
+    ks = FFS.Grids.physical_wavenumbers(ranges, ms, FT)
+    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
+    OMT.@tasks for j in 1:N
+        @inbounds for I in CartesianIndices(ms)
+            phi = zero(FT)
+            for d in 1:D
+                phi += ks[d][I[d]] * coords_vecs[d][j]
+            end
+            W = cis(iflag * phi)
+            for u_idx in 1:NU
+                out[u_idx][j] += coeffs[I, u_idx] * W
+            end
+        end
+    end
+    return out
+end
+
+function FFS._synthesize_spherical(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        coords_vecs::Tuple, lmax::Int) where {FT}
+    θ = coords_vecs[1]
+    φ = coords_vecs[2]
+    N = length(θ)
+    NU = size(coeffs, 3)
+    tables = FFS.SphericalKernels.legendre_tables(FT, lmax)
+    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
+    OMT.@tasks for j in 1:N
+        @local Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
+        @inbounds begin
+            xj = cos(θ[j])
+            sj = sin(θ[j])
+            φj = φ[j]
+            FFS.SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
+            for l in 0:lmax
+                for m in -l:l
+                    abs_m = abs(m)
+                    factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+                    Y_lm = factor * Plm[l+1, abs_m+1] * cis(m * φj)
+                    idx = FFS.sph_mode_index(l, m)
+                    for u_idx in 1:NU
+                        out[u_idx][j] += coeffs[idx, u_idx] * Y_lm
+                    end
+                end
+            end
+        end
+    end
+    return out
 end
 
 end # module FlowFieldSpectraOhMyThreadsExt

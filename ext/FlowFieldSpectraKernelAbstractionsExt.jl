@@ -1,318 +1,207 @@
 module FlowFieldSpectraKernelAbstractionsExt
 
-# `@index` and `@Const` are imported UNQUALIFIED on purpose: they are `@kernel` DSL keywords that
-# the KernelAbstractions `@kernel` macro only recognizes by their bare names inside a kernel body
-# (a qualified `KA.@index` is not rewritten and expands to the wrong `__index_*` call). Everything
-# else stays module-qualified via `KA.`.
+# `@index` and `@Const` are imported UNQUALIFIED on purpose: they are `@kernel` DSL keywords that the
+# KernelAbstractions `@kernel` macro only recognizes by their bare names inside a kernel body (a
+# qualified `KA.@index` is not rewritten and expands to the wrong `__index_*` call). Everything else
+# stays module-qualified via `KA.`.
 using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 # =============================================================================
-# GPUBackend execution of the DirectSum transform. Pure KernelAbstractions: device-agnostic, runs
-# on any KA backend object `exec.backend` (incl. `KA.CPU()` for CI parity, `CUDABackend()`, ...).
-# The coordinate system is fixed by the caller (grid dispatch in core).
+# GPUBackend execution of the DirectSum transform on ANY KernelAbstractions device (incl. `KA.CPU()`
+# for CI parity, `CUDABackend()`, …). One thread per spectral mode, so each thread exclusively owns its
+# coefficient rows — no atomics. Tensor grids decode a spatial point's coordinate from the 1-D axes on
+# device (`axes[d][decode(p)[d]]`) — NO ∏N_d coordinate blob is staged. The batch is the inner loop.
 # =============================================================================
 
-function _array_on_backend(a, backend::KA.Backend)
-    return try
-        KA.get_backend(a) == backend
-    catch
-        false
-    end
-end
-
-# Device-generic device→host copy. Does NOT assume `Array(::DeviceArray)` is defined for an
-# arbitrary KA backend — allocates a host `Array` and uses `copyto!`, which every KA / GPUArrays
-# backend provides (and which is a no-op-cost plain copy on `KA.CPU()`).
+# Device→host copy (device-generic; `copyto!` exists for every KA/GPUArrays backend).
 function _to_host(dev::AbstractArray{T}) where {T}
     host = Array{T}(undef, size(dev)...)
     copyto!(host, dev)
     return host
 end
 
-# Stage host vectors to the device (no-op if already resident there).
-function _stage_to_device(backend::KA.Backend, vecs::Tuple, ::Type{FT}, N::Int) where {FT}
-    _array_on_backend(vecs[1], backend) && return vecs
-    return ntuple(length(vecs)) do i
-        dev = KA.allocate(backend, FT, N)
-        copyto!(dev, collect(vecs[i]))
-        dev
-    end
+_on_backend(a, backend::KA.Backend) = (try KA.get_backend(a) == backend catch; false end)
+
+# Stage a host vector as a length-N device array of element type FT (identity if already resident).
+function _dev_vec(backend::KA.Backend, v, ::Type{FT}) where {FT}
+    _on_backend(v, backend) && eltype(v) === FT && return v
+    d = KA.allocate(backend, FT, length(v))
+    copyto!(d, collect(FT.(v)))
+    return d
 end
 
-function FFS._gpu_directsum_cartesian(
-    exec::FFS.GPUBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple,
-    iflag::Int,
-    domain_size,
-)
-    backend = exec.backend
-    FT = eltype(coords_vecs[1])
-    NU = length(fields_vecs)
-    N = length(coords_vecs[1])
-    for d in 1:length(coords_vecs)
-        length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
-    end
-    for u_idx in 1:NU
-        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
-    end
-
-    coords_dev = _stage_to_device(backend, coords_vecs, FT, N)
-    fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
-    coeffs_dev = KA.zeros(backend, Complex{FT}, ms..., NU)
-    ks = _calculate_spectrum_cartesian_gpu!(coeffs_dev, backend, coords_dev, fields_dev, ms, iflag, domain_size)
-    return _to_host(coeffs_dev), ks
+# Stage a field `(spatial…, batch…)` as a device `(Npts, B)` array.
+function _dev_field(backend::KA.Backend, field, Npts::Int, B::Int, ::Type{FT}) where {FT}
+    d = KA.allocate(backend, FT, Npts, B)
+    copyto!(d, reshape(collect(FT.(field)), Npts, B))
+    return d
 end
 
-function FFS._gpu_directsum_spherical(
-    exec::FFS.GPUBackend,
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    lmax::Int,
-    weights,
-)
-    backend = exec.backend
-    FT = eltype(coords_vecs[1])
-    NU = length(fields_vecs)
-    N = length(coords_vecs[1])
-    for u_idx in 1:NU
-        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
-    end
-    Nθ = lmax + 1
-    Nφ = 2 * lmax + 1
-
-    coords_dev = _stage_to_device(backend, coords_vecs, FT, N)
-    fields_dev = _stage_to_device(backend, fields_vecs, FT, N)
-    weights_dev = if weights === nothing
-        w = KA.allocate(backend, FT, N)
-        copyto!(w, fill(FT(4π) / N, N))
-        w
-    elseif _array_on_backend(weights, backend)
-        weights
-    else
-        w = KA.allocate(backend, FT, N)
-        copyto!(w, collect(weights))
-        w
-    end
-
-    coeffs_dev = KA.zeros(backend, Complex{FT}, Nθ, Nφ, NU)
-    ks = _calculate_spectrum_spherical_gpu!(coeffs_dev, backend, coords_dev, fields_dev, lmax, weights_dev)
-    return _to_host(coeffs_dev), ks
-end
-
-# =============================================================================
-# GPU Cartesian Direct Sum
-# =============================================================================
-
-function _calculate_spectrum_cartesian_gpu!(
-    coeffs::AbstractArray{Complex{FT}},
-    backend::KA.Backend,
-    coords_dev::Tuple,
-    fields_dev::Tuple,
-    ms::Tuple,
-    iflag::Int,
-    domain_size::Union{Nothing, Tuple} = nothing,
-) where {FT}
-    D = length(coords_dev)
-    NU = length(fields_dev)
-    N = length(coords_dev[1])
-
-    # Zero out coefficients
-    fill!(coeffs, zero(Complex{FT}))
-
-    # Coordinate ranges for physical wavenumbers (compute on CPU)
-    ranges = ntuple(Val(D)) do d
-        if domain_size !== nothing
-            return domain_size[d]
-        else
-            c_host = coords_dev[d] isa Array ? coords_dev[d] : _to_host(coords_dev[d])
-            min_x, max_x = extrema(c_host)
-            return max_x - min_x
-        end
-    end
-
-    # Generate physical wavenumbers on CPU
-    ks_phys_cpu = ntuple(
-        d ->
-            range(FT(-ms[d] ÷ 2), stop = FT((ms[d] - 1) ÷ 2), length = ms[d]) .*
-            (FT(2π) / (ranges[d] == 0 ? one(FT) : ranges[d])),
-        Val(D),
-    )
-
-    # Allocate and copy physical wavenumbers to device
-    ks_dev = ntuple(d -> begin
-        v = KA.allocate(backend, FT, ms[d])
-        copyto!(v, collect(ks_phys_cpu[d]))
-        v
-    end, D)
-
-    # Launch Cartesian direct sum kernel
-    kernel! = _cartesian_direct_sum_kernel!(backend)
-    kernel!(coeffs, coords_dev, fields_dev, ks_dev, ms, N, NU, D, iflag; ndrange = prod(ms))
-    KA.synchronize(backend)
-
-    # Scale by 1/N
-    coeffs ./= N
-
-    return ks_phys_cpu
-end
-
-KA.@kernel function _cartesian_direct_sum_kernel!(
-    coeffs,
-    @Const(coords),
-    @Const(fields),
-    @Const(ks),
-    @Const(ms),
-    N::Int,
-    NU::Int,
-    D::Int,
-    iflag::Int,
-)
-    # Get flat mode index
-    mode_idx = @index(Global)
-    total_modes = prod(ms)
-
-    if mode_idx <= total_modes
-        # Convert flat index to Cartesian index
-        I = _ka_flat_to_cartesian(mode_idx, ms, D)
-
-        # Get physical wavenumber components
-        k_phys = ntuple(d -> ks[d][I[d]], D)
-
-        # Accumulate over all spatial points
-        for u_idx in 1:NU
-            val = zero(eltype(coeffs))
-            for j in 1:N
-                phi = zero(eltype(k_phys[1]))
-                for d in 1:D
-                    phi += k_phys[d] * coords[d][j]
-                end
-                phi = -iflag * phi
-                W = cis(phi)
-                val += fields[u_idx][j] * W
-            end
-            @inbounds coeffs[I..., u_idx] = val
-        end
-    end
-end
-
-@inline function _ka_flat_to_cartesian(flat_idx::Int, ms::Tuple, D::Int)
-    idx = flat_idx - 1  # 0-based
-    ntuple(D) do d
+# Column-major decode of a 1-based linear index `p` into a size-`s` grid (pure ⇒ GPU-safe).
+@inline function _ka_decode(p::Int, s::NTuple{D, Int}) where {D}
+    idx = p - 1
+    return ntuple(Val(D)) do d
         stride = 1
-        for i in d+1:D
-            stride *= ms[i]
+        for i in 1:(d - 1)
+            stride *= s[i]
         end
-        i = div(idx, stride) + 1
-        idx = mod(idx, stride)
-        i
+        (idx ÷ stride) % s[d] + 1
     end
 end
 
 # =============================================================================
-# GPU Spherical Direct Sum
+# Cartesian direct sum
 # =============================================================================
 
-function _calculate_spectrum_spherical_gpu!(
-    coeffs::AbstractArray{Complex{FT}},
-    backend::KA.Backend,
-    coords_dev::Tuple,
-    fields_dev::Tuple,
-    lmax::Int,
-    weights_dev,
-) where {FT}
-    N = length(coords_dev[1])
-    NU = length(fields_dev)
-    Nθ = lmax + 1
-    Nφ = 2 * lmax + 1
-
-    # Zero out coefficients
-    fill!(coeffs, zero(Complex{FT}))
-
-    θ_dev = coords_dev[1]
-    φ_dev = coords_dev[2]
-
-    # One thread per output mode (row, col): each thread exclusively owns its coefficient
-    # slice across all components, so accumulation needs no atomics. Unused (row, col) slots
-    # (those with l > lmax) are skipped and stay zero.
-    kernel! = _spherical_direct_sum_kernel!(backend)
-    kernel!(coeffs, θ_dev, φ_dev, fields_dev, weights_dev, lmax, N, NU; ndrange = Nθ * Nφ)
+function FFS._gpu_directsum_cartesian(exec::FFS.GPUBackend, g::FFS.AbstractCartesianGrid{FT, D},
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    backend = exec.backend
+    ss = FFS.spatial_size(g)
+    Npts = prod(ss)
+    M = prod(ms)
+    B = length(field) ÷ Npts
+    ks_cpu = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    ksd = ntuple(d -> _dev_vec(backend, collect(ks_cpu[d]), FT), D)
+    fieldd = _dev_field(backend, field, Npts, B, FT)
+    coeffs_dev = KA.zeros(backend, Complex{FT}, M, B)
+    _launch_cartesian!(coeffs_dev, backend, g, fieldd, ksd, ss, ms, Npts, M, B, iflag)
     KA.synchronize(backend)
-
-    return (0:lmax, -lmax:lmax)
+    coeffs_dev ./= Npts
+    return reshape(_to_host(coeffs_dev), ms..., _batch_shape(g, field)...), ks_cpu
 end
 
-KA.@kernel function _spherical_direct_sum_kernel!(
-    coeffs,
-    @Const(θ),
-    @Const(φ),
-    @Const(fields),
-    @Const(w),
-    lmax::Int,
-    N::Int,
-    NU::Int,
-)
+_batch_shape(g::FFS.AbstractCartesianGrid, field) =
+    ntuple(i -> size(field, FFS.ndims_spatial(g) + i), ndims(field) - FFS.ndims_spatial(g))
+
+# Tensor grid: stage the D axes and decode point coordinates on device.
+function _launch_cartesian!(coeffs_dev, backend, g::Union{FFS.UniformCartesianGrid, FFS.NonuniformCartesianGrid},
+        fieldd, ksd, ss::NTuple{D, Int}, ms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
+    FT = real(eltype(coeffs_dev))
+    axesd = ntuple(d -> _dev_vec(backend, collect(g.axes[d]), FT), D)
+    kernel! = _cart_tensor_kernel!(backend)
+    kernel!(coeffs_dev, fieldd, axesd, ksd, ss, ms, Npts, M, B, D, iflag; ndrange = M)
+    return coeffs_dev
+end
+
+# Scattered grid: stage the D per-point coordinate vectors. `ss` (= (N,)) is unused here — the
+# ambient dimension D comes from `ms`, not from `spatial_size` (which is the single point axis).
+function _launch_cartesian!(coeffs_dev, backend, g::FFS.ScatteredCartesianGrid,
+        fieldd, ksd, ss, ms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
+    FT = real(eltype(coeffs_dev))
+    coordsd = ntuple(d -> _dev_vec(backend, collect(g.coords[d]), FT), D)
+    kernel! = _cart_scattered_kernel!(backend)
+    kernel!(coeffs_dev, fieldd, coordsd, ksd, ms, Npts, M, B, D, iflag; ndrange = M)
+    return coeffs_dev
+end
+
+KA.@kernel function _cart_tensor_kernel!(coeffs, @Const(field), @Const(axesd), @Const(ksd),
+        @Const(ss), @Const(ms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
+    mi = @index(Global)
+    if mi <= M
+        I = _ka_decode(mi, ms)
+        FT = eltype(axesd[1])
+        @inbounds for p in 1:N
+            P = _ka_decode(p, ss)
+            phi = zero(FT)
+            for d in 1:D
+                phi += ksd[d][I[d]] * axesd[d][P[d]]
+            end
+            W = cis(-iflag * phi)
+            for b in 1:B
+                coeffs[mi, b] += field[p, b] * W
+            end
+        end
+    end
+end
+
+KA.@kernel function _cart_scattered_kernel!(coeffs, @Const(field), @Const(coordsd), @Const(ksd),
+        @Const(ms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
+    mi = @index(Global)
+    if mi <= M
+        I = _ka_decode(mi, ms)
+        FT = eltype(coordsd[1])
+        @inbounds for p in 1:N
+            phi = zero(FT)
+            for d in 1:D
+                phi += ksd[d][I[d]] * coordsd[d][p]
+            end
+            W = cis(-iflag * phi)
+            for b in 1:B
+                coeffs[mi, b] += field[p, b] * W
+            end
+        end
+    end
+end
+
+# =============================================================================
+# Spherical direct sum — one thread per (row, col) coefficient slot (owns it across batch, no atomics)
+# =============================================================================
+
+function FFS._gpu_directsum_spherical(exec::FFS.GPUBackend, g::FFS.AbstractSphericalGrid{FT},
+        field::AbstractArray, lmax::Int) where {FT}
+    backend = exec.backend
+    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g)
+    N = length(θpt)
+    Nθc = lmax + 1
+    Nφc = 2 * lmax + 1
+    B = length(field) ÷ N
+    θd = _dev_vec(backend, θpt, FT)
+    φd = _dev_vec(backend, φpt, FT)
+    wd = _dev_vec(backend, wpt, FT)
+    fieldd = _dev_field(backend, field, N, B, FT)
+    coeffs_dev = KA.zeros(backend, Complex{FT}, Nθc, Nφc, B)
+    kernel! = _spherical_kernel!(backend)
+    kernel!(coeffs_dev, θd, φd, fieldd, wd, lmax, N, B; ndrange = Nθc * Nφc)
+    KA.synchronize(backend)
+    batch = ntuple(i -> size(field, 1 + i), ndims(field) - 1)
+    return reshape(_to_host(coeffs_dev), Nθc, Nφc, batch...), (0:lmax, -lmax:lmax)
+end
+
+KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(field), @Const(w),
+        lmax::Int, N::Int, B::Int)
     idx = @index(Global)
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-
     if idx <= Nθ * Nφ
-        # Column-major decode of the (row, col) coefficient slot this thread owns.
         col = (idx - 1) ÷ Nθ + 1
         row = (idx - 1) % Nθ + 1
-
-        # Invert sph_mode_index: recover (m, |m|) from the column, then ℓ from the row.
         m = col == 1 ? 0 : (iseven(col) ? -(col ÷ 2) : (col - 1) ÷ 2)
         abs_m = abs(m)
         l = row - 1 + abs_m
-
         if l <= lmax
             FT = eltype(θ)
             CT = eltype(coeffs)
             factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-            # Accumulate each component in a register, then store once — no atomics, no
-            # global read-modify-write. (Legendre is recomputed per component; NU is small.)
-            @inbounds for u_idx in 1:NU
-                acc = zero(CT)
-                for j in 1:N
-                    xj = cos(θ[j])
-                    sj = sin(θ[j])
-                    P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
-                    Y_lm = factor * P_l_m * cis(m * φ[j])
-                    acc += fields[u_idx][j] * conj(Y_lm) * w[j]
+            @inbounds for p in 1:N
+                xj = cos(θ[p])
+                sj = sin(θ[p])
+                P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
+                Ylm = factor * P_l_m * cis(m * φ[p])
+                gw = conj(Ylm) * w[p]
+                for b in 1:B
+                    coeffs[row, col, b] += CT(field[p, b] * gw)
                 end
-                coeffs[row, col, u_idx] = acc
             end
         end
     end
 end
 
-@inline function _ka_normalized_legendre(l::Int, m::Int, x::FT, s::FT)::FT where FT
+@inline function _ka_normalized_legendre(l::Int, m::Int, x::FT, s::FT)::FT where {FT}
     m > l && return zero(FT)
-
-    # Sectoral recurrence
     P_mm = one(FT) / sqrt(FT(4π))
     for mm in 1:m
         P_mm *= -sqrt(FT(2mm + 1) / (2mm)) * s
     end
-
     l == m && return P_mm
-
-    # P_{m+1}^m
     P_lm = x * sqrt(FT(2m + 3)) * P_mm
     P_lminus1_m = P_mm
-
     l == m + 1 && return P_lm
-
-    # Recurrence for higher l
     for ll in (m+2):l
         coeff1 = sqrt(FT(4ll^2 - 1) / (ll^2 - m^2))
         coeff2 = sqrt(FT(2ll + 1) * ((ll - 1)^2 - m^2) / ((2ll - 3) * (ll^2 - m^2)))
         P_lminus1_m, P_lm = P_lm, x * coeff1 * P_lm - coeff2 * P_lminus1_m
     end
-
     return P_lm
 end
 

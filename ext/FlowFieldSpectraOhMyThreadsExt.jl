@@ -4,219 +4,210 @@ using OhMyThreads: OhMyThreads as OMT
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 
 # =============================================================================
-# ThreadedBackend execution of the DirectSum transform (forward + inverse). The coordinate system
-# is fixed by the caller (grid-type dispatch happens in core), so there is no coordinate heuristic
-# here — these are the `::ThreadedBackend` methods of the core execution hooks.
+# ThreadedBackend execution of the DirectSum transform (forward + inverse), tensor-native. Cartesian
+# forward parallelizes over spectral modes (each mode owns its coefficient row → race-free); spherical
+# forward parallelizes over point chunks with per-task accumulators (each point touches every mode).
+# Inverses parallelize over the independent output points. The batch is the inner contiguous loop.
 # =============================================================================
 
-function FFS._directsum_cartesian!(
-    ::FFS.ThreadedBackend,
-    coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple,
-    iflag::Int,
-    domain_size,
-) where {FT}
-    N = length(coords_vecs[1])
-    for d in 1:length(coords_vecs)
-        length(coords_vecs[d]) == N || throw(DimensionMismatch("Coordinates length mismatch"))
-    end
-    for u_idx in 1:length(fields_vecs)
-        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
-    end
-    return _calculate_spectrum_cartesian_threaded!(coeffs, coords_vecs, fields_vecs, ms, iflag, domain_size)
-end
-
-function FFS._directsum_spherical!(
-    ::FFS.ThreadedBackend,
-    coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    lmax::Int,
-    weights,
-) where {FT}
-    N = length(coords_vecs[1])
-    for u_idx in 1:length(fields_vecs)
-        length(fields_vecs[u_idx]) == N || throw(DimensionMismatch("Field length mismatch"))
-    end
-    return _calculate_spectrum_spherical_threaded!(coeffs, coords_vecs, fields_vecs, lmax, weights)
-end
-
-# =============================================================================
-# Threaded Cartesian Direct Sum
-# =============================================================================
-
-function _calculate_spectrum_cartesian_threaded!(
-    coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple,
-    iflag::Int,
-    domain_size::Union{Nothing, Tuple} = nothing,
-) where {FT}
-    D = length(coords_vecs)
-    NU = length(fields_vecs)
-    N = length(coords_vecs[1])
-
-    # Coordinate ranges for physical wavenumbers
-    ranges = ntuple(Val(D)) do d
-        if domain_size !== nothing
-            return domain_size[d]
-        else
-            min_x, max_x = extrema(coords_vecs[d])
-            return max_x - min_x
-        end
-    end
-
-    # Generate physical wavenumbers
-    ks_phys = ntuple(
-        d ->
-            range(FT(-ms[d] ÷ 2), stop = FT((ms[d] - 1) ÷ 2), length = ms[d]) .*
-            (FT(2π) / (ranges[d] == 0 ? one(FT) : ranges[d])),
-        Val(D),
-    )
-
-    # Zero out coeffs
-    fill!(coeffs, zero(Complex{FT}))
-
-    # Threaded accumulation using OMT.@tasks (each mode I owns its coeffs slice — race-free)
-    OMT.@tasks for I in CartesianIndices(ms)
-        @inbounds for j in 1:N
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks_phys[d][I[d]] * coords_vecs[d][j]
-            end
-            phi = -iflag * phi
-
-            W = cis(phi)
-
-            for u_idx in 1:NU
-                coeffs[I, u_idx] += fields_vecs[u_idx][j] * W
+# ---- Cartesian forward (tensor-product) ----
+function FFS._directsum_cartesian!(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        g::Union{FFS.UniformCartesianGrid{FT, D}, FFS.NonuniformCartesianGrid{FT, D}},
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    axes = g.axes
+    ss = map(length, axes)
+    Npts = prod(ss)
+    M = prod(ms)
+    B = length(coeffs) ÷ M
+    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    F = reshape(field, Npts, B)
+    C = reshape(coeffs, M, B)
+    fill!(C, zero(Complex{FT}))
+    modes = CartesianIndices(ms)
+    spat = CartesianIndices(ss)
+    OMT.@tasks for mi in 1:M
+        @inbounds begin
+            I = modes[mi]
+            for (pj, P) in enumerate(spat)
+                phi = zero(FT)
+                for d in 1:D
+                    phi += ks[d][I[d]] * FT(axes[d][P[d]])
+                end
+                W = cis(-iflag * phi)
+                for b in 1:B
+                    C[mi, b] += F[pj, b] * W
+                end
             end
         end
     end
-
-    coeffs ./= N
-    return ks_phys
+    C ./= Npts
+    return ks
 end
 
-# =============================================================================
-# Threaded Spherical Direct Sum — parallelize over point chunks with per-task
-# accumulators (O(nthreads) buffers, not O(N)) and the shared Legendre table.
-# =============================================================================
+# ---- Cartesian forward (scattered) ----
+function FFS._directsum_cartesian!(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        g::FFS.ScatteredCartesianGrid{FT, D}, field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    coords = g.coords
+    N = length(coords[1])
+    M = prod(ms)
+    B = length(coeffs) ÷ M
+    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    F = reshape(field, N, B)
+    C = reshape(coeffs, M, B)
+    fill!(C, zero(Complex{FT}))
+    modes = CartesianIndices(ms)
+    OMT.@tasks for mi in 1:M
+        @inbounds begin
+            I = modes[mi]
+            for j in 1:N
+                phi = zero(FT)
+                for d in 1:D
+                    phi += ks[d][I[d]] * FT(coords[d][j])
+                end
+                W = cis(-iflag * phi)
+                for b in 1:B
+                    C[mi, b] += F[j, b] * W
+                end
+            end
+        end
+    end
+    C ./= N
+    return ks
+end
 
-function _calculate_spectrum_spherical_threaded!(
-    coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    lmax::Int,
-    weights::Union{Nothing, AbstractVector},
-) where {FT}
-    N = length(coords_vecs[1])
-    NU = length(fields_vecs)
-    Nθ = lmax + 1
-    Nφ = 2 * lmax + 1
-
-    expected_size = (Nθ, Nφ, NU)
-    size(coeffs) == expected_size || throw(DimensionMismatch("coeffs size $(size(coeffs)) != expected $expected_size"))
-
-    θ = coords_vecs[1]
-    φ = coords_vecs[2]
-    w = weights === nothing ? fill(FT(4π) / N, N) : weights
-
+# ---- Spherical forward (point chunks + per-task accumulators) ----
+function FFS._directsum_spherical!(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        g::FFS.AbstractSphericalGrid{FT}, field::AbstractArray, lmax::Int) where {FT}
+    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g)
+    N = length(θpt)
+    Nθc = lmax + 1
+    Nφc = 2 * lmax + 1
+    B = length(coeffs) ÷ (Nθc * Nφc)
+    F = reshape(field, N, B)
     fill!(coeffs, zero(Complex{FT}))
+    C = reshape(coeffs, Nθc, Nφc, B)
     N == 0 && return (0:lmax, -lmax:lmax)
-
     tables = FFS.SphericalKernels.legendre_tables(FT, lmax)
-
-    # Contiguous point chunks, one parallel task each.
     nt = max(1, min(Threads.nthreads(), N))
     chunks = [(div((c - 1) * N, nt) + 1):(div(c * N, nt)) for c in 1:nt]
-
     accs = OMT.tmap(chunks) do chunk
-        acc = zeros(Complex{FT}, Nθ, Nφ, NU)
+        acc = zeros(Complex{FT}, Nθc, Nφc, B)
         Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
-        @inbounds for j in chunk
-            xj = cos(θ[j])
-            sj = sin(θ[j])
-            φj = φ[j]
-            wj = w[j]
+        @inbounds for p in chunk
+            xj = cos(θpt[p])
+            sj = sin(θpt[p])
+            φp = φpt[p]
+            wp = wpt[p]
             FFS.SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
             for l in 0:lmax
                 for m in -l:l
                     abs_m = abs(m)
-                    P_l_m = Plm[l+1, abs_m+1]
                     factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                    Y_lm = factor * P_l_m * cis(m * φj)
+                    Ylm = factor * Plm[l+1, abs_m+1] * cis(m * φp)
                     idx = FFS.sph_mode_index(l, m)
-                    g = conj(Y_lm) * wj
-                    for u_idx in 1:NU
-                        acc[idx, u_idx] += fields_vecs[u_idx][j] * g
+                    gw = conj(Ylm) * wp
+                    for b in 1:B
+                        acc[idx, b] += F[p, b] * gw
                     end
                 end
             end
         end
         return acc
     end
-
     @inbounds for acc in accs
-        coeffs .+= acc
+        C .+= acc
     end
-
     return (0:lmax, -lmax:lmax)
 end
 
-# =============================================================================
-# ThreadedBackend execution of the DirectSum INVERSE (synthesize). Output points are independent,
-# so we parallelize the outer point loop with per-task Legendre buffers (spherical).
-# =============================================================================
-
-function FFS._synthesize_cartesian(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
-        coords_vecs::Tuple, ms::NTuple{D, Int}, iflag::Int, domain_size) where {FT, D}
-    N = length(coords_vecs[1])
-    NU = size(coeffs, D + 1)
-    ranges = ntuple(d -> FT(domain_size[d]), D)
-    ks = FFS.Grids.physical_wavenumbers(ranges, ms, FT)
-    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
-    OMT.@tasks for j in 1:N
-        @inbounds for I in CartesianIndices(ms)
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks[d][I[d]] * coords_vecs[d][j]
-            end
-            W = cis(iflag * phi)
-            for u_idx in 1:NU
-                out[u_idx][j] += coeffs[I, u_idx] * W
+# ---- Cartesian inverse (parallel over independent output points) ----
+function FFS._synthesize_cartesian!(::FFS.ThreadedBackend, out::AbstractArray{Complex{FT}},
+        g::Union{FFS.UniformCartesianGrid{FT, D}, FFS.NonuniformCartesianGrid{FT, D}},
+        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    axes = g.axes
+    ss = map(length, axes)
+    Npts = prod(ss)
+    M = prod(ms)
+    B = length(out) ÷ Npts
+    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    O = reshape(out, Npts, B)
+    C = reshape(coeffs, M, B)
+    fill!(O, zero(Complex{FT}))
+    modes = CartesianIndices(ms)
+    spat = CartesianIndices(ss)
+    OMT.@tasks for pj in 1:Npts
+        @inbounds begin
+            P = spat[pj]
+            for (mi, I) in enumerate(modes)
+                phi = zero(FT)
+                for d in 1:D
+                    phi += ks[d][I[d]] * FT(axes[d][P[d]])
+                end
+                W = cis(iflag * phi)
+                for b in 1:B
+                    O[pj, b] += C[mi, b] * W
+                end
             end
         end
     end
     return out
 end
 
-function FFS._synthesize_spherical(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
-        coords_vecs::Tuple, lmax::Int) where {FT}
-    θ = coords_vecs[1]
-    φ = coords_vecs[2]
-    N = length(θ)
-    NU = size(coeffs, 3)
-    tables = FFS.SphericalKernels.legendre_tables(FT, lmax)
-    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
+function FFS._synthesize_cartesian!(::FFS.ThreadedBackend, out::AbstractArray{Complex{FT}},
+        g::FFS.ScatteredCartesianGrid{FT, D}, coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    coords = g.coords
+    N = length(coords[1])
+    M = prod(ms)
+    B = length(out) ÷ N
+    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    O = reshape(out, N, B)
+    C = reshape(coeffs, M, B)
+    fill!(O, zero(Complex{FT}))
+    modes = CartesianIndices(ms)
     OMT.@tasks for j in 1:N
+        @inbounds begin
+            for (mi, I) in enumerate(modes)
+                phi = zero(FT)
+                for d in 1:D
+                    phi += ks[d][I[d]] * FT(coords[d][j])
+                end
+                W = cis(iflag * phi)
+                for b in 1:B
+                    O[j, b] += C[mi, b] * W
+                end
+            end
+        end
+    end
+    return out
+end
+
+# ---- Spherical inverse (parallel over independent output points, per-task Legendre buffer) ----
+function FFS._synthesize_spherical!(::FFS.ThreadedBackend, out::AbstractArray{Complex{FT}},
+        g::FFS.AbstractSphericalGrid{FT}, coeffs::AbstractArray, lmax::Int) where {FT}
+    θpt, φpt, _ = FFS.DirectSum._sph_point_data(g)
+    N = length(θpt)
+    Nθc = lmax + 1
+    Nφc = 2 * lmax + 1
+    B = length(out) ÷ N
+    O = reshape(out, N, B)
+    C = reshape(coeffs, Nθc, Nφc, B)
+    fill!(O, zero(Complex{FT}))
+    tables = FFS.SphericalKernels.legendre_tables(FT, lmax)
+    OMT.@tasks for p in 1:N
         @local Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
         @inbounds begin
-            xj = cos(θ[j])
-            sj = sin(θ[j])
-            φj = φ[j]
+            xj = cos(θpt[p])
+            sj = sin(θpt[p])
+            φp = φpt[p]
             FFS.SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
             for l in 0:lmax
                 for m in -l:l
                     abs_m = abs(m)
                     factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                    Y_lm = factor * Plm[l+1, abs_m+1] * cis(m * φj)
+                    Ylm = factor * Plm[l+1, abs_m+1] * cis(m * φp)
                     idx = FFS.sph_mode_index(l, m)
-                    for u_idx in 1:NU
-                        out[u_idx][j] += coeffs[idx, u_idx] * Y_lm
+                    for b in 1:B
+                        O[p, b] += C[idx, b] * Ylm
                     end
                 end
             end

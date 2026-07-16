@@ -2,72 +2,90 @@ module Operators
 
 export spectral_divergence, spectral_vorticity, compensate, band_energy
 
-# Physical wavenumber along axis `d` at spectral CartesianIndex `I`.
-@inline _kd(ks_phys, d, I) = @inbounds ks_phys[d][I[d]]
+# =============================================================================
+# Spectral-differentiation operators. The velocity components live on the FIRST batch dim (size `D`),
+# so coefficients are `(ms…, D, extra_batch…)`; the extra trailing batch dims (levels/time/…) are
+# carried through. Output keeps `(ms…, ncomp_out, extra_batch…)`.
+# =============================================================================
+
+# Reshape `(ms…, D, extra…)` ↔ `(M, D, E)` (M = ∏ms spectral modes, E = ∏extra batch slices).
+@inline _mDE(a, M, D, E) = reshape(a, M, D, E)
 
 """
-    spectral_divergence(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}}) -> AbstractArray
+    spectral_divergence(ks_phys::Tuple, coeffs) -> AbstractArray
 
-Spectral divergence ``\\widehat{\\nabla\\cdot u} = i\\,\\sum_d k_d\\,\\hat u_d`` of a `D`-component
-vector field whose Fourier coefficients are `coeffs` of shape `(ms..., D)`. Returns a
-`(ms..., 1)` coefficient array; take its `isotropic_spectrum` for the divergence
-(compressive) spectrum. Defined for `D = 1, 2, 3`.
+Spectral divergence ``\\widehat{\\nabla\\cdot u} = i\\sum_d k_d \\hat u_d`` of a `D`-component vector
+field with coefficients `(ms…, D, extra…)`. Returns `(ms…, 1, extra…)`. Defined for `D = 1, 2, 3`.
 """
 function spectral_divergence(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}) where {T, N}
     D = length(ks_phys)
-    N == D + 1 || throw(ArgumentError("coeffs must have shape (ms..., NU)"))
-    ms = size(coeffs)[1:D]
-    NU = size(coeffs, N)
-    NU == D || throw(ArgumentError("divergence needs NU = D = $D components, got $NU"))
-    out = zeros(Complex{T}, ms..., 1)
-    @inbounds for I in CartesianIndices(ms)
-        acc = zero(Complex{T})
-        for d in 1:D
-            acc += im * T(_kd(ks_phys, d, I)) * coeffs[I, d]
+    N >= D + 1 || throw(ArgumentError("coeffs must have shape (ms…, D, extra…)"))
+    ms = ntuple(d -> size(coeffs, d), D)
+    ncomp = size(coeffs, D + 1)
+    ncomp == D || throw(ArgumentError("divergence needs D = $D components on dim $(D+1), got $ncomp"))
+    extra = ntuple(i -> size(coeffs, D + 1 + i), N - D - 1)
+    M = prod(ms)
+    E = prod(extra; init = 1)
+    out = zeros(Complex{T}, ms..., 1, extra...)
+    C = _mDE(coeffs, M, D, E)
+    O = _mDE(out, M, 1, E)
+    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+        for e in 1:E
+            acc = zero(Complex{T})
+            for d in 1:D
+                acc += im * T(ks_phys[d][I[d]]) * C[mi, d, e]
+            end
+            O[mi, 1, e] = acc
         end
-        out[I, 1] = acc
     end
     return out
 end
 
 """
-    spectral_vorticity(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}}) -> AbstractArray
+    spectral_vorticity(ks_phys::Tuple, coeffs) -> AbstractArray
 
 Spectral vorticity ``\\hat\\omega = i\\,k \\times \\hat u`` of a vector field with coefficients
-`coeffs` of shape `(ms..., D)`:
-- `D = 2`: scalar out-of-plane vorticity → `(ms..., 1)`.
-- `D = 3`: 3-component vorticity vector → `(ms..., 3)`.
-
-Take the `isotropic_spectrum` of the result for the enstrophy spectrum
-``Z(k) = \\tfrac12 |\\hat\\omega|^2``. (`D = 1` has no curl.)
+`(ms…, D, extra…)`: `D = 2` → scalar out-of-plane vorticity `(ms…, 1, extra…)`; `D = 3` → 3-component
+vorticity `(ms…, 3, extra…)`.
 """
 function spectral_vorticity(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}) where {T, N}
     D = length(ks_phys)
-    N == D + 1 || throw(ArgumentError("coeffs must have shape (ms..., NU)"))
-    ms = size(coeffs)[1:D]
-    NU = size(coeffs, N)
+    N >= D + 1 || throw(ArgumentError("coeffs must have shape (ms…, D, extra…)"))
+    ms = ntuple(d -> size(coeffs, d), D)
+    ncomp = size(coeffs, D + 1)
+    extra = ntuple(i -> size(coeffs, D + 1 + i), N - D - 1)
+    M = prod(ms)
+    E = prod(extra; init = 1)
     if D == 2
-        NU == 2 || throw(ArgumentError("2D vorticity needs 2 velocity components, got $NU"))
-        out = zeros(Complex{T}, ms..., 1)
-        @inbounds for I in CartesianIndices(ms)
-            kx = T(_kd(ks_phys, 1, I))
-            ky = T(_kd(ks_phys, 2, I))
-            out[I, 1] = im * (kx * coeffs[I, 2] - ky * coeffs[I, 1])
+        ncomp == 2 || throw(ArgumentError("2D vorticity needs 2 components, got $ncomp"))
+        out = zeros(Complex{T}, ms..., 1, extra...)
+        C = _mDE(coeffs, M, 2, E)
+        O = _mDE(out, M, 1, E)
+        @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+            kx = T(ks_phys[1][I[1]])
+            ky = T(ks_phys[2][I[2]])
+            for e in 1:E
+                O[mi, 1, e] = im * (kx * C[mi, 2, e] - ky * C[mi, 1, e])
+            end
         end
         return out
     elseif D == 3
-        NU == 3 || throw(ArgumentError("3D vorticity needs 3 velocity components, got $NU"))
-        out = zeros(Complex{T}, ms..., 3)
-        @inbounds for I in CartesianIndices(ms)
-            kx = T(_kd(ks_phys, 1, I))
-            ky = T(_kd(ks_phys, 2, I))
-            kz = T(_kd(ks_phys, 3, I))
-            cx = coeffs[I, 1]
-            cy = coeffs[I, 2]
-            cz = coeffs[I, 3]
-            out[I, 1] = im * (ky * cz - kz * cy)
-            out[I, 2] = im * (kz * cx - kx * cz)
-            out[I, 3] = im * (kx * cy - ky * cx)
+        ncomp == 3 || throw(ArgumentError("3D vorticity needs 3 components, got $ncomp"))
+        out = zeros(Complex{T}, ms..., 3, extra...)
+        C = _mDE(coeffs, M, 3, E)
+        O = _mDE(out, M, 3, E)
+        @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+            kx = T(ks_phys[1][I[1]])
+            ky = T(ks_phys[2][I[2]])
+            kz = T(ks_phys[3][I[3]])
+            for e in 1:E
+                cx = C[mi, 1, e]
+                cy = C[mi, 2, e]
+                cz = C[mi, 3, e]
+                O[mi, 1, e] = im * (ky * cz - kz * cy)
+                O[mi, 2, e] = im * (kz * cx - kx * cz)
+                O[mi, 3, e] = im * (kx * cy - ky * cx)
+            end
         end
         return out
     else
@@ -76,19 +94,18 @@ function spectral_vorticity(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}
 end
 
 """
-    compensate(k_bins, E_k, p) -> Vector
+    compensate(k_bins, E_k, p) -> AbstractArray
 
-Compensated spectrum ``k^p E(k)`` (e.g. `p = 5/3` for a Kolmogorov inertial-range plateau,
-`p = 1` for a premultiplied / variance-preserving log-`k` plot, `p = 2` for the
-2D-incompressible enstrophy identity ``Z(k) = k^2 E(k)``).
+Compensated spectrum ``k^p E(k)`` (e.g. `p = 5/3` Kolmogorov plateau, `p = 2` for `Z(k)=k²E(k)`).
+`E_k` may be `(num_bins,)` or `(num_bins, batch…)`; `k_bins` broadcasts along the wavenumber axis.
 """
-compensate(k_bins::AbstractVector, E_k::AbstractVector, p::Real) = @. k_bins^p * E_k
+compensate(k_bins::AbstractVector, E_k::AbstractArray, p::Real) = (k_bins .^ p) .* E_k
 
 """
     band_energy(k_bins, E_k, k1, k2) -> Real
 
-Energy integrated over the wavenumber band ``[k_1, k_2]``: ``\\int_{k_1}^{k_2} E(k)\\,dk`` via the
-trapezoidal rule over the bins whose centers fall in the band.
+Energy integrated over the wavenumber band ``[k_1, k_2]`` via the trapezoidal rule over the bins whose
+centers fall in the band. `E_k` is a 1D spectrum `(num_bins,)`.
 """
 function band_energy(k_bins::AbstractVector{T}, E_k::AbstractVector, k1::Real, k2::Real) where {T}
     lo, hi = promote(T(k1), T(k2))

@@ -1,57 +1,37 @@
 module FlowFieldSpectraFastSphericalHarmonicsExt
 
-using FastSphericalHarmonics: FastSphericalHarmonics
+using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 
-"""
-    calculate_spectrum(::SHTBackend, coords_vecs, fields_vecs, ms; ...)
+# =============================================================================
+# Structured Spherical Harmonic Transform via FastSphericalHarmonics, tensor-native. The field arrives
+# as `(Nθ, Nφ, batch…)` — we slice each batch's `(Nθ, Nφ)` plane straight into `sph_transform!`, with
+# NO `vec`→`reshape` round-trip. FastSphericalHarmonics/FastTransforms is CPU-only (see the plan's
+# ceilings); the execution axis is a documented no-op here (Serial and Threaded route in identically).
+# =============================================================================
 
-Compute structured Spherical Harmonic Transform (SHT) using FastSphericalHarmonics.
-"""
-function FFS._calculate_spectrum_sht(
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    ms::Tuple;
-    kwargs...,
-)
-    FT = eltype(coords_vecs[1])
-    NU = length(fields_vecs)
+function FFS._calculate_spectrum_sht(g::FFS.StructuredSphericalGrid, field::AbstractArray, ms::Tuple; kwargs...)
+    FT = real(float(eltype(field)))
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-
-    # Validate inputs
-    for d in 1:2
-        length(coords_vecs[d]) == Nθ * Nφ || throw(DimensionMismatch("SHT requires coordinates length to match grid size Nθ*Nφ = $(Nθ*Nφ)"))
-    end
-    for k in 1:NU
-        length(fields_vecs[k]) == Nθ * Nφ || throw(DimensionMismatch("SHT requires field components length to match grid size Nθ*Nφ = $(Nθ*Nφ)"))
-    end
-
-    # Preallocate complex coefficients
-    # Although FastSphericalHarmonics returns a real matrix where real/imag parts of C_l^m
-    # are stored in different columns, we map them to a standard Complex array.
-    coeffs = zeros(Complex{FT}, Nθ, Nφ, NU)
-
-    for k in 1:NU
-        # Copy input field and reshape to grid
-        grid_data = copy(reshape(fields_vecs[k], Nθ, Nφ))
-        
-        # In-place transform to spherical harmonic coefficients (stores real/imag parts)
-        FastSphericalHarmonics.sph_transform!(grid_data)
-
-        # Map to complex coefficients coeffs
+    ss = FFS.spatial_size(g)
+    ss == (Nθ, Nφ) || throw(ArgumentError(
+        "SHTBackend requires a structured (Nθ, Nφ) = ($Nθ, $Nφ) grid matching ms; got spatial_size = $ss"))
+    B = length(field) ÷ (Nθ * Nφ)
+    Fr = reshape(field, Nθ, Nφ, B)
+    coeffs = zeros(Complex{FT}, Nθ, Nφ, B)
+    @inbounds for b in 1:B
+        slab = Matrix{FT}(@view Fr[:, :, b])          # dense copy; sph_transform! mutates in place
+        FSH.sph_transform!(slab)                       # real/imag packed in the FSH layout
         for l in 0:lmax
             for m in -l:l
-                idx = FFS.sph_mode_index(l, m)
-                # FastSphericalHarmonics.sph_mode(l, m) returns the CartesianIndex of the real coefficient
-                fsh_idx = FastSphericalHarmonics.sph_mode(l, m)
-                coeffs[idx, k] = grid_data[fsh_idx]
+                coeffs[FFS.sph_mode_index(l, m), b] = slab[FSH.sph_mode(l, m)]
             end
         end
     end
-
-    return coeffs, (0:lmax, -lmax:lmax)
+    batch = ntuple(i -> size(field, 2 + i), ndims(field) - 2)
+    return reshape(coeffs, Nθ, Nφ, batch...), (0:lmax, -lmax:lmax)
 end
 
 end # module FlowFieldSpectraFastSphericalHarmonicsExt

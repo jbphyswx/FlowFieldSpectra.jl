@@ -143,10 +143,12 @@ calculate_spectrum(::FFTBackend, exec::Union{SerialBackend, ThreadedBackend}, g:
 calculate_spectrum(::FFTBackend, exec::GPUBackend, g::UniformCartesianGrid, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_gpu_fft(exec, g, field, ms; kwargs...)
 
-# ---- Level 2: NUFFT (FINUFFT ext CPU; cuFINUFFT ext on CUDA). Scattered / nonuniform-gridded. ----
-calculate_spectrum(::NUFFTBackend, exec::Union{SerialBackend, ThreadedBackend}, g::Union{ScatteredCartesianGrid, NonuniformCartesianGrid}, field::AbstractArray, ms::Tuple; kwargs...) =
+# ---- Level 2: NUFFT (FINUFFT ext CPU; cuFINUFFT ext on CUDA). Scattered point clouds. ----
+# (A nonuniform-but-gridded NonuniformCartesianGrid uses DirectSumBackend; a separable per-axis fast
+# NUFFT for it is a planned optimization and routes to the catch-all until implemented.)
+calculate_spectrum(::NUFFTBackend, exec::Union{SerialBackend, ThreadedBackend}, g::ScatteredCartesianGrid, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_nufft(exec, g, field, ms; kwargs...)
-calculate_spectrum(::NUFFTBackend, exec::GPUBackend, g::Union{ScatteredCartesianGrid, NonuniformCartesianGrid}, field::AbstractArray, ms::Tuple; kwargs...) =
+calculate_spectrum(::NUFFTBackend, exec::GPUBackend, g::ScatteredCartesianGrid, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_gpu_nufft(exec, g, field, ms; kwargs...)
 
 # ---- Level 2: SHT / NUFSHT (execution axis handled inside the extension) ----
@@ -160,9 +162,10 @@ function calculate_spectrum(t::AbstractSpectralBackend, e::AbstractExecutionBack
         g::AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
     throw(ArgumentError(
         "Unsupported combination transform=$(nameof(typeof(t))), execution=$(nameof(typeof(e))), " *
-        "grid=$(nameof(typeof(g))). FFT needs a UniformCartesianGrid; NUFFT needs a Scattered/Nonuniform " *
-        "Cartesian grid; SHT needs a StructuredSphericalGrid; NUFSHT needs a spherical grid; fast GPU " *
-        "FFT/NUFFT need a CUDA device. DirectSumBackend works on any grid (and on a GPUBackend).",
+        "grid=$(nameof(typeof(g))). FFT needs a UniformCartesianGrid; NUFFT needs a ScatteredCartesianGrid " *
+        "(a nonuniform-but-gridded NonuniformCartesianGrid uses DirectSumBackend); SHT needs a " *
+        "StructuredSphericalGrid; NUFSHT needs a spherical grid; fast GPU FFT/NUFFT need a CUDA device. " *
+        "DirectSumBackend works on any grid (and on a GPUBackend).",
     ))
 end
 

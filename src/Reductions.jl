@@ -24,7 +24,9 @@ export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spec
 end
 
 # Radial-bin setup shared by the isotropic-style reductions.
-@inline function _radial_setup(ks_phys::NTuple{D, Any}, ms::NTuple{D, Int}, num_bins::Int, ::Type{T}) where {D, T}
+# Non-allocating radial extent (num_bins, dk, k_max): the max resolved isotropic wavenumber is the
+# min over axes of each axis's max |k|, formed without per-axis temporaries.
+@inline function _radial_extent(ks_phys::NTuple{D, Any}, ms::NTuple{D, Int}, num_bins::Int, ::Type{T}) where {D, T}
     k_max = T(Inf)
     @inbounds for d in 1:D
         axmax = zero(T)
@@ -35,9 +37,15 @@ end
         k_max = min(k_max, axmax)
     end
     num_bins <= 0 && (num_bins = minimum(ms) ÷ 2)
-    dk = k_max / num_bins
-    k_bins = [T(0.5) * ((i - 1) * dk + i * dk) for i in 1:num_bins]
-    return num_bins, dk, k_max, k_bins
+    return num_bins, k_max / num_bins, k_max
+end
+
+@inline _kbin_centers(num_bins::Int, dk::T) where {T} = [T(0.5) * ((i - 1) * dk + i * dk) for i in 1:num_bins]
+
+# Allocating setup (returns the k-bin centers too) for the allocating reductions.
+@inline function _radial_setup(ks_phys::NTuple{D, Any}, ms::NTuple{D, Int}, num_bins::Int, ::Type{T}) where {D, T}
+    num_bins, dk, k_max = _radial_extent(ks_phys, ms, num_bins, T)
+    return num_bins, dk, k_max, _kbin_centers(num_bins, dk)
 end
 
 # =============================================================================
@@ -99,7 +107,7 @@ function isotropic_spectrum!(E::AbstractArray{T}, k_bins::AbstractVector{T}, ks_
     nb = length(k_bins)
     num_bins > 0 && num_bins != nb &&
         throw(ArgumentError("num_bins=$num_bins ≠ length(k_bins)=$nb"))
-    _, dk, k_max, _ = _radial_setup(ks_phys, ms, nb, T)
+    _, dk, k_max = _radial_extent(ks_phys, ms, nb, T)      # no k_bins allocation (fill the arg below)
     @inbounds for i in 1:nb
         k_bins[i] = T(0.5) * ((i - 1) * dk + i * dk)
     end

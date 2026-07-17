@@ -20,7 +20,7 @@ using .Types: Types, AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFF
 using .Grids: Grids, AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, spatial_dims, ndims_spatial, spatial_size, npoints
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
-using .Problem: Problem, TransformProblem, batch_shape, stack_fields, coeff_eltype
+using .Problem: Problem, TransformProblem, batch_shape, stack_fields
 using .Plans: Plans, AbstractSpectralPlan, plan_spectrum
 using .DirectSum: DirectSum, sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum

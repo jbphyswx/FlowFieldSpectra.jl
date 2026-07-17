@@ -40,23 +40,21 @@ end
 
 # Reconstruct the full (N…, batch…) complex spectrum from the rfft half (h1, N_2…N_D, batch…) via
 # Hermitian symmetry F[k] = conj(F[-k]) over the spectral dims 1:D; the batch rides along.
-function _full_from_rfft!(full::AbstractArray{Complex{T}}, half::AbstractArray{Complex{T}},
-        ns::NTuple{D, Int}) where {T, D}
+function _full_from_rfft!(full::AbstractArray{Complex{T}, NT}, half::AbstractArray{Complex{T}, NT},
+        ns::NTuple{D, Int}) where {T, D, NT}
     h1 = ns[1] ÷ 2 + 1
-    B = length(full) ÷ prod(ns)
-    Ff = reshape(full, ns..., B)
-    Hf = reshape(half, h1, ns[2:D]..., B)
-    # Fill each full mode from the stored lower half (J[1] ≤ h1) or its Hermitian conjugate partner.
-    # The negated per-axis index (j ↦ 1 if j==1 else n-j+2) is computed inline — no per-call vectors.
-    @inbounds for b in 1:B
-        for J in CartesianIndices(ns)
-            if J[1] <= h1
-                Ff[J, b] = Hf[J, b]
-            else
-                src = CartesianIndex(ns[1] - J[1] + 2,
-                    ntuple(d -> (J[d + 1] == 1 ? 1 : ns[d + 1] - J[d + 1] + 2), D - 1)...)
-                Ff[J, b] = conj(Hf[src, b])
-            end
+    # `full` is (ns…, batch…) and `half` is (h1, ns[2:D]…, batch…), both rank NT. Iterate `full`
+    # directly (no reshape → no per-call header allocation): each mode is the stored lower half
+    # (I[1] ≤ h1) or the Hermitian conjugate of its negated-frequency partner (batch dims copied
+    # through). The negated per-axis index is j ↦ 1 if j==1 else n-j+2.
+    @inbounds for I in CartesianIndices(full)
+        if I[1] <= h1
+            full[I] = half[I]
+        else
+            src = CartesianIndex(ntuple(
+                d -> d == 1 ? (ns[1] - I[1] + 2) : (d <= D ? (I[d] == 1 ? 1 : ns[d] - I[d] + 2) : I[d]),
+                Val(NT)))
+            full[I] = conj(half[src])
         end
     end
     return full

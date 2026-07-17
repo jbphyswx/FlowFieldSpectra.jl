@@ -86,11 +86,8 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUFFTC
     # (M, ntrans) strengths buffer (M = N, ntrans = ∏batch, column-major orders coincide).
     copyto!(plan.cj, field)                                   # widen real→complex into the reused buffer
     FINUFFT.finufft_exec!(plan.guru, plan.cj, plan.fk)
-    if size(coeffs) == size(plan.fk)                          # single batch axis: shapes already match
-        coeffs .= plan.fk .* plan.phase                       # phase is (ms…, 1): broadcasts over ntrans
-    else                                                      # multi-axis batch: one reshape header
-        reshape(coeffs, plan.ms..., plan.ntrans) .= plan.fk .* plan.phase
-    end
+    plan.fk .*= plan.phase                                    # phase (ms…, 1) broadcasts over ntrans, in place
+    copyto!(coeffs, plan.fk)                                  # linear copy → any coeffs shape (no reshape)
     return plan.ks_phys
 end
 

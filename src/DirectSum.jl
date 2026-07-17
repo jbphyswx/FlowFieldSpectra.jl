@@ -1,6 +1,6 @@
 module DirectSum
 
-using ..Grids: Grids, AbstractCartesianGrid, UniformCartesianGrid, NonuniformCartesianGrid,
+using ..Grids: UniformCartesianGrid, NonuniformCartesianGrid,
     ScatteredCartesianGrid, AbstractSphericalGrid, StructuredSphericalGrid, ScatteredSphericalGrid,
     physical_wavenumbers
 using ..SphericalKernels: SphericalKernels

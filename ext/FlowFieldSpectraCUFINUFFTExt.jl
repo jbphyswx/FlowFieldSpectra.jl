@@ -109,4 +109,56 @@ function FFS._calculate_spectrum_gpu_nufft(::FFS.GPUBackend{<:CUDA.CUDABackend},
     return Array(coeffs_dev), ks
 end
 
+# =============================================================================
+# Separable GPU NUFFT for a nonuniform tensor-product grid (NonuniformCartesianGrid): the D-dim kernel
+# factorizes, so it is a sequence of 1-D cuFINUFFT type-1 transforms — one per axis — with every other
+# spatial + batch dim carried as the `ntrans` batch. Device-side analog of the CPU separable path
+# (FINUFFTExt._nufft_axis); each 1-D transform needs only its own length-N_d axis (no ∏N_d coords).
+# Because every transform is 1-D, this supports any D. CUDA-only; validated only on `gpu/`, never CI.
+# =============================================================================
+function FFS._calculate_spectrum_gpu_nufft(::FFS.GPUBackend{<:CUDA.CUDABackend},
+        g::FFS.NonuniformCartesianGrid{FT0, D}, field::AbstractArray, ms::Tuple;
+        iflag::Int = 1, eps::Union{Nothing, Real} = nothing, kwargs...) where {FT0, D}
+    CUDA.functional() || throw(ArgumentError("cuFINUFFT requires a functional CUDA device."))
+    T = float(real(eltype(field)))
+    epsv = T(eps === nothing ? _default_eps(T) : eps)
+    npts = prod(ntuple(d -> length(g.axes[d]), D))
+    A = CUDA.CuArray{Complex{T}}(undef, size(field)...)
+    copyto!(A, field)                                            # host/device → device, widen real→complex
+    for d in 1:D
+        A = _gpu_nufft_axis(A, d, g.axes[d], Int(ms[d]), T(g.domain_size[d]), iflag, epsv)
+    end
+    A ./= npts
+    ks = FFS.Grids.physical_wavenumbers(ntuple(d -> T(g.domain_size[d]), D), NTuple{D, Int}(ms), T)
+    return Array(A), ks
+end
+
+# One 1-D cuFINUFFT type-1 transform along dim `d` (points = `axis`), other dims → ntrans; × per-mode
+# translation-correction phase. Returns a new device array whose dim `d` now has length `m`.
+function _gpu_nufft_axis(A::CUDA.CuArray{Complex{T}}, d::Int, axis::AbstractVector, m::Int,
+        L::T, iflag::Int, eps::T) where {T}
+    nd = ndims(A)
+    Nd = length(axis)
+    size(A, d) == Nd ||
+        throw(DimensionMismatch("axis $d: field length $(size(A, d)) ≠ grid axis length $Nd"))
+    perm = (d, ntuple(i -> i < d ? i : i + 1, nd - 1)...)        # move transform axis to front
+    Ap = permutedims(A, perm)                                    # device (Nd, rest…), contiguous
+    restshape = size(Ap)[2:end]
+    ntrans = prod(restshape; init = 1)
+    cj = reshape(Ap, Nd, ntrans)                                 # device (Nd, ntrans)
+    off = T(minimum(axis))
+    rng = L == 0 ? one(T) : L
+    x = CUDA.CuArray(T(2π) .* (T.(collect(axis)) .- off) ./ rng)
+    guru = FINUFFT.cufinufft_makeplan(1, [m], -iflag, ntrans, eps; dtype = T)
+    FINUFFT.cufinufft_setpts!(guru, x)
+    fk = CUDA.zeros(Complex{T}, m, ntrans)
+    FINUFFT.cufinufft_exec!(guru, cj, fk)
+    FINUFFT.cufinufft_destroy!(guru)
+    m_ints = -(m ÷ 2):((m - 1) ÷ 2)
+    ophase = CUDA.CuArray(Complex{T}[cis(-iflag * mm * (off * T(2π) / rng)) for mm in m_ints])  # (m,)
+    fk .*= reshape(ophase, m, 1)                                 # broadcast over ntrans
+    Fr = reshape(fk, m, restshape...)
+    return permutedims(Fr, invperm(collect(perm)))               # restore dim order; dim d now length m
+end
+
 end # module FlowFieldSpectraCUFINUFFTExt

@@ -148,7 +148,7 @@ calculate_spectrum(::FFTBackend, exec::GPUBackend, g::UniformCartesianGrid, fiel
 # NUFFT (both are `_calculate_spectrum_nufft`, dispatched on the grid type inside the extension). ----
 calculate_spectrum(::NUFFTBackend, exec::Union{SerialBackend, ThreadedBackend}, g::Union{ScatteredCartesianGrid, NonuniformCartesianGrid}, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_nufft(exec, g, field, ms; kwargs...)
-calculate_spectrum(::NUFFTBackend, exec::GPUBackend, g::ScatteredCartesianGrid, field::AbstractArray, ms::Tuple; kwargs...) =
+calculate_spectrum(::NUFFTBackend, exec::GPUBackend, g::Union{ScatteredCartesianGrid, NonuniformCartesianGrid}, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_gpu_nufft(exec, g, field, ms; kwargs...)
 
 # ---- Level 2: SHT / NUFSHT (execution axis handled inside the extension) ----

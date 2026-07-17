@@ -47,9 +47,14 @@ function run_nufft_coastline_example()
     ax1 = Mke.Axis(fig[1, 1]; title = "Ocean samples (land cut out)", xlabel = "x", ylabel = "y",
         aspect = Mke.DataAspect())
     Mke.scatter!(ax1, xo, yo; color = fo, colormap = :balance, markersize = 4)
-    ax2 = Mke.Axis(fig[1, 2]; title = "Isotropic energy spectrum", xlabel = "k", ylabel = "E(k)", yscale = log10)
-    Mke.lines!(ax2, k_ref, E_ref .+ 1e-20; color = :black, linewidth = 2, label = "Full grid (FFT)")
-    Mke.scatter!(ax2, k_nu2, E_nu .+ 1e-20; color = :crimson, markersize = 9, label = "Ocean cloud (NUFFT)")
+    # symlog y-axis: linear through a small threshold near 0, logarithmic above it. The exact FFT's
+    # off-peak roundoff-zeros (~1e-32) collapse into the linear region at ≈0 (not stretching the axis
+    # over 30 empty decades), while the NUFFT's real ~2-decade leakage-floor→peak gap is shown honestly
+    # in the log region. Nothing is clipped and nothing is compressed — all data is visible.
+    ax2 = Mke.Axis(fig[1, 2]; title = "Isotropic energy spectrum (masked ⇒ broadband leakage floor)",
+        xlabel = "k", ylabel = "E(k)", yscale = Mke.Makie.Symlog10(1.0e-4))
+    Mke.lines!(ax2, k_ref, E_ref; color = :black, linewidth = 2, label = "Full grid (FFT)")
+    Mke.scatter!(ax2, k_nu2, E_nu; color = :crimson, markersize = 9, label = "Ocean cloud (NUFFT)")
     Mke.axislegend(ax2; position = :rt)
 
     outpath = joinpath(@__DIR__, "nufft_coastline.png")

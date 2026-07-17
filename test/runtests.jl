@@ -87,6 +87,41 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test all(isapprox(k_direct[d], k_nufft[d], rtol = 1e-12) for d in 1:2)
     end
 
+    Test.@testset "Nonuniform-gridded Parity (separable NUFFT vs Direct)" begin
+        # NonuniformCartesianGrid: a tensor-product grid with nonuniform axis spacing. The NUFFT path is
+        # a separable sweep of 1-D transforms (FINUFFTExt._nufft_axis) — no ∏N_d coordinate blob. Because
+        # every transform is 1-D it also covers D=3 (FINUFFT's per-call D≤3 cap is never hit).
+        Random.seed!(7)
+        L = (2π, 2π)
+        xax = sort(rand(13)) .* L[1]
+        yax = sort(rand(11)) .* L[2]
+        g = FFS.NonuniformCartesianGrid((xax, yax); domain_size = L)
+        ms = (8, 7)
+        f = [cos(2x) + 0.5sin(3y) + 0.3cos(x + 2y) for x in xax, y in yax]
+
+        c_d, k_d = FFS.calculate_spectrum(g, f, ms; transform = FFS.DirectSumBackend())
+        c_n, k_n = FFS.calculate_spectrum(g, f, ms; transform = FFS.NUFFTBackend(), eps = 1e-13)
+        Test.@test size(c_n) == ms
+        Test.@test isapprox(c_d, c_n, atol = 1e-10)
+        Test.@test all(isapprox(k_d[d], k_n[d], rtol = 1e-12) for d in 1:2)
+
+        # trailing (nz, nt) batch preserved and batched through the separable sweep
+        fb = cat(cat(f, 2f, -0.5f; dims = 3), 0.7 .* cat(f, 2f, -0.5f; dims = 3); dims = 4)  # (13,11,3,2)
+        cb_d, _ = FFS.calculate_spectrum(g, fb, ms; transform = FFS.DirectSumBackend())
+        cb_n, _ = FFS.calculate_spectrum(g, fb, ms; transform = FFS.NUFFTBackend(), eps = 1e-13)
+        Test.@test size(cb_n) == (ms..., 3, 2)
+        Test.@test isapprox(cb_d, cb_n, atol = 1e-10)
+
+        # D = 3 (separable = all 1-D, so FINUFFT's D≤3 per-call cap is irrelevant here)
+        zax = sort(rand(6)) .* 2π
+        g3 = FFS.NonuniformCartesianGrid((xax, yax, zax); domain_size = (2π, 2π, 2π))
+        ms3 = (5, 4, 3)
+        f3 = [cos(x) + sin(2y) + 0.4cos(z) for x in xax, y in yax, z in zax]
+        c3_d, _ = FFS.calculate_spectrum(g3, f3, ms3; transform = FFS.DirectSumBackend())
+        c3_n, _ = FFS.calculate_spectrum(g3, f3, ms3; transform = FFS.NUFFTBackend(), eps = 1e-13)
+        Test.@test isapprox(c3_d, c3_n, atol = 1e-9)
+    end
+
     Test.@testset "Spherical Structured Parity (Direct vs FastSphericalHarmonics)" begin
         lmax = 8
         Nθ = lmax + 1

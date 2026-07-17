@@ -111,4 +111,59 @@ function FFS._calculate_spectrum_nufft(exec::FFS.AbstractExecutionBackend, g::FF
     return coeffs, ks
 end
 
+# =============================================================================
+# Separable NUFFT for a nonuniform tensor-product grid (NonuniformCartesianGrid). The D-dim Fourier
+# kernel factorizes over a tensor-product grid, so the transform is a sequence of 1-D type-1 NUFFTs —
+# one per axis — with every OTHER spatial + batch dim carried as the FINUFFT `ntrans` batch. Each 1-D
+# transform needs only its own length-N_d axis: NO ∏N_d coordinate materialization (the point of a
+# gridded-but-nonuniform representation). Along axis `d` the working array's dim `d` shrinks from N_d
+# to ms[d]. Because every transform is 1-D, this path supports any D (FINUFFT's D≤3 cap is per-call and
+# never reached here). Divide by ∏N_d once at the end — matches the DirectSum / scattered-NUFFT result.
+# =============================================================================
+function FFS._calculate_spectrum_nufft(exec::FFS.AbstractExecutionBackend, g::FFS.NonuniformCartesianGrid{FT0, D},
+        field::AbstractArray, ms::Tuple; iflag::Int = 1, eps::Union{Nothing, Real} = nothing, kwargs...) where {FT0, D}
+    T = float(real(eltype(field)))
+    epsv = T(eps === nothing ? _default_eps(T) : eps)
+    nth = _exec_nthreads(exec)
+    npts = prod(ntuple(d -> length(g.axes[d]), D))
+    A = Array{Complex{T}}(undef, size(field)...)
+    copyto!(A, field)                                          # widen real→complex working copy
+    for d in 1:D
+        A = _nufft_axis(A, d, T.(g.axes[d]), Int(ms[d]), T(g.domain_size[d]), iflag, epsv, nth)
+    end
+    A ./= npts
+    ks = FFS.Grids.physical_wavenumbers(ntuple(d -> T(g.domain_size[d]), D), NTuple{D, Int}(ms), T)
+    return A, ks
+end
+
+# One 1-D type-1 NUFFT along dim `d` (points = `axis`, length N_d), modes = `m`; every other dim of `A`
+# is carried as an `ntrans` column. Returns a new array whose dim `d` now has length `m`.
+function _nufft_axis(A::AbstractArray{Complex{T}}, d::Int, axis::AbstractVector{T}, m::Int,
+        L::T, iflag::Int, eps::T, nthreads::Int) where {T}
+    nd = ndims(A)
+    Nd = length(axis)
+    size(A, d) == Nd ||
+        throw(DimensionMismatch("axis $d: field length $(size(A, d)) ≠ grid axis length $Nd"))
+    perm = (d, ntuple(i -> i < d ? i : i + 1, nd - 1)...)      # move transform axis to front
+    Ap = permutedims(A, perm)                                  # (Nd, rest…), dense
+    restshape = size(Ap)[2:end]
+    ntrans = prod(restshape; init = 1)
+    cj = reshape(Ap, Nd, ntrans)                               # (Nd, ntrans) contiguous strengths
+    off = T(minimum(axis))
+    rng = L == 0 ? one(T) : L
+    x = T(2π) .* (axis .- off) ./ rng                          # scale points into FINUFFT's period
+    guru = FINUFFT.finufft_makeplan(1, [m], -iflag, ntrans, eps; dtype = T, nthreads = nthreads)
+    FINUFFT.finufft_setpts!(guru, x)
+    fk = Array{Complex{T}}(undef, m, ntrans)
+    FINUFFT.finufft_exec!(guru, cj, fk)
+    FINUFFT.finufft_destroy!(guru)
+    ophase = T(2π) * off / rng                                 # per-mode translation-correction phase
+    m_ints = -(m ÷ 2):((m - 1) ÷ 2)
+    @inbounds for t in 1:ntrans, (mi, mm) in enumerate(m_ints)
+        fk[mi, t] *= cis(-iflag * mm * ophase)
+    end
+    Fr = reshape(fk, m, restshape...)                          # (m, rest…)
+    return permutedims(Fr, invperm(collect(perm)))             # restore dim order; dim d now length m
+end
+
 end # module FlowFieldSpectraFINUFFTExt

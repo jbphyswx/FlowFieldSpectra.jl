@@ -271,12 +271,16 @@ end
 Centered physical wavenumber ranges matching the FFTW/FINUFFT `fftshift`ed mode ordering
 `[-m÷2, (m-1)÷2]`, scaled by `2π / L` along each axis. A zero domain size is treated as length `1`.
 """
-@inline function physical_wavenumbers(domain_size::NTuple{D, FT}, ms::NTuple{D, Int}, ::Type{FT}) where {D, FT}
-    return ntuple(Val(D)) do d
-        L = domain_size[d]
-        scale = FT(2π) / (L == 0 ? one(FT) : L)
-        range(FT(-(ms[d] ÷ 2)), stop = FT((ms[d] - 1) ÷ 2), length = ms[d]) .* scale
-    end
+# `map` over the two tuples with a top-level (non-capturing) function — NOT `ntuple(d -> …)`, whose
+# closure boxes the captured `domain_size`/`ms` when `@inbounds` is disabled under `--check-bounds=yes`.
+@inline physical_wavenumbers(domain_size::NTuple{D, FT}, ms::NTuple{D, Int}, ::Type{FT}) where {D, FT} =
+    map(_wavenumber_axis, domain_size, ms)
+
+# One axis of centered physical wavenumbers, built directly as a `start:step:…` range (no `.*`
+# broadcast) so it stays allocation-free even with `@inbounds` off.
+@inline function _wavenumber_axis(L::FT, m::Int) where {FT}
+    scale = FT(2π) / (L == 0 ? one(FT) : L)
+    return range(FT(-(m ÷ 2)) * scale; step = scale, length = m)
 end
 
 """

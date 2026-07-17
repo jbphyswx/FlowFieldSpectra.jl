@@ -24,6 +24,15 @@ export sph_mode_index
     return CartesianIndex(row, col)
 end
 
+# Phase argument Σ_d ks[d][K[d]] · x_d, Val-unrolled over the type-parameter dim count so each tuple
+# index is a compile-time constant. This stays type-stable and allocation-free even when `@inbounds`
+# is disabled (as under `--check-bounds=yes`, how `Pkg.test` runs) — a plain `for d in 1:D` loop
+# indexing the heterogeneous `ks`/`axes`/`coords` tuples at a runtime `d` can otherwise box.
+@inline _phase_tensor(ks::Tuple, axes::Tuple, K::CartesianIndex{D}, P::CartesianIndex{D}, ::Type{FT}) where {D, FT} =
+    sum(ntuple(d -> FT(ks[d][K[d]]) * FT(axes[d][P[d]]), Val(D)))
+@inline _phase_scattered(ks::Tuple, coords::Tuple, K::CartesianIndex{D}, j::Int, ::Type{FT}) where {D, FT} =
+    sum(ntuple(d -> FT(ks[d][K[d]]) * FT(coords[d][j]), Val(D)))
+
 # =============================================================================
 # Cartesian forward (analysis):  C[k, b] = (1/Npts) Σ_p f[p, b] · exp(-iflag · i · k·x_p)
 # =============================================================================
@@ -43,23 +52,21 @@ function _calculate_spectrum_cartesian_direct!(
     M = prod(ms)
     B = length(coeffs) ÷ M
     ks = physical_wavenumbers(g.domain_size, ms, FT)
-    F = reshape(field, Npts, B)
-    C = reshape(coeffs, M, B)
-    fill!(C, zero(Complex{FT}))
+    fill!(coeffs, zero(Complex{FT}))
     spat = CartesianIndices(ss)
+    # Linear indexing (no `reshape`): the (spatial, batch) split is column-major, so mode `mi` of batch
+    # `b` is `coeffs[mi + (b-1)·M]` and point `pj` of batch `b` is `field[pj + (b-1)·Npts]`. Avoids the
+    # non-escaping reshape-header alloc that appears when `@inbounds` is off (`--check-bounds=yes`).
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
         for (pj, P) in enumerate(spat)
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks[d][I[d]] * FT(axes[d][P[d]])
-            end
+            phi = _phase_tensor(ks, axes, I, P, FT)
             W = cis(-iflag * phi)
             for b in 1:B
-                C[mi, b] += F[pj, b] * W
+                coeffs[mi + (b - 1) * M] += field[pj + (b - 1) * Npts] * W
             end
         end
     end
-    C ./= Npts
+    coeffs ./= Npts
     return ks
 end
 
@@ -76,22 +83,17 @@ function _calculate_spectrum_cartesian_direct!(
     M = prod(ms)
     B = length(coeffs) ÷ M
     ks = physical_wavenumbers(g.domain_size, ms, FT)
-    F = reshape(field, N, B)
-    C = reshape(coeffs, M, B)
-    fill!(C, zero(Complex{FT}))
+    fill!(coeffs, zero(Complex{FT}))
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
         for j in 1:N
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks[d][I[d]] * FT(coords[d][j])
-            end
+            phi = _phase_scattered(ks, coords, I, j, FT)
             W = cis(-iflag * phi)
             for b in 1:B
-                C[mi, b] += F[j, b] * W
+                coeffs[mi + (b - 1) * M] += field[j + (b - 1) * N] * W
             end
         end
     end
-    C ./= N
+    coeffs ./= N
     return ks
 end
 
@@ -112,19 +114,14 @@ function _synthesize_cartesian_direct!(
     M = prod(ms)
     B = length(out) ÷ Npts
     ks = physical_wavenumbers(g.domain_size, ms, FT)
-    O = reshape(out, Npts, B)
-    C = reshape(coeffs, M, B)
-    fill!(O, zero(Complex{FT}))
+    fill!(out, zero(Complex{FT}))
     spat = CartesianIndices(ss)
     @inbounds for (pj, P) in enumerate(spat)
         for (mi, I) in enumerate(CartesianIndices(ms))
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks[d][I[d]] * FT(axes[d][P[d]])
-            end
+            phi = _phase_tensor(ks, axes, I, P, FT)
             W = cis(iflag * phi)
             for b in 1:B
-                O[pj, b] += C[mi, b] * W
+                out[pj + (b - 1) * Npts] += coeffs[mi + (b - 1) * M] * W
             end
         end
     end
@@ -143,18 +140,13 @@ function _synthesize_cartesian_direct!(
     M = prod(ms)
     B = length(out) ÷ N
     ks = physical_wavenumbers(g.domain_size, ms, FT)
-    O = reshape(out, N, B)
-    C = reshape(coeffs, M, B)
-    fill!(O, zero(Complex{FT}))
+    fill!(out, zero(Complex{FT}))
     @inbounds for j in 1:N
         for (mi, I) in enumerate(CartesianIndices(ms))
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks[d][I[d]] * FT(coords[d][j])
-            end
+            phi = _phase_scattered(ks, coords, I, j, FT)
             W = cis(iflag * phi)
             for b in 1:B
-                O[j, b] += C[mi, b] * W
+                out[j + (b - 1) * N] += coeffs[mi + (b - 1) * M] * W
             end
         end
     end

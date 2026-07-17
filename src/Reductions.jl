@@ -314,17 +314,21 @@ end
 function _accumulate_degree!(E::AbstractArray{T}, coeffs::AbstractArray{Complex{T}, N}, lmax::Int) where {T, N}
     Nθ = size(coeffs, 1)
     Nφ = size(coeffs, 2)
-    B = length(coeffs) ÷ (Nθ * Nφ)
-    C = reshape(coeffs, Nθ, Nφ, B)
-    EL = reshape(E, lmax + 1, B)
+    NθNφ = Nθ * Nφ
+    B = length(coeffs) ÷ NθNφ
+    Lp1 = lmax + 1
+    # Linear indexing (no `reshape`): degree ℓ / order m / batch b lives at
+    # `coeffs[row + (col-1)·Nθ + (b-1)·Nθ·Nφ]`. Avoids the reshape-header alloc under --check-bounds=yes.
     @inbounds for b in 1:B
+        cbase = (b - 1) * NθNφ
+        ebase = (b - 1) * Lp1
         for l in 0:lmax
             acc = zero(T)
             for m in -l:l
                 idx = sph_mode_index(l, m)
-                acc += abs2(C[idx, b])
+                acc += abs2(coeffs[idx[1] + (idx[2] - 1) * Nθ + cbase])
             end
-            EL[l+1, b] += T(0.5) * acc
+            E[l + 1 + ebase] += T(0.5) * acc
         end
     end
     return E

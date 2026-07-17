@@ -85,31 +85,25 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW                          # activates the FFTBackend extension
 using CairoMakie: CairoMakie as Mke       # activates the plotting extension
 
-# 1. Define a 2D Cartesian Domain
+# 1. A uniform Cartesian grid — defined by its axes (no per-point coordinate arrays).
 L = 10.0
 N = 64
-dx = L / N
-xs = range(0.0, stop=L-dx, length=N)
-ys = range(0.0, stop=L-dx, length=N)
+grid = FFS.UniformCartesianGrid(; domain = (L, L), n = (N, N))
+xs, ys = grid.axes
 
-# Generate coordinate lists matching a grid
-xv = vec([x for x in xs, y in ys])
-yv = vec([y for x in xs, y in ys])
+# 2. Fields are plain N-D tensors on the grid — here two velocity components (u, v).
+u = [cos(2π * 2 * x / L) + 0.5 * sin(2π * 5 * y / L) for x in xs, y in ys]   # (N, N)
+v = [sin(2π * 2 * x / L) for x in xs, y in ys]
 
-# 2. Synthesize a 2D flow field (u, v) with specific wave components
-u = @. cos(2π * 2 * xv / L) + 0.5 * sin(2π * 5 * yv / L)
-v = @. sin(2π * 2 * xv / L)
-
-# 3. Build an explicit grid and compute spectral coefficients via FFTW.
-#    The coordinate system is the grid type — there is no coordinate guessing.
-grid = FFS.UniformCartesianGrid((xv, yv); domain_size=(L, L))
+# 3. Spectral coefficients via FFTW. Passing (u, v) stacks them on a trailing component axis,
+#    so `coeffs` is (N, N, 2). The coordinate system is the grid type — no coordinate guessing.
 coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
 
-# 4. Reduce 2D Coefficients to a 1D Isotropic (Radial) Spectrum
-k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins=32)
+# 4. 1D isotropic energy spectrum, folding the 2 components (dim 3) into the kinetic energy.
+k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 32, dims = 3)
 
-# 5. Visualize the Energy Spectrum
-fig = FFS.plot_spectrum(ks, coeffs; title="Radial Energy Spectrum")
+# 5. Visualize.
+fig = FFS.plot_spectrum(ks, coeffs; title = "2D Spectral Energy")
 Mke.save("energy_spectrum.png", fig)
 ```
 
@@ -193,12 +187,12 @@ capability has a runnable, rendered [example in the docs](https://jbphyswx.githu
 See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/) for the full surface.
 
 ### Spectral calculation
-- `calculate_spectrum(grid, fields, ms; transform=DirectSumBackend(), execution=AutoBackend(), kwargs...)`: complex coefficients + physical wavenumber grids. The two backend axes are orthogonal and compose (`transform` = which spectral math; `execution` = serial/threaded/GPU/distributed/MPI).
-- `calculate_spectrum!(coeffs, plan, fields)` / `plan_spectrum(grid, T, ms; transform, execution, n_transf)`: reusable plans with batched trailing axes for allocation-free repeated transforms.
+- `calculate_spectrum(grid, field, ms; transform=DirectSumBackend(), execution=AutoBackend(), kwargs...)`: complex coefficients + physical wavenumber grids. `field` is an N-D `AbstractArray` shaped `(spatial…, batch…)` — the grid fixes the leading spatial dims, every trailing dim is a preserved batch axis (components/levels/time/ensemble); a `Tuple` of equal-shaped arrays stacks them on a new trailing axis. The two backend axes are orthogonal and compose (`transform` = which spectral math; `execution` = serial/threaded/GPU/distributed/MPI).
+- `calculate_spectrum!(coeffs, plan, field)` / `plan_spectrum(grid, T, ms; transform, execution, batch=())`: reusable plans over a trailing batch shape for allocation-free, copy-free (real FFT) repeated transforms.
 - `synthesize(grid, coeffs, ms)`: inverse transform (spectral filtering, round-trip).
 
 ### Reductions
-- `isotropic_spectrum(ks, coeffs; num_bins)`: radial integration to a 1D energy-density spectrum.
+- `isotropic_spectrum(ks, coeffs; num_bins, dims=())`: radial integration to `E(k, batch…)` (batch preserved); `dims` folds designated batch axes (e.g. vector components) into the energy.
 - `transect_spectrum(ks, coeffs, dims)`: integrate out specific dimensions (e.g. a zonal spectrum).
 - `anisotropic_spectrum(ks, coeffs; num_k_bins, num_θ_bins)`: anisotropy-resolved `E(k, θ)`.
 - `spherical_energy_spectrum(coeffs; lmax)`: energy per spherical degree `ℓ`.

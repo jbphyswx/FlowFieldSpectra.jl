@@ -168,6 +168,58 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(c_sol[FFS.sph_mode_index(2, 0)], 1.0, atol = 0.05)
     end
 
+    Test.@testset "DirectSum spherical convention == FastSphericalHarmonics" begin
+        # DirectSum spherical uses the real-SH (FSH) convention; its synthesis must equal
+        # FastSphericalHarmonics.sph_evaluate on the same grid (verifies the s(m)=(-1)^|m|√2 map).
+        lmax = 6
+        Nθ = lmax + 1
+        Nφ = 2 * lmax + 1
+        pts = FastSphericalHarmonics.sph_points(Nθ)
+        g = FFS.StructuredSphericalGrid(pts[1], pts[2])
+        modes = ((0, 0, 0.8), (1, 1, -0.5), (2, -2, 0.6), (4, -3, 0.3), (6, 4, -0.2))
+        Cr = zeros(Nθ, Nφ)
+        Cc = zeros(ComplexF64, Nθ, Nφ)
+        for (l, m, v) in modes
+            Cr[FastSphericalHarmonics.sph_mode(l, m)] = v
+            Cc[FFS.sph_mode_index(l, m)] = v
+        end
+        f_ffs = real(FFS.synthesize(g, Cc, (Nθ, Nφ)))
+        f_fsh = FastSphericalHarmonics.sph_evaluate(Cr)
+        Test.@test isapprox(f_ffs, f_fsh; atol = 1e-11)
+    end
+
+    Test.@testset "Gauss-Legendre exact SHT + fast GPU SHT (KA.CPU)" begin
+        # On a Gauss-Legendre grid the direct/GPU spherical transform is EXACT (quadrature exact to
+        # degree 2lmax+1). The fast device-generic GPU SHT (φ-FFT + Legendre) matches it to round-off.
+        lmax = 8
+        Nθ = lmax + 1
+        Nφ = 2 * lmax + 1
+        g = FFS.gauss_legendre_sphere(lmax)
+        modes = ((0, 0, 0.8), (1, 0, 1.0), (2, 1, 0.6), (3, -2, 0.5), (4, 0, 0.3), (5, 3, -0.4), (6, -1, 0.7), (8, 4, 0.2))
+        C = zeros(ComplexF64, Nθ, Nφ)
+        for (l, m, v) in modes
+            C[FFS.sph_mode_index(l, m)] = v
+        end
+        f = real(FFS.synthesize(g, C, (Nθ, Nφ)))
+
+        c_dir, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.DirectSumBackend())
+        for (l, m, v) in modes
+            Test.@test isapprox(real(c_dir[FFS.sph_mode_index(l, m)]), v; atol = 1e-10)
+        end
+        Test.@test maximum(abs, imag(c_dir)) < 1e-10
+
+        c_gsht, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.SHTBackend(), execution = FFS.GPUBackend(KA.CPU()))
+        c_gds, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.DirectSumBackend(), execution = FFS.GPUBackend(KA.CPU()))
+        Test.@test isapprox(c_gsht, c_dir; atol = 1e-10)
+        Test.@test isapprox(c_gds, c_dir; atol = 1e-10)
+
+        fb = cat(f, 2 .* f; dims = 3)                          # (Nθ, Nφ, 2) batch
+        cb, _ = FFS.calculate_spectrum(g, fb, (Nθ, Nφ); transform = FFS.SHTBackend(), execution = FFS.GPUBackend(KA.CPU()))
+        Test.@test size(cb) == (Nθ, Nφ, 2)
+        Test.@test isapprox(cb[:, :, 1], c_dir; atol = 1e-10)
+        Test.@test isapprox(cb[:, :, 2], 2 .* c_dir; atol = 1e-10)
+    end
+
     Test.@testset "Legendre Recurrence" begin
         FT = Float64
         x = FT(0.5)

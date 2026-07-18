@@ -189,6 +189,18 @@ function _sph_point_data(g::ScatteredSphericalGrid{FT}) where {FT}
     return θpt, φpt, wpt
 end
 
+# Real spherical harmonic value in the FastSphericalHarmonics convention (verified to match
+# `FSH.sph_evaluate` to round-off): Y_lm = s(m)·P̄_l^|m|·trig, with s(0)=1, s(m≠0)=(-1)^|m|√2, and
+# trig = cos(mφ) for m≥0, sin(|m|φ) for m<0. `Plm` holds the normalized associated Legendre
+# P̄_l^|m|(cosθ). Coefficients are real (stored in the complex array with zero imaginary part).
+@inline function _real_sph(Plm::AbstractMatrix{FT}, l::Int, m::Int, φ::FT) where {FT}
+    abs_m = abs(m)
+    P = Plm[l+1, abs_m+1]
+    m == 0 && return P
+    s = isodd(abs_m) ? -sqrt(FT(2)) : sqrt(FT(2))
+    return s * P * (m > 0 ? cos(m * φ) : sin(abs_m * φ))
+end
+
 function _calculate_spectrum_spherical_direct!(
     coeffs::AbstractArray{Complex{FT}},
     g::AbstractSphericalGrid{FT},
@@ -213,11 +225,9 @@ function _calculate_spectrum_spherical_direct!(
         SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
         for l in 0:lmax
             for m in -l:l
-                abs_m = abs(m)
-                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                Ylm = factor * Plm[l+1, abs_m+1] * cis(m * φp)
+                Ylm = _real_sph(Plm, l, m, φp)          # real SH (FSH convention)
                 idx = sph_mode_index(l, m)
-                gw = conj(Ylm) * wp
+                gw = Ylm * wp
                 for b in 1:B
                     C[idx, b] += F[p, b] * gw
                 end
@@ -250,9 +260,7 @@ function _synthesize_spherical_direct!(
         SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
         for l in 0:lmax
             for m in -l:l
-                abs_m = abs(m)
-                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                Ylm = factor * Plm[l+1, abs_m+1] * cis(m * φp)
+                Ylm = _real_sph(Plm, l, m, φp)          # real SH (FSH convention)
                 idx = sph_mode_index(l, m)
                 for b in 1:B
                     O[p, b] += C[idx, b] * Ylm

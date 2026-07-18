@@ -17,7 +17,7 @@ include("LombScargle.jl")
 
 using .Types: Types, AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTBackend, NUFSHTBackend,
     AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, DistributedBackend, MPIBackend, AutoBackend
-using .Grids: Grids, AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, spatial_dims, ndims_spatial, spatial_size, npoints
+using .Grids: Grids, AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, gauss_legendre_sphere, AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, spatial_dims, ndims_spatial, spatial_size, npoints
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 using .Problem: Problem, TransformProblem, batch_shape, stack_fields
@@ -33,7 +33,7 @@ export AbstractSpectralBackend, DirectSumBackend, FFTBackend, NUFFTBackend, SHTB
 # Execution backends (where/how it runs)
 export AbstractExecutionBackend, SerialBackend, ThreadedBackend, GPUBackend, DistributedBackend, MPIBackend, AutoBackend
 # Grids
-export AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid
+export AbstractGrid, AbstractCartesianGrid, AbstractSphericalGrid, UniformCartesianGrid, NonuniformCartesianGrid, ScatteredCartesianGrid, StructuredSphericalGrid, ScatteredSphericalGrid, gauss_legendre_sphere
 export AbstractQuadrature, ClenshawCurtis, GaussLegendre, Equiangular, spatial_dims, ndims_spatial, spatial_size, npoints
 # Preprocessing & Normalization (typed configuration)
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
@@ -154,6 +154,11 @@ calculate_spectrum(::NUFFTBackend, exec::GPUBackend, g::Union{ScatteredCartesian
 # ---- Level 2: SHT / NUFSHT (execution axis handled inside the extension) ----
 calculate_spectrum(::SHTBackend, ::Union{SerialBackend, ThreadedBackend}, g::StructuredSphericalGrid, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_sht(g, field, ms; kwargs...)
+# GPU SHT: a fast device-generic transform (φ-DFT + θ-Legendre contraction) in the KernelAbstractions
+# ext — no FastTransforms, runs on any KA device. Structured grid only (the φ-uniform structure is what
+# makes the φ-DFT valid).
+calculate_spectrum(::SHTBackend, exec::GPUBackend, g::StructuredSphericalGrid, field::AbstractArray, ms::Tuple; kwargs...) =
+    _calculate_spectrum_gpu_sht(exec, g, field, ms; kwargs...)
 calculate_spectrum(::NUFSHTBackend, exec::AbstractExecutionBackend, g::AbstractSphericalGrid, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_nufsht(exec, g, field, ms; kwargs...)
 
@@ -161,11 +166,12 @@ calculate_spectrum(::NUFSHTBackend, exec::AbstractExecutionBackend, g::AbstractS
 function calculate_spectrum(t::AbstractSpectralBackend, e::AbstractExecutionBackend,
         g::AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
     throw(ArgumentError(
-        "Unsupported combination transform=$(nameof(typeof(t))), execution=$(nameof(typeof(e))), " *
-        "grid=$(nameof(typeof(g))). FFT needs a UniformCartesianGrid; NUFFT needs a ScatteredCartesianGrid " *
-        "(a nonuniform-but-gridded NonuniformCartesianGrid uses DirectSumBackend); SHT needs a " *
-        "StructuredSphericalGrid; NUFSHT needs a spherical grid; fast GPU FFT/NUFFT need a CUDA device. " *
-        "DirectSumBackend works on any grid (and on a GPUBackend).",
+        "$(nameof(typeof(t))) cannot act on a $(nameof(typeof(g))) with $(nameof(typeof(e))) — wrong " *
+        "transform for that grid's geometry. Each grid has its transform: UniformCartesianGrid → FFT; " *
+        "Scattered/NonuniformCartesianGrid → NUFFT (CPU; GPU NUFFT is cuFINUFFT/CUDA and scattered-only); " *
+        "StructuredSphericalGrid → SHT (CPU via FastSphericalHarmonics; GPU via the device-generic " *
+        "transform on a gauss_legendre_sphere grid); ScatteredSphericalGrid → NUFSHT (CPU). " *
+        "DirectSumBackend works on any grid and any execution backend, including GPUBackend.",
     ))
 end
 
@@ -294,6 +300,8 @@ _synthesize_spherical!(::ThreadedBackend, args...) = throw(ArgumentError("Thread
 # GPU direct-sum (KernelAbstractions ext; portable on any KA device, incl. KA.CPU()).
 _gpu_directsum_cartesian(args...; kwargs...) = throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions`."))
 _gpu_directsum_spherical(args...; kwargs...) = throw(ArgumentError("GPUBackend is not loaded. Run `using KernelAbstractions`."))
+# Fast device-generic structured SHT (φ-DFT + θ-Legendre contraction), KernelAbstractions ext.
+_calculate_spectrum_gpu_sht(args...; kwargs...) = throw(ArgumentError("GPU SHT requires `using KernelAbstractions`."))
 
 # GPU FFT is device-generic via AbstractFFTs; GPU NUFFT is CUDA-only (cuFINUFFT).
 _calculate_spectrum_gpu_fft(args...; kwargs...) = throw(ArgumentError("GPU FFT requires `using KernelAbstractions` plus an AbstractFFTs provider (`FFTW` for `KA.CPU()`, `CUDA` for `CUDABackend`, …)."))

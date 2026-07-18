@@ -154,7 +154,8 @@ function FFS._gpu_directsum_spherical(exec::FFS.GPUBackend, g::FFS.AbstractSpher
     kernel! = _spherical_kernel!(backend)
     kernel!(coeffs_dev, θd, φd, fieldd, wd, lmax, N, B; ndrange = Nθc * Nφc)
     KA.synchronize(backend)
-    batch = ntuple(i -> size(field, 1 + i), ndims(field) - 1)
+    nsp = FFS.ndims_spatial(g)                                  # structured: 2 (Nθ,Nφ); scattered: 1 (N)
+    batch = ntuple(i -> size(field, nsp + i), ndims(field) - nsp)
     return reshape(_to_host(coeffs_dev), Nθc, Nφc, batch...), (0:lmax, -lmax:lmax)
 end
 
@@ -172,13 +173,13 @@ KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(fi
         if l <= lmax
             FT = eltype(θ)
             CT = eltype(coeffs)
-            factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
+            sfac = m == 0 ? one(FT) : (isodd(abs_m) ? -sqrt(FT(2)) : sqrt(FT(2)))
             @inbounds for p in 1:N
                 xj = cos(θ[p])
                 sj = sin(θ[p])
-                P_l_m = _ka_normalized_legendre(l, abs_m, xj, sj)
-                Ylm = factor * P_l_m * cis(m * φ[p])
-                gw = conj(Ylm) * w[p]
+                P = _ka_normalized_legendre(l, abs_m, xj, sj)
+                Ylm = sfac * P * (m >= 0 ? cos(m * φ[p]) : sin(abs_m * φ[p]))   # real SH (FSH convention)
+                gw = Ylm * w[p]
                 for b in 1:B
                     coeffs[row, col, b] += CT(field[p, b] * gw)
                 end

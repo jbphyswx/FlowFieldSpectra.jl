@@ -8,6 +8,7 @@ export AbstractGrid,
     ScatteredCartesianGrid,
     StructuredSphericalGrid,
     ScatteredSphericalGrid,
+    gauss_legendre_sphere,
     AbstractQuadrature,
     ClenshawCurtis,
     GaussLegendre,
@@ -259,6 +260,52 @@ function ScatteredSphericalGrid(θ, φ; weights = nothing)
     FT = _float_eltype(θ)
     cc = (θ, φ)
     return ScatteredSphericalGrid{FT, typeof(cc), typeof(weights)}(cc, weights)
+end
+
+# Gauss-Legendre nodes (roots of Pₙ) and weights for ∫₋₁¹, via Newton iteration (the sinθ of the
+# spherical θ-integral is absorbed by the x = cosθ change of variables, so these are the exact
+# per-colatitude weights). Returns nodes ascending in θ.
+function _gauss_legendre_nw(::Type{FT}, n::Int) where {FT}
+    x = Vector{FT}(undef, n)
+    w = Vector{FT}(undef, n)
+    for i in 1:n
+        z = cos(FT(π) * (i - one(FT) / 4) / (n + one(FT) / 2))
+        dp = zero(FT)
+        for _ in 1:100
+            p1 = one(FT); p2 = zero(FT)
+            for k in 1:n
+                p3 = p2; p2 = p1; p1 = ((2k - 1) * z * p2 - (k - 1) * p3) / k
+            end
+            dp = n * (z * p1 - p2) / (z * z - 1)
+            z1 = z; z = z1 - p1 / dp
+            abs(z - z1) <= eps(FT) && break
+        end
+        p1 = one(FT); p2 = zero(FT)
+        for k in 1:n
+            p3 = p2; p2 = p1; p1 = ((2k - 1) * z * p2 - (k - 1) * p3) / k
+        end
+        dp = n * (z * p1 - p2) / (z * z - 1)
+        x[i] = z; w[i] = 2 / ((1 - z * z) * dp * dp)
+    end
+    return x, w
+end
+
+"""
+    gauss_legendre_sphere(lmax; FT=Float64) -> StructuredSphericalGrid
+
+Structured spherical grid with **Gauss–Legendre** colatitude nodes (`Nθ = lmax+1`) and uniform
+longitude (`Nφ = 2·lmax+1`), carrying the exact Gauss quadrature weights. On this grid the direct and
+GPU spherical-harmonic transforms are **exact** (the quadrature is exact to degree `2·lmax+1`),
+matching `FastSphericalHarmonics`. Use this grid for `SHTBackend × GPUBackend` and for an exact
+`DirectSumBackend` spherical transform.
+"""
+function gauss_legendre_sphere(lmax::Int; FT::Type = Float64)
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+    x, w = _gauss_legendre_nw(FT, Nθ)
+    θ = acos.(clamp.(x, -one(FT), one(FT)))
+    φ = FT[2π * (j - 1) / Nφ for j in 1:Nφ]
+    return StructuredSphericalGrid(θ, φ; weights = w, quad = GaussLegendre())
 end
 
 # -----------------------------------------------------------------------------

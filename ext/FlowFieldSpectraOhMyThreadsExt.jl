@@ -101,11 +101,9 @@ function FFS._directsum_spherical!(::FFS.ThreadedBackend, coeffs::AbstractArray{
             FFS.SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
             for l in 0:lmax
                 for m in -l:l
-                    abs_m = abs(m)
-                    factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                    Ylm = factor * Plm[l+1, abs_m+1] * cis(m * φp)
+                    Ylm = FFS.DirectSum._real_sph(Plm, l, m, φp)   # real SH (FSH convention)
                     idx = FFS.sph_mode_index(l, m)
-                    gw = conj(Ylm) * wp
+                    gw = Ylm * wp
                     for b in 1:B
                         acc[idx, b] += F[p, b] * gw
                     end
@@ -202,9 +200,7 @@ function FFS._synthesize_spherical!(::FFS.ThreadedBackend, out::AbstractArray{Co
             FFS.SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
             for l in 0:lmax
                 for m in -l:l
-                    abs_m = abs(m)
-                    factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                    Ylm = factor * Plm[l+1, abs_m+1] * cis(m * φp)
+                    Ylm = FFS.DirectSum._real_sph(Plm, l, m, φp)   # real SH (FSH convention)
                     idx = FFS.sph_mode_index(l, m)
                     for b in 1:B
                         O[p, b] += C[idx, b] * Ylm

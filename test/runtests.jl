@@ -220,6 +220,41 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(cb[:, :, 2], 2 .* c_dir; atol = 1e-10)
     end
 
+    Test.@testset "GPU NUFSHT parity (KA.CPU)" begin
+        # NUFSHTBackend × GPUBackend places nodes/field on the execution backend and runs NUFSHT's
+        # device-generic transform (cuFINUFFT on CUDA; FFTW/FINUFFT on KA.CPU) — so it matches the CPU
+        # NUFSHT here, and is the fast GPU scattered-spherical path (no DirectSum).
+        lmax = 5
+        Nθ = lmax + 1
+        Nφ = 2 * lmax + 1
+        N_pts = 4 * Nθ^2
+        ga = π * (3 - sqrt(5))
+        zf = [1 - 2 * (i + 0.5) / N_pts for i in 0:(N_pts-1)]
+        θ = acos.(clamp.(zf, -1.0, 1.0))
+        φ = mod.(ga .* (0:(N_pts-1)), 2π)
+        Ct = zeros(Nθ, Nφ)
+        Ct[FastSphericalHarmonics.sph_mode(2, 0)] = 1.0
+        plan = NUFSHT.make_plan(θ, φ, lmax)
+        f = zeros(N_pts)
+        NUFSHT.nusht_type2!(f, Ct, plan)
+        g = FFS.ScatteredSphericalGrid(θ, φ)
+
+        cs, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.NUFSHTBackend(), execution = FFS.SerialBackend())
+        cg, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.NUFSHTBackend(), execution = FFS.GPUBackend(KA.CPU()))
+        Test.@test size(cg) == (Nθ, Nφ)
+        Test.@test isapprox(cs, cg; atol = 1e-10)
+
+        cs2, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.NUFSHTBackend(), execution = FFS.SerialBackend(), solve = true, rtol = 1e-10, maxiter = 2000)
+        cg2, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = FFS.NUFSHTBackend(), execution = FFS.GPUBackend(KA.CPU()), solve = true, rtol = 1e-10, maxiter = 2000)
+        Test.@test isapprox(cs2, cg2; atol = 1e-8)
+        Test.@test isapprox(cg2[FFS.sph_mode_index(2, 0)], 1.0; atol = 0.05)
+
+        fb = hcat(f, 2 .* f)                                   # (N, 2) batch
+        cgb, _ = FFS.calculate_spectrum(g, fb, (Nθ, Nφ); transform = FFS.NUFSHTBackend(), execution = FFS.GPUBackend(KA.CPU()))
+        Test.@test size(cgb) == (Nθ, Nφ, 2)
+        Test.@test isapprox(cgb[:, :, 1], cg; atol = 1e-10)
+    end
+
     Test.@testset "Legendre Recurrence" begin
         FT = Float64
         x = FT(0.5)

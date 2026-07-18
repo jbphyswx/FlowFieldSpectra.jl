@@ -170,8 +170,9 @@ function calculate_spectrum(t::AbstractSpectralBackend, e::AbstractExecutionBack
         "transform for that grid's geometry. Each grid has its transform: UniformCartesianGrid → FFT; " *
         "Scattered/NonuniformCartesianGrid → NUFFT (CPU; GPU NUFFT is cuFINUFFT/CUDA and scattered-only); " *
         "StructuredSphericalGrid → SHT (CPU via FastSphericalHarmonics; GPU via the device-generic " *
-        "transform on a gauss_legendre_sphere grid); ScatteredSphericalGrid → NUFSHT (CPU). " *
-        "DirectSumBackend works on any grid and any execution backend, including GPUBackend.",
+        "transform on a gauss_legendre_sphere grid); ScatteredSphericalGrid → NUFSHT (CPU, or GPU with " *
+        "`using KernelAbstractions`). DirectSumBackend runs on any grid/backend but is an O(N·L²) " *
+        "correctness reference — slow, not a fast path.",
     ))
 end
 

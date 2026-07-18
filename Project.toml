@@ -36,6 +36,7 @@ FlowFieldSpectraFastSphericalHarmonicsExt = "FastSphericalHarmonics"
 FlowFieldSpectraKernelAbstractionsExt = "KernelAbstractions"
 FlowFieldSpectraMPIExt = "MPI"
 FlowFieldSpectraNUFSHTExt = "NUFSHT"
+FlowFieldSpectraNUFSHTKernelAbstractionsExt = ["NUFSHT", "KernelAbstractions"]
 FlowFieldSpectraOhMyThreadsExt = "OhMyThreads"
 
 [extras]

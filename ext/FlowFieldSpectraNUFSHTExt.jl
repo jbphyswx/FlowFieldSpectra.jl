@@ -43,15 +43,12 @@ function FFS._calculate_spectrum_nufsht(exec::Union{FFS.SerialBackend, FFS.Threa
     return reshape(coeffs, Nθ, Nφ, batch...), (0:lmax, -lmax:lmax)
 end
 
-# NUFSHT.jl has a device (cuFINUFFT) path selected by a CuArray node set; wiring GPUBackend to it is a
-# CUDA-only follow-up. Until then, a clear error (never a silent CPU fallback).
+# GPU NUFSHT (device-resident NUFSHT plan via cuFINUFFT) is provided by the NUFSHT × KernelAbstractions
+# extension, which allocates the node/field arrays on the execution backend so NUFSHT.make_plan builds a
+# device plan. This less-specific stub fires only when KernelAbstractions is not loaded.
 function FFS._calculate_spectrum_nufsht(::FFS.GPUBackend, g::FFS.AbstractSphericalGrid,
         field::AbstractArray, ms::Tuple; kwargs...)
-    throw(ArgumentError(
-        "GPU NUFSHT is not wired in FlowFieldSpectra yet. Use a CPU execution backend for " *
-        "NUFSHTBackend, or transform=DirectSumBackend() with a GPUBackend for an on-device spherical " *
-        "direct sum.",
-    ))
+    throw(ArgumentError("GPU NUFSHT requires `using KernelAbstractions` (to place the transform on the execution backend)."))
 end
 
 end # module FlowFieldSpectraNUFSHTExt

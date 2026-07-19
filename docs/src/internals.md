@@ -19,18 +19,21 @@ FlowFieldSpectra.Types.resolve_backend
 ```@docs
 FlowFieldSpectra.Grids.physical_wavenumbers
 FlowFieldSpectra.Grids.spatial_dims
+FlowFieldSpectra.Grids.ndims_spatial
+FlowFieldSpectra.Grids.spatial_size
 FlowFieldSpectra.Grids.npoints
 ```
 
 ## Transform problem & layout
 
 ```@docs
-FlowFieldSpectra.Problem.n_spectral
+FlowFieldSpectra.Problem.spatial_shape
+FlowFieldSpectra.Problem.batch_shape
 FlowFieldSpectra.Problem.n_batch
-FlowFieldSpectra.Problem.batch_size
-FlowFieldSpectra.Problem.output_size
+FlowFieldSpectra.Problem.batch_length
+FlowFieldSpectra.Problem.coeff_output_size
 FlowFieldSpectra.Problem.coeff_eltype
-FlowFieldSpectra.Problem.pack_fields
+FlowFieldSpectra.Problem.stack_fields
 ```
 
 ## Preprocessing helpers

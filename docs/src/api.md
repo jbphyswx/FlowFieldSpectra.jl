@@ -24,6 +24,7 @@ NonuniformCartesianGrid
 ScatteredCartesianGrid
 StructuredSphericalGrid
 ScatteredSphericalGrid
+gauss_legendre_sphere
 AbstractQuadrature
 ClenshawCurtis
 GaussLegendre

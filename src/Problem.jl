@@ -1,61 +1,68 @@
 module Problem
 
-using ..Grids: AbstractGrid
+using ..Grids: Grids, AbstractGrid, ndims_spatial, spatial_size
 
-export TransformProblem, n_spectral, n_batch, batch_size, output_size,
-    pack_fields, coeff_eltype
+export TransformProblem, spatial_shape, batch_shape, n_batch, batch_length,
+    coeff_output_size, coeff_eltype, stack_fields
+
+# =============================================================================
+# The shape contract, taken from the grid — never guessed.
+#
+# A field on `grid` is an AbstractArray shaped `(spatial…, batch…)`: the first `ndims_spatial(grid)`
+# dims are spatial (and must equal `spatial_size(grid)`), and EVERY trailing dim is a batch dim
+# (components / vertical levels / time / ensemble — any number), carried through the transform and
+# (by default) through the reductions. The coefficient array is `(spectral…, batch…)`.
+# =============================================================================
 
 """
-    TransformProblem{D, B}
+    TransformProblem{NS, B}
 
-Describes the shape of a spectral transform: which input axes are *spectral* (transformed,
-matching the grid's `D` dimensions) and which trailing axes are *batch* axes (carried through
-untouched — components, vertical levels, time, ensemble members). `B` is the number of batch
-axes.
-
-# Fields
-- `ms::NTuple{D,Int}`: number of spectral modes along each spectral axis.
-- `batch::NTuple{B,Int}`: size of each trailing batch axis.
-
-The data-layout contract is **column-major, spectral dims leading, batch dims trailing**: a
-field array has shape `(N_spatial-or-spectral…, batch…)` and the coefficient array has shape
-`(ms…, batch…)`. The legacy "tuple of `NU` field vectors" form maps to a single batch axis of
-length `NU`.
+Shape of one transform: the leading `NS` spatial array dims (matching the grid) and the trailing `B`
+batch dims. Built from `(grid, field)` via [`TransformProblem`](@ref); drives buffer ranks and the
+coefficient output size.
 """
-struct TransformProblem{D, B}
-    ms::NTuple{D, Int}
-    batch::NTuple{B, Int}
+struct TransformProblem{NS, B}
+    spatial::NTuple{NS, Int}      # == spatial_size(grid)
+    batch::NTuple{B, Int}         # trailing batch sizes (possibly empty)
 end
 
 """
-    TransformProblem(ms::NTuple{D,Int}; batch=())
+    TransformProblem(grid, field::AbstractArray) -> TransformProblem
 
-Construct a problem with spectral resolution `ms` and trailing batch-axis sizes `batch`.
+Validate `field` against `grid` and split its axes: the first `ndims_spatial(grid)` dims must equal
+`spatial_size(grid)`; the remainder are the batch shape.
 """
-function TransformProblem(ms::NTuple{D, Int}; batch::Tuple = ()) where {D}
-    B = length(batch)
-    return TransformProblem{D, B}(ms, NTuple{B, Int}(batch))
+@inline function TransformProblem(grid::AbstractGrid, field::AbstractArray{T, N}) where {T, N}
+    ss = spatial_size(grid)
+    ns = ndims_spatial(grid)
+    N >= ns || throw(DimensionMismatch(
+        "field has $N dims but grid $(nameof(typeof(grid))) needs at least $ns leading spatial dim(s) of size $ss"))
+    @inbounds for d in 1:ns
+        size(field, d) == ss[d] || throw(DimensionMismatch(
+            "field leading dim $d = $(size(field, d)) ≠ grid spatial size $(ss[d]) (spatial_size = $ss)"))
+    end
+    batch = ntuple(d -> size(field, ns + d), N - ns)
+    return TransformProblem(ss, batch)
 end
 
-"""`n_spectral(prob)` — number of spectral (transformed) axes."""
-n_spectral(::TransformProblem{D, B}) where {D, B} = D
+"""`spatial_shape(prob)` — the leading spatial array sizes `(N_1, …)`."""
+spatial_shape(p::TransformProblem) = p.spatial
 
-"""`n_batch(prob)` — number of trailing batch axes."""
-n_batch(::TransformProblem{D, B}) where {D, B} = B
+"""`batch_shape(prob)` — the trailing batch sizes (`()` if none)."""
+batch_shape(p::TransformProblem) = p.batch
 
-"""`batch_size(prob)` — total number of batch slices, `prod(batch)` (1 if no batch axes)."""
-batch_size(p::TransformProblem) = prod(p.batch; init = 1)
+"""`n_batch(prob)` — number of trailing batch dims."""
+n_batch(::TransformProblem{NS, B}) where {NS, B} = B
+
+"""`batch_length(prob)` — total batch slices, `prod(batch)` (1 if no batch axes)."""
+batch_length(p::TransformProblem) = prod(p.batch; init = 1)
 
 """
-    output_size(prob) -> NTuple
+    coeff_output_size(spectral::Tuple, prob) -> NTuple
 
-Shape of the coefficient array: `(ms…, batch…)`.
+Shape of the coefficient array: `(spectral…, batch…)`.
 """
-output_size(p::TransformProblem) = (p.ms..., p.batch...)
-
-# -----------------------------------------------------------------------------
-# Legacy field-tuple adapter
-# -----------------------------------------------------------------------------
+coeff_output_size(spectral::Tuple, p::TransformProblem) = (spectral..., p.batch...)
 
 """
     coeff_eltype(grid) -> Type
@@ -65,29 +72,20 @@ Complex coefficient element type for a grid (`Complex{FT}`).
 coeff_eltype(::AbstractGrid{FT}) where {FT} = Complex{FT}
 
 """
-    pack_fields(fields_vecs::Tuple) -> (data, batch)
+    stack_fields(fields::Tuple) -> AbstractArray
 
-Normalize the legacy "tuple of `NU` equal-length field vectors" into a packed
-`(N, NU)` matrix plus the batch shape `(NU,)`. A single vector packs to `(N, 1)` with batch
-`(1,)`. When `fields_vecs` is already an `AbstractArray`, it is returned as-is with an empty
-batch (the caller supplies the layout).
+Convenience for the multi-field call form: stack equal-shaped field arrays along a **new trailing
+batch axis** (`(spatial…, batch…, NU)`). This materializes a combined array — pass a single
+`(spatial…, batch…)` array to avoid the copy.
 """
-function pack_fields(fields_vecs::Tuple)
-    NU = length(fields_vecs)
-    N = length(fields_vecs[1])
-    @inbounds for u in 2:NU
-        length(fields_vecs[u]) == N ||
-            throw(DimensionMismatch("all field vectors must have equal length (got $(length(fields_vecs[u])) ≠ $N)"))
+function stack_fields(fields::Tuple)
+    length(fields) >= 1 || throw(ArgumentError("need at least one field"))
+    sz = size(fields[1])
+    @inbounds for u in 2:length(fields)
+        size(fields[u]) == sz ||
+            throw(DimensionMismatch("all fields must share shape (field $u is $(size(fields[u])), field 1 is $sz)"))
     end
-    FT = float(eltype(fields_vecs[1]))
-    data = Matrix{FT}(undef, N, NU)
-    @inbounds for u in 1:NU
-        col = fields_vecs[u]
-        for j in 1:N
-            data[j, u] = col[j]
-        end
-    end
-    return data, (NU,)
+    return stack(fields)
 end
 
 end # module Problem

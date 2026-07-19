@@ -8,28 +8,46 @@ export AbstractGrid,
     ScatteredCartesianGrid,
     StructuredSphericalGrid,
     ScatteredSphericalGrid,
+    gauss_legendre_sphere,
     AbstractQuadrature,
     ClenshawCurtis,
     GaussLegendre,
     Equiangular,
     physical_wavenumbers,
     spatial_dims,
+    ndims_spatial,
+    spatial_size,
     npoints
+
+# =============================================================================
+# Grid taxonomy.
+#
+# The fundamental distinction is TOPOLOGY, encoded in the type:
+#   • tensor-product / rectilinear — points are the Cartesian product of `D` 1-D axes; a field is a
+#     `D`-dimensional tensor `(N_1, …, N_D, batch…)`. Uniform spacing (`AbstractRange` axes) is
+#     FFT-eligible; nonuniform spacing (`AbstractVector` axes, e.g. Gaussian latitudes / stretched z)
+#     needs NUFFT/DirectSum. Nonuniform-in-space-but-gridded (lat/lon) lives here.
+#   • scattered — a genuine point cloud of `N` points; a field is `(N, batch…)`. Coordinates are
+#     `D` per-axis point vectors of length `N` (the layout FINUFFT/cuFINUFFT consume directly).
+#
+# `D` = number of SPATIAL (transformed) dims. The batch axes are every trailing array dim beyond the
+# ones the grid consumes; the split is taken from the grid via `ndims_spatial`/`spatial_size`, never
+# guessed (see `Problem.jl`).
+# =============================================================================
 
 """
     AbstractGrid{FT, D}
 
-Abstract supertype for all coordinate grids. `FT` is the coordinate element type and
-`D` is the number of physical (spatial) dimensions. Grids make the coordinate system
-*explicit* so backends dispatch on the grid type rather than guessing from coordinate
-magnitudes.
+Abstract supertype for all coordinate grids. `FT` is the coordinate element type and `D` the number
+of physical (spatial, transformed) dimensions. The grid type *is* the coordinate system, so backends
+dispatch on it rather than guessing from coordinate magnitudes.
 """
 abstract type AbstractGrid{FT, D} end
 
 """
     AbstractCartesianGrid{FT, D} <: AbstractGrid{FT, D}
 
-Cartesian grids in `D` dimensions (uniform, nonuniform tensor-product, or scattered).
+Cartesian grids in `D` dimensions (uniform / nonuniform tensor-product, or scattered).
 """
 abstract type AbstractCartesianGrid{FT, D} <: AbstractGrid{FT, D} end
 
@@ -61,39 +79,48 @@ struct Equiangular <: AbstractQuadrature end
 # -----------------------------------------------------------------------------
 
 """
-    UniformCartesianGrid(coords; domain_size=nothing)
+    UniformCartesianGrid(axes::NTuple{D,AbstractRange}; domain_size=nothing)
+    UniformCartesianGrid(axis::AbstractRange; domain_size=nothing)
+    UniformCartesianGrid(; domain, n)
 
-Scattered/listed coordinates that lie on a *uniform* rectilinear lattice (one value per
-grid point, e.g. produced by `vec` over a `range` mesh). Suitable for the `FFTBackend`.
+Tensor-product Cartesian grid with **uniform** spacing along every axis — the FFT-eligible grid. Each
+`axes[d]` is a 1-D `AbstractRange` of length `N_d` (one value per grid line, *not* `prod(N)` per-point
+coordinates). A field on this grid is a `D`-dimensional tensor `(N_1, …, N_D, batch…)`.
 
-`coords` is a `D`-tuple of equal-length coordinate vectors (`coords[d][j]` is the `d`-th
-coordinate of point `j`). `domain_size` is the physical extent (period) along each axis;
-when `nothing` it is inferred from the coordinate bounding box.
+`domain_size[d]` is the physical period along axis `d`; when omitted it is `step(axes[d]) * N_d`
+(the periodic-domain convention, so `range(0, L, N+1)[1:N]` recovers `L`). The `domain=…, n=…`
+keyword form builds `range(0, L_d, n_d + 1)[1:n_d]` for each axis.
 """
-struct UniformCartesianGrid{FT, D, C<:Tuple} <: AbstractCartesianGrid{FT, D}
-    coords::C
+struct UniformCartesianGrid{FT, D, A<:Tuple} <: AbstractCartesianGrid{FT, D}
+    axes::A                       # D-tuple of AbstractRange, each length N_d
     domain_size::NTuple{D, FT}
 end
 
 """
-    NonuniformCartesianGrid(coords; domain_size=nothing)
+    NonuniformCartesianGrid(axes::NTuple{D,AbstractVector}; domain_size=nothing)
+    NonuniformCartesianGrid(axis::AbstractVector; domain_size=nothing)
 
-Tensor-product Cartesian grid with nonuniform spacing along one or more axes. FFTW is not
-valid here; use `NUFFTBackend` or `DirectSumBackend`.
+Tensor-product Cartesian grid with **nonuniform** spacing along one or more axes (e.g. Gaussian
+latitudes, a stretched vertical grid). Still fully gridded: each `axes[d]` is a 1-D coordinate vector
+of length `N_d`, and a field is a tensor `(N_1, …, N_D, batch…)`. FFTW is not valid; use
+`NUFFTBackend` or `DirectSumBackend`. `domain_size` defaults to the per-axis coordinate span.
 """
-struct NonuniformCartesianGrid{FT, D, C<:Tuple} <: AbstractCartesianGrid{FT, D}
-    coords::C
+struct NonuniformCartesianGrid{FT, D, A<:Tuple} <: AbstractCartesianGrid{FT, D}
+    axes::A                       # D-tuple of AbstractVector, each length N_d
     domain_size::NTuple{D, FT}
 end
 
 """
-    ScatteredCartesianGrid(coords; domain_size=nothing)
+    ScatteredCartesianGrid(coords::NTuple{D,AbstractVector}; domain_size=nothing)
 
-Arbitrary scattered points in `D`-dimensional Cartesian space. Suitable for `NUFFTBackend`
-(``D \\le 3``) and `DirectSumBackend` (any `D`).
+Arbitrary scattered points in `D`-dimensional Cartesian space (a genuine point cloud — no product
+structure). `coords[d]` is the length-`N` vector of the `d`-th coordinate of every point; a field is
+`(N, batch…)`. This per-axis-vector layout is what NUFFT/cuFINUFFT consume directly. Suitable for
+`NUFFTBackend` (``D \\le 3``) and `DirectSumBackend` (any `D`). `domain_size` defaults to the
+coordinate bounding box.
 """
 struct ScatteredCartesianGrid{FT, D, C<:Tuple} <: AbstractCartesianGrid{FT, D}
-    coords::C
+    coords::C                     # D-tuple of AbstractVector, each length N (points)
     domain_size::NTuple{D, FT}
 end
 
@@ -102,101 +129,205 @@ end
 # -----------------------------------------------------------------------------
 
 """
-    StructuredSphericalGrid(θ, φ; weights=nothing, quad=:clenshaw_curtis)
+    StructuredSphericalGrid(θ, φ; weights=nothing, quad=ClenshawCurtis())
 
-Structured spherical quadrature grid given as flattened colatitude/longitude node lists
-`(θ, φ)` (each of length `N = Nθ·Nφ`). Suitable for `SHTBackend`.
+Structured spherical quadrature grid given by a colatitude axis `θ` (length `Nθ`) and a longitude
+axis `φ` (length `Nφ`) — a tensor-product `(Nθ, Nφ)` grid. A field is `(Nθ, Nφ, batch…)`. `weights`
+are the per-colatitude quadrature weights (length `Nθ`) or `nothing`. Suitable for `SHTBackend`.
 """
-struct StructuredSphericalGrid{FT, C<:Tuple, W, Q<:AbstractQuadrature} <: AbstractSphericalGrid{FT}
-    coords::C            # (θ, φ), each length N
-    weights::W           # quadrature weights (length N) or nothing → uniform 4π/N
+struct StructuredSphericalGrid{FT, Aθ<:AbstractVector, Aφ<:AbstractVector, W, Q<:AbstractQuadrature} <: AbstractSphericalGrid{FT}
+    θ::Aθ                         # colatitude axis, length Nθ
+    φ::Aφ                         # longitude axis, length Nφ
+    weights::W                    # per-θ quadrature weights (length Nθ) or nothing → uniform
     quad::Q
 end
 
 """
     ScatteredSphericalGrid(θ, φ; weights=nothing)
 
-Arbitrary scattered points ``(\\theta, \\phi)`` on the sphere. Suitable for
-`NUFSHTBackend` and `DirectSumBackend`.
+Arbitrary scattered points ``(\\theta, \\phi)`` on the sphere (length-`N` per-point vectors). A field
+is `(N, batch…)`. Suitable for `NUFSHTBackend` and `DirectSumBackend`.
 """
 struct ScatteredSphericalGrid{FT, C<:Tuple, W} <: AbstractSphericalGrid{FT}
-    coords::C            # (θ, φ), each length N
+    coords::C                     # (θ, φ), each length N
     weights::W
 end
 
 # -----------------------------------------------------------------------------
-# Accessors
+# Interface — the spatial/batch split is taken from HERE, never guessed.
 # -----------------------------------------------------------------------------
 
 """
     spatial_dims(grid) -> Int
 
-Number of physical/spatial dimensions of the grid.
+Number of physical/spatial (transformed) dimensions `D`. For a scattered grid this is the *ambient*
+dimension (number of coordinate axes), which can exceed `ndims_spatial`.
 """
 spatial_dims(::AbstractGrid{FT, D}) where {FT, D} = D
 
 """
+    ndims_spatial(grid) -> Int
+
+Number of *leading array dimensions* a field on this grid consumes: `D` for a tensor-product Cartesian
+grid or a structured spherical grid, and `1` for any scattered/point-cloud grid (the single point
+axis). Every array dimension after these is a batch dimension.
+"""
+ndims_spatial(::UniformCartesianGrid{FT, D}) where {FT, D} = D
+ndims_spatial(::NonuniformCartesianGrid{FT, D}) where {FT, D} = D
+ndims_spatial(::ScatteredCartesianGrid) = 1
+ndims_spatial(::StructuredSphericalGrid) = 2
+ndims_spatial(::ScatteredSphericalGrid) = 1
+
+"""
+    spatial_size(grid) -> NTuple
+
+Sizes of the leading spatial array dimensions: `(N_1, …, N_D)` for a tensor-product Cartesian grid,
+`(Nθ, Nφ)` for a structured spherical grid, and `(N,)` for a scattered grid.
+"""
+spatial_size(g::UniformCartesianGrid) = map(length, g.axes)
+spatial_size(g::NonuniformCartesianGrid) = map(length, g.axes)
+spatial_size(g::ScatteredCartesianGrid) = (length(g.coords[1]),)
+spatial_size(g::StructuredSphericalGrid) = (length(g.θ), length(g.φ))
+spatial_size(g::ScatteredSphericalGrid) = (length(g.coords[1]),)
+
+"""
     npoints(grid) -> Int
 
-Number of spatial sample points in the grid.
+Total number of spatial sample points: `prod(spatial_size(grid))` (`∏ N_d` for a tensor grid, `N` for
+a scattered grid).
 """
-npoints(g::AbstractGrid) = length(g.coords[1])
+npoints(g::AbstractGrid) = prod(spatial_size(g))
 
 # -----------------------------------------------------------------------------
-# Construction helpers (fold domain_size inference into one place)
+# Construction helpers
 # -----------------------------------------------------------------------------
 
-@inline function _infer_domain_size(coords::NTuple{D, Any}, ::Type{FT}) where {D, FT}
-    return ntuple(Val(D)) do d
-        lo, hi = extrema(coords[d])
-        FT(hi - lo)
+# Periodic-domain size for a uniform axis: step·N (so range(0, L, N+1)[1:N] ⇒ L).
+@inline _uniform_domain(ax::AbstractRange, ::Type{FT}) where {FT} = FT(step(ax)) * length(ax)
+# Bounding-box span for an arbitrary axis / coordinate vector.
+@inline function _span(v, ::Type{FT}) where {FT}
+    lo, hi = extrema(v)
+    return FT(hi - lo)
+end
+
+_float_eltype(v) = float(eltype(v))
+
+# UniformCartesianGrid: axes are ranges; domain defaults to step·N per axis.
+function UniformCartesianGrid(axes::Tuple; domain_size = nothing)
+    D = length(axes)
+    all(ax -> ax isa AbstractRange, axes) ||
+        throw(ArgumentError("UniformCartesianGrid axes must be AbstractRanges (uniform spacing); use NonuniformCartesianGrid for vector axes"))
+    FT = _float_eltype(axes[1])
+    ax = ntuple(d -> axes[d], D)
+    ds = domain_size === nothing ?
+        ntuple(d -> _uniform_domain(ax[d], FT), D) :
+        ntuple(d -> FT(domain_size[d]), D)
+    return UniformCartesianGrid{FT, D, typeof(ax)}(ax, ds)
+end
+UniformCartesianGrid(axis::AbstractRange; kwargs...) = UniformCartesianGrid((axis,); kwargs...)
+
+# Convenience: build periodic uniform axes from physical extent + point count.
+function UniformCartesianGrid(; domain::Tuple, n::Tuple)
+    length(domain) == length(n) || throw(ArgumentError("domain and n must have equal length"))
+    FT = float(eltype(domain))
+    axes = ntuple(length(n)) do d
+        L = FT(domain[d])
+        range(zero(FT), L; length = n[d] + 1)[1:n[d]]
     end
+    return UniformCartesianGrid(axes; domain_size = ntuple(d -> FT(domain[d]), length(n)))
 end
 
-@inline function _resolve_domain_size(coords::NTuple{D, Any}, domain_size, ::Type{FT}) where {D, FT}
-    domain_size === nothing && return _infer_domain_size(coords, FT)
-    return ntuple(d -> FT(domain_size[d]), Val(D))
-end
-
-for G in (:UniformCartesianGrid, :NonuniformCartesianGrid, :ScatteredCartesianGrid)
-    @eval function $G(coords::Tuple; domain_size = nothing)
-        D = length(coords)
-        FT = float(eltype(coords[1]))
-        cc = ntuple(d -> coords[d], D)
-        ds = _resolve_domain_size(cc, domain_size, FT)
+# NonuniformCartesianGrid / ScatteredCartesianGrid: 1-D vectors; domain defaults to the span.
+for G in (:NonuniformCartesianGrid, :ScatteredCartesianGrid)
+    @eval function $G(vs::Tuple; domain_size = nothing)
+        D = length(vs)
+        FT = _float_eltype(vs[1])
+        cc = ntuple(d -> vs[d], D)
+        ds = domain_size === nothing ?
+            ntuple(d -> _span(cc[d], FT), D) :
+            ntuple(d -> FT(domain_size[d]), D)
         return $G{FT, D, typeof(cc)}(cc, ds)
     end
+    @eval $G(v::AbstractVector; kwargs...) = $G((v,); kwargs...)
 end
 
 function StructuredSphericalGrid(θ, φ; weights = nothing, quad::AbstractQuadrature = ClenshawCurtis())
-    FT = float(eltype(θ))
-    cc = (θ, φ)
-    return StructuredSphericalGrid{FT, typeof(cc), typeof(weights), typeof(quad)}(cc, weights, quad)
+    FT = _float_eltype(θ)
+    return StructuredSphericalGrid{FT, typeof(θ), typeof(φ), typeof(weights), typeof(quad)}(θ, φ, weights, quad)
 end
 
 function ScatteredSphericalGrid(θ, φ; weights = nothing)
-    FT = float(eltype(θ))
+    FT = _float_eltype(θ)
     cc = (θ, φ)
     return ScatteredSphericalGrid{FT, typeof(cc), typeof(weights)}(cc, weights)
 end
 
+# Gauss-Legendre nodes (roots of Pₙ) and weights for ∫₋₁¹, via Newton iteration (the sinθ of the
+# spherical θ-integral is absorbed by the x = cosθ change of variables, so these are the exact
+# per-colatitude weights). Returns nodes ascending in θ.
+function _gauss_legendre_nw(::Type{FT}, n::Int) where {FT}
+    x = Vector{FT}(undef, n)
+    w = Vector{FT}(undef, n)
+    for i in 1:n
+        z = cos(FT(π) * (i - one(FT) / 4) / (n + one(FT) / 2))
+        dp = zero(FT)
+        for _ in 1:100
+            p1 = one(FT); p2 = zero(FT)
+            for k in 1:n
+                p3 = p2; p2 = p1; p1 = ((2k - 1) * z * p2 - (k - 1) * p3) / k
+            end
+            dp = n * (z * p1 - p2) / (z * z - 1)
+            z1 = z; z = z1 - p1 / dp
+            abs(z - z1) <= eps(FT) && break
+        end
+        p1 = one(FT); p2 = zero(FT)
+        for k in 1:n
+            p3 = p2; p2 = p1; p1 = ((2k - 1) * z * p2 - (k - 1) * p3) / k
+        end
+        dp = n * (z * p1 - p2) / (z * z - 1)
+        x[i] = z; w[i] = 2 / ((1 - z * z) * dp * dp)
+    end
+    return x, w
+end
+
+"""
+    gauss_legendre_sphere(lmax; FT=Float64) -> StructuredSphericalGrid
+
+Structured spherical grid with **Gauss–Legendre** colatitude nodes (`Nθ = lmax+1`) and uniform
+longitude (`Nφ = 2·lmax+1`), carrying the exact Gauss quadrature weights. On this grid the direct and
+GPU spherical-harmonic transforms are **exact** (the quadrature is exact to degree `2·lmax+1`),
+matching `FastSphericalHarmonics`. Use this grid for `SHTBackend × GPUBackend` and for an exact
+`DirectSumBackend` spherical transform.
+"""
+function gauss_legendre_sphere(lmax::Int; FT::Type = Float64)
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+    x, w = _gauss_legendre_nw(FT, Nθ)
+    θ = acos.(clamp.(x, -one(FT), one(FT)))
+    φ = FT[2π * (j - 1) / Nφ for j in 1:Nφ]
+    return StructuredSphericalGrid(θ, φ; weights = w, quad = GaussLegendre())
+end
+
 # -----------------------------------------------------------------------------
-# Physical wavenumbers (single definition; was copy-pasted across backends)
+# Physical wavenumbers (single definition; axis/domain-based, not coord-based).
 # -----------------------------------------------------------------------------
 
 """
     physical_wavenumbers(domain_size::NTuple{D}, ms::NTuple{D}, ::Type{FT}) -> NTuple{D,<:AbstractRange}
 
 Centered physical wavenumber ranges matching the FFTW/FINUFFT `fftshift`ed mode ordering
-`[-m÷2, (m-1)÷2]`, scaled by `2π / L` along each axis. A zero domain size is treated as
-length `1` to avoid division by zero.
+`[-m÷2, (m-1)÷2]`, scaled by `2π / L` along each axis. A zero domain size is treated as length `1`.
 """
-@inline function physical_wavenumbers(domain_size::NTuple{D, FT}, ms::NTuple{D, Int}, ::Type{FT}) where {D, FT}
-    return ntuple(Val(D)) do d
-        L = domain_size[d]
-        scale = FT(2π) / (L == 0 ? one(FT) : L)
-        range(FT(-(ms[d] ÷ 2)), stop = FT((ms[d] - 1) ÷ 2), length = ms[d]) .* scale
-    end
+# `map` over the two tuples with a top-level (non-capturing) function — NOT `ntuple(d -> …)`, whose
+# closure boxes the captured `domain_size`/`ms` when `@inbounds` is disabled under `--check-bounds=yes`.
+@inline physical_wavenumbers(domain_size::NTuple{D, FT}, ms::NTuple{D, Int}, ::Type{FT}) where {D, FT} =
+    map(_wavenumber_axis, domain_size, ms)
+
+# One axis of centered physical wavenumbers, built directly as a `start:step:…` range (no `.*`
+# broadcast) so it stays allocation-free even with `@inbounds` off.
+@inline function _wavenumber_axis(L::FT, m::Int) where {FT}
+    scale = FT(2π) / (L == 0 ? one(FT) : L)
+    return range(FT(-(m ÷ 2)) * scale; step = scale, length = m)
 end
 
 """

@@ -1,15 +1,22 @@
 module DirectSum
 
-using ..Grids: Grids
+using ..Grids: UniformCartesianGrid, NonuniformCartesianGrid,
+    ScatteredCartesianGrid, AbstractSphericalGrid, StructuredSphericalGrid, ScatteredSphericalGrid,
+    physical_wavenumbers
 using ..SphericalKernels: SphericalKernels
 
 export sph_mode_index
 
-"""
-    sph_mode_index(l::Int, m::Int)
+# The direct-sum (DFT / SHT-projection) reference transform. Dependency-free, `O(∏ms · Npts · ∏batch)`
+# — correct for any grid, never FFT-competitive by design. It reads a field tensor `(spatial…, batch…)`
+# and writes coefficients `(spectral…, batch…)`; the batch is the innermost, contiguous loop. Tensor
+# grids read coordinates through their 1-D axes (`axes[d][I[d]]`) — NO per-point coordinate blob is
+# materialized; scattered grids read their per-point vectors (`coords[d][j]`).
 
-Return the `CartesianIndex` corresponding to degree `l` and order `m` in the
-standard 2D coefficient array of size `(lmax+1, 2lmax+1)`.
+"""
+    sph_mode_index(l, m) -> CartesianIndex
+
+`CartesianIndex` of degree `l`, order `m` in the `(lmax+1, 2lmax+1)` coefficient array.
 """
 @inline function sph_mode_index(l::Int, m::Int)
     row = l - abs(m) + 1
@@ -17,170 +24,246 @@ standard 2D coefficient array of size `(lmax+1, 2lmax+1)`.
     return CartesianIndex(row, col)
 end
 
-# Cartesian Direct Sum Transform - SERIAL VERSION
+# Phase argument Σ_d ks[d][K[d]] · x_d, Val-unrolled over the type-parameter dim count so each tuple
+# index is a compile-time constant. This stays type-stable and allocation-free even when `@inbounds`
+# is disabled (as under `--check-bounds=yes`, how `Pkg.test` runs) — a plain `for d in 1:D` loop
+# indexing the heterogeneous `ks`/`axes`/`coords` tuples at a runtime `d` can otherwise box.
+@inline _phase_tensor(ks::Tuple, axes::Tuple, K::CartesianIndex{D}, P::CartesianIndex{D}, ::Type{FT}) where {D, FT} =
+    sum(ntuple(d -> FT(ks[d][K[d]]) * FT(axes[d][P[d]]), Val(D)))
+@inline _phase_scattered(ks::Tuple, coords::Tuple, K::CartesianIndex{D}, j::Int, ::Type{FT}) where {D, FT} =
+    sum(ntuple(d -> FT(ks[d][K[d]]) * FT(coords[d][j]), Val(D)))
+
+# =============================================================================
+# Cartesian forward (analysis):  C[k, b] = (1/Npts) Σ_p f[p, b] · exp(-iflag · i · k·x_p)
+# =============================================================================
+
+# Tensor-product grid (uniform or nonuniform): spatial point `P` is a CartesianIndex over the axis
+# lengths; its coordinate along `d` is `axes[d][P[d]]` (no materialization).
 function _calculate_spectrum_cartesian_direct!(
     coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
+    g::Union{UniformCartesianGrid{FT, D}, NonuniformCartesianGrid{FT, D}},
+    field::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
-    domain_size::Union{Nothing, Tuple} = nothing,
 ) where {FT, D}
-    N = length(coords_vecs[1])
-    NU = length(fields_vecs)
-
-    # Validate output size
-    expected_size = (ms..., NU)
-    size(coeffs) == expected_size || throw(DimensionMismatch("coeffs size $(size(coeffs)) != expected $expected_size"))
-
-    # 1. Coordinate ranges for physical wavenumbers
-    ranges = ntuple(Val(D)) do d
-        if domain_size !== nothing
-            return FT(domain_size[d])
-        else
-            min_x, max_x = extrema(coords_vecs[d])
-            return FT(max_x - min_x)
-        end
-    end
-
-    # Generate physical wavenumbers consistent with FFTW/FINUFFT (shared definition)
-    ks_phys = Grids.physical_wavenumbers(ranges, ms, FT)
-
-    # Zero out coeffs (in case of reuse)
+    axes = g.axes
+    ss = map(length, axes)
+    Npts = prod(ss)
+    M = prod(ms)
+    B = length(coeffs) ÷ M
+    ks = physical_wavenumbers(g.domain_size, ms, FT)
     fill!(coeffs, zero(Complex{FT}))
-
-    # O(N * M) Cartesian direct Fourier sum - SERIAL
-    @inbounds for I in CartesianIndices(ms)
-        for j in 1:N
-            # Compute phase = k ⋅ x (manual loop for zero allocation)
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks_phys[d][I[d]] * coords_vecs[d][j]
-            end
-            phi = -iflag * phi
-
-            W = cis(phi)  # cis(x) = exp(im*x), more efficient
-
-            for u_idx in 1:NU
-                coeffs[I, u_idx] += fields_vecs[u_idx][j] * W
+    spat = CartesianIndices(ss)
+    # Linear indexing (no `reshape`): the (spatial, batch) split is column-major, so mode `mi` of batch
+    # `b` is `coeffs[mi + (b-1)·M]` and point `pj` of batch `b` is `field[pj + (b-1)·Npts]`. Avoids the
+    # non-escaping reshape-header alloc that appears when `@inbounds` is off (`--check-bounds=yes`).
+    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+        for (pj, P) in enumerate(spat)
+            phi = _phase_tensor(ks, axes, I, P, FT)
+            W = cis(-iflag * phi)
+            for b in 1:B
+                coeffs[mi + (b - 1) * M] += field[pj + (b - 1) * Npts] * W
             end
         end
     end
-
-    coeffs ./= N
-    return ks_phys
+    coeffs ./= Npts
+    return ks
 end
 
-# Spherical Direct SHT Projection - SERIAL VERSION
-function _calculate_spectrum_spherical_direct!(
+# Scattered point cloud: spatial point `j` reads `coords[d][j]`.
+function _calculate_spectrum_cartesian_direct!(
     coeffs::AbstractArray{Complex{FT}},
-    coords_vecs::Tuple,
-    fields_vecs::Tuple,
-    lmax::Int,
-    weights::Union{Nothing, AbstractVector},
-) where {FT}
-    N = length(coords_vecs[1])
-    NU = length(fields_vecs)
-    Nθ = lmax + 1
-    Nφ = 2 * lmax + 1
-
-    # Validate output size
-    expected_size = (Nθ, Nφ, NU)
-    size(coeffs) == expected_size || throw(DimensionMismatch("coeffs size $(size(coeffs)) != expected $expected_size"))
-
-    θ = coords_vecs[1]
-    φ = coords_vecs[2]
-
-    # Use uniform weights if not provided
-    w = weights === nothing ? fill(FT(4π) / N, N) : weights
-
-    # Zero out coeffs (in case of reuse)
+    g::ScatteredCartesianGrid{FT, D},
+    field::AbstractArray,
+    ms::NTuple{D, Int},
+    iflag::Int,
+) where {FT, D}
+    coords = g.coords
+    N = length(coords[1])
+    M = prod(ms)
+    B = length(coeffs) ÷ M
+    ks = physical_wavenumbers(g.domain_size, ms, FT)
     fill!(coeffs, zero(Complex{FT}))
-
-    # Precompute recurrence coefficients once; reuse a per-point Legendre table buffer.
-    tables = SphericalKernels.legendre_tables(FT, lmax)
-    Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
-
-    @inbounds for j in 1:N
-        θj = θ[j]
-        φj = φ[j]
-        wj = w[j]
-
-        xj = cos(θj)
-        sj = sin(θj)
-
-        # Fill P_l^m(cos θj) for all (l, m≥0) once for this point.
-        SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
-
-        for l in 0:lmax
-            for m in -l:l
-                abs_m = abs(m)
-                P_l_m = Plm[l+1, abs_m+1]
-
-                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                phase = cis(m * φj)
-                Y_lm = factor * P_l_m * phase
-
-                idx = sph_mode_index(l, m)
-                fj_conj_Ylm_wj = conj(Y_lm) * wj
-                for u_idx in 1:NU
-                    coeffs[idx, u_idx] += fields_vecs[u_idx][j] * fj_conj_Ylm_wj
-                end
+    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+        for j in 1:N
+            phi = _phase_scattered(ks, coords, I, j, FT)
+            W = cis(-iflag * phi)
+            for b in 1:B
+                coeffs[mi + (b - 1) * M] += field[j + (b - 1) * N] * W
             end
         end
     end
-
-    return (0:lmax, -lmax:lmax)
+    coeffs ./= N
+    return ks
 end
 
-# Inverse Cartesian direct sum: reconstruct fields at the grid points from (ms..., NU) coeffs,
-#   f_u(x_j) = Σ_I coeffs[I, u] · exp(+iflag · i · k_I · x_j),
-# which is the exact inverse of the forward (1/N)-normalized direct sum on a uniform grid.
-function _synthesize_cartesian_direct(coeffs::AbstractArray{Complex{FT}}, coords_vecs::Tuple,
-        ms::NTuple{D, Int}, iflag::Int, domain_size) where {FT, D}
-    N = length(coords_vecs[1])
-    NU = size(coeffs, D + 1)
-    ranges = ntuple(d -> FT(domain_size[d]), D)
-    ks = Grids.physical_wavenumbers(ranges, ms, FT)
-    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
-    @inbounds for j in 1:N
-        for I in CartesianIndices(ms)
-            phi = zero(FT)
-            for d in 1:D
-                phi += ks[d][I[d]] * coords_vecs[d][j]
-            end
+# =============================================================================
+# Cartesian inverse (synthesis):  f[p, b] = Σ_k C[k, b] · exp(+iflag · i · k·x_p)
+# =============================================================================
+
+function _synthesize_cartesian_direct!(
+    out::AbstractArray{Complex{FT}},
+    g::Union{UniformCartesianGrid{FT, D}, NonuniformCartesianGrid{FT, D}},
+    coeffs::AbstractArray,
+    ms::NTuple{D, Int},
+    iflag::Int,
+) where {FT, D}
+    axes = g.axes
+    ss = map(length, axes)
+    Npts = prod(ss)
+    M = prod(ms)
+    B = length(out) ÷ Npts
+    ks = physical_wavenumbers(g.domain_size, ms, FT)
+    fill!(out, zero(Complex{FT}))
+    spat = CartesianIndices(ss)
+    @inbounds for (pj, P) in enumerate(spat)
+        for (mi, I) in enumerate(CartesianIndices(ms))
+            phi = _phase_tensor(ks, axes, I, P, FT)
             W = cis(iflag * phi)
-            for u_idx in 1:NU
-                out[u_idx][j] += coeffs[I, u_idx] * W
+            for b in 1:B
+                out[pj + (b - 1) * Npts] += coeffs[mi + (b - 1) * M] * W
             end
         end
     end
     return out
 end
 
-# Inverse spherical direct sum: f_u(θ_j, φ_j) = Σ_{l,m} coeffs[l,m,u] · Y_l^m(θ_j, φ_j).
-function _synthesize_spherical_direct(coeffs::AbstractArray{Complex{FT}}, coords_vecs::Tuple,
-        lmax::Int) where {FT}
-    θ = coords_vecs[1]
-    φ = coords_vecs[2]
+function _synthesize_cartesian_direct!(
+    out::AbstractArray{Complex{FT}},
+    g::ScatteredCartesianGrid{FT, D},
+    coeffs::AbstractArray,
+    ms::NTuple{D, Int},
+    iflag::Int,
+) where {FT, D}
+    coords = g.coords
+    N = length(coords[1])
+    M = prod(ms)
+    B = length(out) ÷ N
+    ks = physical_wavenumbers(g.domain_size, ms, FT)
+    fill!(out, zero(Complex{FT}))
+    @inbounds for j in 1:N
+        for (mi, I) in enumerate(CartesianIndices(ms))
+            phi = _phase_scattered(ks, coords, I, j, FT)
+            W = cis(iflag * phi)
+            for b in 1:B
+                out[j + (b - 1) * N] += coeffs[mi + (b - 1) * M] * W
+            end
+        end
+    end
+    return out
+end
+
+# =============================================================================
+# Spherical forward / inverse (SHT projection / synthesis).
+# Spherical grids are small (N = Nθ·Nφ or the scattered count), so per-point (θ, φ, weight) lists are
+# materialized once — this is NOT the ∏N_d Cartesian blob, just a modest point list.
+# =============================================================================
+
+# Per-point (θ, φ, weight) lists, in the SAME column-major order as a reshaped field:
+#   structured (Nθ, Nφ): point p = iθ + (iφ-1)·Nθ, weight w_θ[iθ]·(2π/Nφ) or uniform 4π/N;
+#   scattered:           point k, weight weights[k] or uniform 4π/N.
+function _sph_point_data(g::StructuredSphericalGrid{FT}) where {FT}
+    Nθ = length(g.θ)
+    Nφ = length(g.φ)
+    N = Nθ * Nφ
+    θpt = Vector{FT}(undef, N)
+    φpt = Vector{FT}(undef, N)
+    wpt = Vector{FT}(undef, N)
+    dφ = FT(2π) / Nφ
+    @inbounds for iφ in 1:Nφ, iθ in 1:Nθ
+        p = iθ + (iφ - 1) * Nθ
+        θpt[p] = FT(g.θ[iθ])
+        φpt[p] = FT(g.φ[iφ])
+        wpt[p] = g.weights === nothing ? FT(4π) / N : FT(g.weights[iθ]) * dφ
+    end
+    return θpt, φpt, wpt
+end
+
+function _sph_point_data(g::ScatteredSphericalGrid{FT}) where {FT}
+    θ = g.coords[1]
+    φ = g.coords[2]
     N = length(θ)
-    NU = size(coeffs, 3)
+    θpt = FT.(θ)
+    φpt = FT.(φ)
+    wpt = g.weights === nothing ? fill(FT(4π) / N, N) : FT.(g.weights)
+    return θpt, φpt, wpt
+end
+
+# Real spherical harmonic value in the FastSphericalHarmonics convention (verified to match
+# `FSH.sph_evaluate` to round-off): Y_lm = s(m)·P̄_l^|m|·trig, with s(0)=1, s(m≠0)=(-1)^|m|√2, and
+# trig = cos(mφ) for m≥0, sin(|m|φ) for m<0. `Plm` holds the normalized associated Legendre
+# P̄_l^|m|(cosθ). Coefficients are real (stored in the complex array with zero imaginary part).
+@inline function _real_sph(Plm::AbstractMatrix{FT}, l::Int, m::Int, φ::FT) where {FT}
+    abs_m = abs(m)
+    P = Plm[l+1, abs_m+1]
+    m == 0 && return P
+    s = isodd(abs_m) ? -sqrt(FT(2)) : sqrt(FT(2))
+    return s * P * (m > 0 ? cos(m * φ) : sin(abs_m * φ))
+end
+
+function _calculate_spectrum_spherical_direct!(
+    coeffs::AbstractArray{Complex{FT}},
+    g::AbstractSphericalGrid{FT},
+    field::AbstractArray,
+    lmax::Int,
+) where {FT}
+    θpt, φpt, wpt = _sph_point_data(g)
+    N = length(θpt)
+    Nθc = lmax + 1
+    Nφc = 2 * lmax + 1
+    B = length(coeffs) ÷ (Nθc * Nφc)
+    F = reshape(field, N, B)
+    C = reshape(coeffs, Nθc, Nφc, B)
+    fill!(coeffs, zero(Complex{FT}))
     tables = SphericalKernels.legendre_tables(FT, lmax)
     Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
-    out = ntuple(_ -> zeros(Complex{FT}, N), NU)
-    @inbounds for j in 1:N
-        xj = cos(θ[j])
-        sj = sin(θ[j])
-        φj = φ[j]
+    @inbounds for p in 1:N
+        xj = cos(θpt[p])
+        sj = sin(θpt[p])
+        φp = φpt[p]
+        wp = wpt[p]
         SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
         for l in 0:lmax
             for m in -l:l
-                abs_m = abs(m)
-                factor = (m < 0 && isodd(abs_m)) ? -one(FT) : one(FT)
-                Y_lm = factor * Plm[l+1, abs_m+1] * cis(m * φj)
+                Ylm = _real_sph(Plm, l, m, φp)          # real SH (FSH convention)
                 idx = sph_mode_index(l, m)
-                for u_idx in 1:NU
-                    out[u_idx][j] += coeffs[idx, u_idx] * Y_lm
+                gw = Ylm * wp
+                for b in 1:B
+                    C[idx, b] += F[p, b] * gw
+                end
+            end
+        end
+    end
+    return (0:lmax, -lmax:lmax)
+end
+
+function _synthesize_spherical_direct!(
+    out::AbstractArray{Complex{FT}},
+    g::AbstractSphericalGrid{FT},
+    coeffs::AbstractArray,
+    lmax::Int,
+) where {FT}
+    θpt, φpt, _ = _sph_point_data(g)
+    N = length(θpt)
+    Nθc = lmax + 1
+    Nφc = 2 * lmax + 1
+    B = length(out) ÷ N
+    O = reshape(out, N, B)
+    C = reshape(coeffs, Nθc, Nφc, B)
+    fill!(O, zero(Complex{FT}))
+    tables = SphericalKernels.legendre_tables(FT, lmax)
+    Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
+    @inbounds for p in 1:N
+        xj = cos(θpt[p])
+        sj = sin(θpt[p])
+        φp = φpt[p]
+        SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
+        for l in 0:lmax
+            for m in -l:l
+                Ylm = _real_sph(Plm, l, m, φp)          # real SH (FSH convention)
+                idx = sph_mode_index(l, m)
+                for b in 1:B
+                    O[p, b] += C[idx, b] * Ylm
                 end
             end
         end

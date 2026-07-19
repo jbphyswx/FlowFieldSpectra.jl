@@ -6,60 +6,44 @@ using CairoMakie: CairoMakie as Mke
 """
     run_spherical_example()
 
-Spherical-harmonic degree energy spectrum of a field built from known modes, recovered two ways:
-the **structured** transform (`SHTBackend`, exact on its quadrature grid) and the **scattered**
-transform (`NUFSHTBackend`, a least-squares solve from jittered points). The scattered solve is
-kept in a regime (modest `lmax`, ~4× oversampling) where it cleanly recovers the dominant degrees,
-so the two estimates visibly agree.
+Spherical-harmonic degree energy spectrum recovered two ways: the **structured** transform (`SHTBackend`
+on a Clenshaw–Curtis grid, exact) and the **scattered** transform (`NUFSHTBackend`, a least-squares
+solve from Fibonacci-sphere points).
 """
 function run_spherical_example()
     println("--- Running Spherical Grid Spectra Example ---")
 
-    # 1. Structured Clenshaw–Curtis grid. lmax is kept modest so the scattered least-squares
-    #    solve (which becomes ill-conditioned at high degree on random points) recovers cleanly.
     lmax = 6
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
+    pts = FSH.sph_points(Nθ)                            # (θ axis, φ axis)
+    θax, φax = pts[1], pts[2]
+    sht_grid = FFS.StructuredSphericalGrid(θax, φax)
 
-    pts = FSH.sph_points(Nθ)
-    theta_grid, phi_grid = pts[1], pts[2]
-    theta_nodes = vec([θ for θ in theta_grid, φ in phi_grid])
-    phi_nodes = vec([φ for θ in theta_grid, φ in phi_grid])
-
-    # Field with two known modes: Y₂¹ (amplitude 1.0) and Y₄⁻² (amplitude 0.6).
     C_true = zeros(Nθ, Nφ)
     C_true[FSH.sph_mode(2, 1)] = 1.0
     C_true[FSH.sph_mode(4, -2)] = 0.6
-    f_val = vec(FSH.sph_evaluate(C_true))
+    f_val = FSH.sph_evaluate(C_true)                    # (Nθ, Nφ) tensor field
 
-    # 2. Structured SHT (exact on the quadrature grid).
     println("Computing structured SHT via FastSphericalHarmonics...")
-    sht_grid = FFS.StructuredSphericalGrid(theta_nodes, phi_nodes)
-    c_sht, _ = FFS.calculate_spectrum(sht_grid, (f_val,), (Nθ, Nφ); transform = FFS.SHTBackend())
+    c_sht, _ = FFS.calculate_spectrum(sht_grid, f_val, (Nθ, Nφ); transform = FFS.SHTBackend())
     deg, E_l = FFS.spherical_energy_spectrum(c_sht)
 
-    # 3. Scattered NUFSHT: ~4x more points than modes, CG least-squares solve.
-    #    Use a Fibonacci-spiral sphere — a genuinely *well-distributed* scattered set. (A point
-    #    layout with large gaps at scale 1/lmax leaves the SHT operator near-rank-deficient, and
-    #    the minimum-norm solve then under-recovers; an even distribution recovers exactly.)
     println("Computing unstructured SHT via NUFSHT (CG solve, Fibonacci-sphere points)...")
     N_pts = 4 * Nθ * Nφ
     golden = π * (3 - sqrt(5))
     z_fib = [1 - 2 * (i + 0.5) / N_pts for i in 0:(N_pts-1)]
-    theta_scat = acos.(clamp.(z_fib, -1.0, 1.0))
-    phi_scat = mod.(golden .* (0:(N_pts-1)), 2π)
-
-    plan = NUFSHT.make_plan(theta_scat, phi_scat, lmax; tol = 1e-10)
+    θ_scat = acos.(clamp.(z_fib, -1.0, 1.0))
+    φ_scat = mod.(golden .* (0:(N_pts-1)), 2π)
+    plan = NUFSHT.make_plan(θ_scat, φ_scat, lmax; tol = 1e-10)
     f_scat = zeros(N_pts)
     NUFSHT.nusht_type2!(f_scat, C_true, plan)
 
-    nufsht_grid = FFS.ScatteredSphericalGrid(theta_scat, phi_scat)
-    c_nufsht, _ = FFS.calculate_spectrum(nufsht_grid, (f_scat,), (Nθ, Nφ);
+    nufsht_grid = FFS.ScatteredSphericalGrid(θ_scat, φ_scat)
+    c_nu, _ = FFS.calculate_spectrum(nufsht_grid, f_scat, (Nθ, Nφ);
         transform = FFS.NUFSHTBackend(), solve = true, maxiter = 3000, rtol = 1e-10)
-    deg_scat, E_l_scat = FFS.spherical_energy_spectrum(c_nufsht)
+    deg_s, E_l_s = FFS.spherical_energy_spectrum(c_nu)
 
-    # 4. Plot the TWO samplings of the same field (structured grid vs scattered points) and the
-    #    degree spectra they recover. Shared colour range so the two inputs are comparable.
     crange = maximum(abs, f_val)
     fig = Mke.Figure(size = (1200, 780))
     Mke.Label(fig[0, 1:3], "Spherical Harmonic Degree Spectrum: structured grid vs scattered points",
@@ -67,29 +51,24 @@ function run_spherical_example()
 
     ax1 = Mke.Axis(fig[1, 1]; title = "Structured: f on the Clenshaw–Curtis grid",
         xlabel = "Longitude φ", ylabel = "Colatitude θ", yreversed = true)
-    Mke.heatmap!(ax1, phi_grid, theta_grid, reshape(f_val, Nθ, Nφ)';
-        colormap = :balance, colorrange = (-crange, crange))
+    Mke.heatmap!(ax1, φax, θax, f_val'; colormap = :balance, colorrange = (-crange, crange))
 
     ax2 = Mke.Axis(fig[1, 2]; title = "Scattered: f at $(N_pts) Fibonacci-sphere points",
         xlabel = "Longitude φ", ylabel = "Colatitude θ", yreversed = true)
-    sc = Mke.scatter!(ax2, phi_scat, theta_scat; color = f_scat, colormap = :balance,
+    sc = Mke.scatter!(ax2, φ_scat, θ_scat; color = f_scat, colormap = :balance,
         colorrange = (-crange, crange), markersize = 6)
     Mke.Colorbar(fig[1, 3], sc; label = "f(θ, φ)")
 
     ax3 = Mke.Axis(fig[2, 1:3]; title = "Degree energy spectrum E(ℓ) — both samplings recover it",
         xlabel = "Degree ℓ", ylabel = "E(ℓ)")
-    Mke.barplot!(ax3, deg .- 0.18, E_l; width = 0.36, color = (:steelblue, 0.9),
-        label = "Structured (SHT, exact)")
-    Mke.barplot!(ax3, deg_scat .+ 0.18, E_l_scat; width = 0.36, color = (:crimson, 0.9),
-        label = "Scattered (NUFSHT solve)")
+    Mke.barplot!(ax3, deg .- 0.18, E_l; width = 0.36, color = (:steelblue, 0.9), label = "Structured (SHT, exact)")
+    Mke.barplot!(ax3, deg_s .+ 0.18, E_l_s; width = 0.36, color = (:crimson, 0.9), label = "Scattered (NUFSHT solve)")
     Mke.xlims!(ax3, -0.5, lmax + 0.5)
     Mke.axislegend(ax3; position = :rt)
 
     outpath = joinpath(@__DIR__, "spherical_spectra.png")
     Mke.save(outpath, fig)
     println("Saved figure: ", outpath)
-    println("Structured  E(2)=$(round(E_l[3];sigdigits=3)),  E(4)=$(round(E_l[5];sigdigits=3))")
-    println("Scattered   E(2)=$(round(E_l_scat[3];sigdigits=3)),  E(4)=$(round(E_l_scat[5];sigdigits=3))")
     println("Example run successfully!")
     return fig
 end

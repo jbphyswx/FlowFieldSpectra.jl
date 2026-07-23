@@ -40,5 +40,4 @@ Manifest*.toml
 LocalPreferences.toml
 JuliaLocalPreferences.toml
 
-# Local dev tooling environment (not part of the package)
-.dev/
+

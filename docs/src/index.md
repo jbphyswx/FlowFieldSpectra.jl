@@ -20,7 +20,7 @@ Pkg.add("FlowFieldSpectra")
 A typical flow field spectral analysis consists of three main steps:
 
 1. **Coordinate and Field Setup**: Define your grid coordinates (zonal, meridional, vertical, or spherical latitude/longitude) and spatial velocity field values.
-2. **Spectral Transform**: Run `calculate_spectrum` with a chosen backend (e.g. `DirectSumBackend`, `FFTBackend`, `NUFFTBackend`, etc.).
+2. **Spectral Transform**: Run `calculate_spectrum` with a chosen backend (e.g. `DirectSumSpectralBackend`, `FFTSpectralBackend`, `NUFFTSpectralBackend`, etc.).
 3. **Spectral Reductions**: Convert high-dimensional Fourier coefficients to meaningful energy spectra (e.g., 1D isotropic / radial energy density, 1D slice/transect, or spherical degree energy spectra).
 
 ### Quickstart Tutorial: Cartesian 2D Flow Field
@@ -31,26 +31,26 @@ and pass it to `calculate_spectrum`.
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW              # activates the FFTBackend extension
+using FFTW: FFTW                     # activates the FFT extension
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
-# 1. Coordinate lists on a uniform grid
+# 1. Axes of a uniform, periodic Cartesian grid
 L = 2π
 N = 32
-dx = L / N
-xs = range(0.0, stop = L - dx, length = N)
-xv = vec([x for x in xs, y in xs])
-yv = vec([y for x in xs, y in xs])
+xs = range(0.0, L; length = N + 1)[1:N]
 
-# 2. Synthesize zonal/meridional velocities with specific wavenumbers
-u = @. cos(2 * xv) + 0.5 * sin(5 * yv)
-v = @. sin(2 * xv)
+# 2. Zonal/meridional velocities as (N, N) field tensors
+u = [cos(2x) + 0.5 * sin(5y) for x in xs, y in xs]
+v = [sin(2x) for x in xs, y in xs]
 
-# 3. Build the grid and compute Fourier coefficients (FFTBackend needs FFTW)
-grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
+# 3. Build the grid (FlowGeometries) and compute Fourier coefficients (the FFT backend needs FFTW)
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
+    periodic = (true, true), period = (L, L))
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 
-# 4. Radially integrate to a 1D isotropic energy spectrum
-k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 16)
+# 4. Radially integrate to a 1D isotropic (kinetic) energy spectrum (fold the component axis)
+k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 16, dims = 3)
 ```
 
 ![Isotropic energy spectrum of a 2D flow field](assets/cartesian_spectra.png)

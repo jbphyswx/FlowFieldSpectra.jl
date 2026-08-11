@@ -2,13 +2,15 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT
 using CairoMakie: CairoMakie as Mke
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 """
     run_spherical_example()
 
-Spherical-harmonic degree energy spectrum recovered two ways: the **structured** transform (`SHTBackend`
-on a Clenshaw–Curtis grid, exact) and the **scattered** transform (`NUFSHTBackend`, a least-squares
-solve from Fibonacci-sphere points).
+Spherical-harmonic degree energy spectrum recovered two ways: the **structured** transform
+(`FSHTSpectralBackend` on a Clenshaw–Curtis grid, exact) and the **scattered** transform
+(`NUFSHTSpectralBackend`, a least-squares solve from Fibonacci-sphere points).
 """
 function run_spherical_example()
     println("--- Running Spherical Grid Spectra Example ---")
@@ -16,17 +18,19 @@ function run_spherical_example()
     lmax = 6
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-    pts = FSH.sph_points(Nθ)                            # (θ axis, φ axis)
-    θax, φax = pts[1], pts[2]
-    sht_grid = FFS.StructuredSphericalGrid(θax, φax)
+    # Structured Clenshaw–Curtis grid (FlowGeometries) — the grid FastSphericalHarmonics transforms on.
+    sht_grid = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), Nθ)
+    λ = collect(FG.Grids.coordinates(sht_grid, 1))                # longitude (nlon)
+    θax = (π / 2) .- collect(FG.Grids.coordinates(sht_grid, 2))   # colatitude (nlat)
 
-    C_true = zeros(Nθ, Nφ)
-    C_true[FSH.sph_mode(2, 1)] = 1.0
-    C_true[FSH.sph_mode(4, -2)] = 0.6
-    f_val = FSH.sph_evaluate(C_true)                    # (Nθ, Nφ) tensor field
+    C_true = zeros(ComplexF64, Nθ, Nφ)
+    C_true[FFS.sph_mode_index(2, 1)] = 1.0
+    C_true[FFS.sph_mode_index(4, -2)] = 0.6
+    C_true_r = real.(C_true)                            # real coeffs (FSH sph_mode layout) for NUFSHT
+    f_val = real(FFS.synthesize(sht_grid, C_true, (Nθ, Nφ)))      # (nlon, nlat) field on the grid
 
     println("Computing structured SHT via FastSphericalHarmonics...")
-    c_sht, _ = FFS.calculate_spectrum(sht_grid, f_val, (Nθ, Nφ); transform = FFS.SHTBackend())
+    c_sht, _ = FFS.calculate_spectrum(sht_grid, f_val, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())
     deg, E_l = FFS.spherical_energy_spectrum(c_sht)
 
     println("Computing unstructured SHT via NUFSHT (CG solve, Fibonacci-sphere points)...")
@@ -35,13 +39,14 @@ function run_spherical_example()
     z_fib = [1 - 2 * (i + 0.5) / N_pts for i in 0:(N_pts-1)]
     θ_scat = acos.(clamp.(z_fib, -1.0, 1.0))
     φ_scat = mod.(golden .* (0:(N_pts-1)), 2π)
-    plan = NUFSHT.make_plan(θ_scat, φ_scat, lmax; tol = 1e-10)
+    plan = NUFSHT.make_plan(Float64, θ_scat, φ_scat, lmax; tol = 1e-10)
     f_scat = zeros(N_pts)
-    NUFSHT.nusht_type2!(f_scat, C_true, plan)
+    NUFSHT.nusht_type2!(f_scat, C_true_r, plan)
 
-    nufsht_grid = FFS.ScatteredSphericalGrid(θ_scat, φ_scat)
+    nufsht_grid = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0),
+        (φ_scat, (π / 2) .- θ_scat), ones(N_pts))
     c_nu, _ = FFS.calculate_spectrum(nufsht_grid, f_scat, (Nθ, Nφ);
-        transform = FFS.NUFSHTBackend(), solve = true, maxiter = 3000, rtol = 1e-10)
+        transform = SB.NUFSHTSpectralBackend(), solve = true, maxiter = 3000, rtol = 1e-10)
     deg_s, E_l_s = FFS.spherical_energy_spectrum(c_nu)
 
     crange = maximum(abs, f_val)
@@ -51,7 +56,7 @@ function run_spherical_example()
 
     ax1 = Mke.Axis(fig[1, 1]; title = "Structured: f on the Clenshaw–Curtis grid",
         xlabel = "Longitude φ", ylabel = "Colatitude θ", yreversed = true)
-    Mke.heatmap!(ax1, φax, θax, f_val'; colormap = :balance, colorrange = (-crange, crange))
+    Mke.heatmap!(ax1, λ, θax, f_val; colormap = :balance, colorrange = (-crange, crange))
 
     ax2 = Mke.Axis(fig[1, 2]; title = "Scattered: f at $(N_pts) Fibonacci-sphere points",
         xlabel = "Longitude φ", ylabel = "Colatitude θ", yreversed = true)

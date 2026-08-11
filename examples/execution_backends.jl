@@ -8,18 +8,23 @@
 #   julia --project=examples examples/execution_backends.jl
 
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW                                   # FFTBackend + the device-generic GPU FFT (KA.CPU→FFTW)
+using FFTW: FFTW                                   # FFT transform + the device-generic GPU FFT (KA.CPU→FFTW)
 using KernelAbstractions: KernelAbstractions as KA # GPUBackend (KA.CPU() here; CUDABackend() on a GPU)
 using OhMyThreads: OhMyThreads                     # ThreadedBackend
 using CairoMakie: CairoMakie as Mke
 using Random: Random
+using ComputationalBackends: ComputationalBackends as CB
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 function run_execution_backends_example()
     println("--- Two-axis backends: one transform, several execution backends ---")
 
     L = 2π
     N = 96
-    grid = FFS.UniformCartesianGrid(; domain = (L, L), n = (N, N))
+    xs = range(0.0, L; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
+        periodic = (true, true), period = (L, L))
     ms = (N, N)
 
     # A broadband field with a k^-5/3 cascade — built and kept as a plain (N, N) tensor.
@@ -33,11 +38,11 @@ function run_execution_backends_example()
     f = real(FFTW.ifft(f̂))                          # (N, N) — no flattening
 
     execs = [
-        ("Serial", FFS.SerialBackend()),
-        ("Threaded", FFS.ThreadedBackend()),
-        ("GPU (KA.CPU())", FFS.GPUBackend(KA.CPU())),
+        ("Serial", CB.SerialBackend()),
+        ("Threaded", CB.ThreadedBackend()),
+        ("GPU (KA.CPU())", CB.GPUBackend(KA.CPU())),
     ]
-    results = [FFS.calculate_spectrum(grid, f, ms; transform = FFS.FFTBackend(), execution = e) for (_, e) in execs]
+    results = [FFS.calculate_spectrum(grid, f, ms; transform = SB.FFTSpectralBackend(), execution = e) for (_, e) in execs]
     ks = results[1][2]
     cref = results[1][1]
 
@@ -47,14 +52,14 @@ function run_execution_backends_example()
     end
 
     # ── real GPU / Distributed / MPI (uncomment on the appropriate machine) ──
-    # using CUDA; dev = FFS.GPUBackend(CUDA.CUDABackend())
-    #   FFS.calculate_spectrum(grid, f, ms; transform=FFS.FFTBackend(),  execution=dev)   # CUFFT
-    #   scat = FFS.ScatteredCartesianGrid((xv, yv); domain_size=(L,L))
-    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.NUFFTBackend(), execution=dev)  # cuFINUFFT
+    # using CUDA; dev = CB.GPUBackend(CUDA.CUDABackend())
+    #   FFS.calculate_spectrum(grid, f, ms; transform=SB.FFTSpectralBackend(),  execution=dev)   # CUFFT
+    #   scat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(length(xv)); periodic=(true,true), period=(L,L))
+    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.FINUFFTBackend(), execution=dev)  # cuFINUFFT
     # using Distributed; addprocs(4); @everywhere using FlowFieldSpectra, FINUFFT
-    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.NUFFTBackend(), execution=FFS.DistributedBackend())
+    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.FINUFFTBackend(), execution=CB.DistributedBackend())
     # using MPI; MPI.Init()
-    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.DirectSumBackend(), execution=FFS.MPIBackend())
+    #   FFS.calculate_spectrum(scat, fscat, ms; transform=SB.DirectSumSpectralBackend(), execution=CB.MPIBackend())
 
     specs = [FFS.isotropic_spectrum(ks, r[1]; num_bins = 40) for r in results]
     kb1 = specs[1][1]

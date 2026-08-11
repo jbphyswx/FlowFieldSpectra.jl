@@ -1,8 +1,10 @@
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FINUFFT: FINUFFT     # activates the NUFFTBackend extension
-using FFTW: FFTW           # activates the FFTBackend extension
+using FINUFFT: FINUFFT     # activates the NUFFT extension
+using FFTW: FFTW           # activates the FFT extension
 using CairoMakie: CairoMakie as Mke
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 """
     run_nufft_coastline_example()
@@ -17,12 +19,14 @@ function run_nufft_coastline_example()
 
     L = 2π
     N = 64
-    grid = FFS.UniformCartesianGrid(; domain = (L, L), n = (N, N))
-    xs, ys = grid.axes
+    xs = range(0.0, L; length = N + 1)[1:N]
+    ys = range(0.0, L; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
+        periodic = (true, true), period = (L, L))
     field(x, y) = cos(3x) + 0.6 * sin(5y) + 0.4 * cos(2x + 4y)
     f_grid = [field(x, y) for x in xs, y in ys]         # (N, N) tensor
 
-    c_fft, k_fft = FFS.calculate_spectrum(grid, f_grid, (N, N); transform = FFS.FFTBackend())
+    c_fft, k_fft = FFS.calculate_spectrum(grid, f_grid, (N, N); transform = SB.FFTSpectralBackend())
     k_ref, E_ref = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 24)
 
     dx = L / N
@@ -38,8 +42,9 @@ function run_nufft_coastline_example()
     fo = field.(xo, yo)                                 # (N_ocean,) scattered field
     println("Kept $(count(ocean)) / $(length(xj)) points after the coastline cutout.")
 
-    ocean_grid = FFS.ScatteredCartesianGrid((xo, yo); domain_size = (L, L))
-    c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FFS.NUFFTBackend(), eps = 1e-9)
+    ocean_grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xo, yo), ones(length(xo));
+        periodic = (true, true), period = (L, L))
+    c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-9)
     k_nu2, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 24)
 
     fig = Mke.Figure(size = (1200, 500))

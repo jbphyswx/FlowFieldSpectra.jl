@@ -1,6 +1,6 @@
 module Averaging
 
-export welch_power_spectrum, coherence_spectrum
+export welch_power_spectrum, welch_power_spectrum!, coherence_spectrum, coherence_spectrum!
 
 # =============================================================================
 # Variance-reduced (Welch / ensemble) estimators. The trailing batch dims of the coefficient array are
@@ -8,13 +8,56 @@ export welch_power_spectrum, coherence_spectrum
 # with (coherence) the radial binning. `coeffs` is `(ms…, realization_batch…)`.
 # =============================================================================
 
-@inline function _radial_setup(ks_phys::NTuple{D, Any}, ms::NTuple{D, Int}, num_bins::Int, ::Type{T}) where {D, T}
+# Fill `k_bins` (length nb) with radial bin centers; return `(dk, k_max)`. No allocation.
+@inline function _fill_kbins!(k_bins::AbstractVector{T}, ks_phys::NTuple{D, Any}) where {T, D}
     k_max = minimum(ntuple(d -> maximum(abs, ks_phys[d]), D))
-    num_bins <= 0 && (num_bins = minimum(ms) ÷ 2)
-    dk = k_max / num_bins
-    k_bins = [T(0.5) * ((i - 1) * dk + i * dk) for i in 1:num_bins]
-    kd2 = ntuple(d -> [T(v)^2 for v in ks_phys[d]], D)
-    return num_bins, dk, k_max, k_bins, kd2
+    nb = length(k_bins)
+    dk = k_max / nb
+    @inbounds for i in 1:nb
+        k_bins[i] = T(0.5) * ((i - 1) * dk + i * dk)
+    end
+    return dk, k_max
+end
+
+@inline _resolve_nb(num_bins::Int, ms::NTuple) = num_bins > 0 ? num_bins : minimum(ms) ÷ 2
+
+"""
+    welch_power_spectrum!(E_k, k_bins, ks_phys, coeffs; num_bins=0) -> nothing
+
+In-place, allocation-free [`welch_power_spectrum`](@ref): fills preallocated `E_k` and `k_bins` (both
+length `num_bins`). Reusable across a loop with zero steady-state heap traffic.
+"""
+function welch_power_spectrum!(E_k::AbstractVector{T}, k_bins::AbstractVector{T}, ks_phys::Tuple,
+        coeffs::AbstractArray{Complex{T}, N}; num_bins::Int = 0) where {T, N}
+    D = length(ks_phys)
+    N >= D || throw(ArgumentError("coeffs must have ≥ $D spectral dims"))
+    ms = ntuple(d -> size(coeffs, d), D)
+    nb = length(k_bins)
+    length(E_k) == nb || throw(DimensionMismatch("E_k and k_bins must have equal length"))
+    num_bins > 0 && num_bins != nb && throw(ArgumentError("num_bins=$num_bins ≠ length(k_bins)=$nb"))
+    M = prod(ms)
+    nreal = length(coeffs) ÷ M
+    dk, k_max = _fill_kbins!(k_bins, ks_phys)
+    fill!(E_k, zero(T))
+    # Linear indexing `coeffs[mi + (e-1)·M]` (mode mi, realization e) avoids a reshape-header alloc.
+    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+        kmag = zero(T)
+        for d in 1:D
+            kv = T(ks_phys[d][I[d]])
+            kmag += kv * kv
+        end
+        kmag = sqrt(kmag)
+        kmag > k_max && continue
+        p = zero(T)
+        for e in 1:nreal
+            p += abs2(coeffs[mi + (e - 1) * M])
+        end
+        p /= nreal
+        bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
+        E_k[bin] += T(0.5) * p
+    end
+    E_k ./= dk
+    return nothing
 end
 
 """
@@ -29,27 +72,67 @@ function welch_power_spectrum(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, 
     D = length(ks_phys)
     N >= D || throw(ArgumentError("coeffs must have ≥ $D spectral dims"))
     ms = ntuple(d -> size(coeffs, d), D)
-    nreal = prod(ntuple(i -> size(coeffs, D + i), N - D); init = 1)
-    num_bins, dk, k_max, k_bins, kd2 = _radial_setup(ks_phys, ms, num_bins, T)
-    C = reshape(coeffs, prod(ms), nreal)
-    E_k = zeros(T, num_bins)
+    nb = _resolve_nb(num_bins, ms)
+    k_bins = Vector{T}(undef, nb)
+    E_k = Vector{T}(undef, nb)
+    welch_power_spectrum!(E_k, k_bins, ks_phys, coeffs)
+    return k_bins, E_k
+end
+
+"""
+    coherence_spectrum!(coherence², phase, k_bins, ks_phys, cf, cg; num_bins=0) -> nothing
+
+In-place [`coherence_spectrum`](@ref): fills preallocated `coherence²`, `phase`, `k_bins` (each length
+`num_bins`). Uses `O(num_bins)` internal scratch for the complex cross-spectrum accumulator.
+"""
+function coherence_spectrum!(coherence²::AbstractVector{T}, phase::AbstractVector{T},
+        k_bins::AbstractVector{T}, ks_phys::Tuple, cf::AbstractArray{Complex{T}, N},
+        cg::AbstractArray{Complex{T}, N}; num_bins::Int = 0) where {T, N}
+    D = length(ks_phys)
+    size(cf) == size(cg) || throw(DimensionMismatch("cf and cg must match"))
+    N >= D || throw(ArgumentError("coeffs must have ≥ $D spectral dims"))
+    ms = ntuple(d -> size(cf, d), D)
+    nb = length(k_bins)
+    (length(coherence²) == nb && length(phase) == nb) ||
+        throw(DimensionMismatch("coherence², phase, k_bins must have equal length"))
+    num_bins > 0 && num_bins != nb && throw(ArgumentError("num_bins=$num_bins ≠ length(k_bins)=$nb"))
+    M = prod(ms)
+    nreal = length(cf) ÷ M
+    dk, k_max = _fill_kbins!(k_bins, ks_phys)
+    # `coherence²`/`phase` double as the Sff/Sgg real accumulators; the complex cross-spectrum Sfg needs
+    # its own accumulator (the only allocation — O(num_bins)).
+    fill!(coherence², zero(T))
+    fill!(phase, zero(T))
+    Sfg = zeros(Complex{T}, nb)
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
         kmag = zero(T)
         for d in 1:D
-            kmag += kd2[d][I[d]]
+            kv = T(ks_phys[d][I[d]])
+            kmag += kv * kv
         end
         kmag = sqrt(kmag)
         kmag > k_max && continue
-        p = zero(T)
+        bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
+        sff = zero(T)
+        sgg = zero(T)
+        sfg = zero(Complex{T})
         for e in 1:nreal
-            p += abs2(C[mi, e])
+            a = cf[mi + (e - 1) * M]
+            b = cg[mi + (e - 1) * M]
+            sff += abs2(a)
+            sgg += abs2(b)
+            sfg += a * conj(b)
         end
-        p /= nreal
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
-        E_k[bin] += T(0.5) * p
+        coherence²[bin] += sff
+        phase[bin] += sgg
+        Sfg[bin] += sfg
     end
-    E_k ./= dk
-    return k_bins, E_k
+    @inbounds for i in 1:nb
+        denom = coherence²[i] * phase[i]                       # Sff · Sgg
+        coherence²[i] = denom > 0 ? clamp(abs2(Sfg[i]) / denom, zero(T), one(T)) : zero(T)
+        phase[i] = angle(Sfg[i])
+    end
+    return nothing
 end
 
 """
@@ -65,42 +148,11 @@ function coherence_spectrum(ks_phys::Tuple, cf::AbstractArray{Complex{T}, N},
     size(cf) == size(cg) || throw(DimensionMismatch("cf and cg must match"))
     N >= D || throw(ArgumentError("coeffs must have ≥ $D spectral dims"))
     ms = ntuple(d -> size(cf, d), D)
-    nreal = prod(ntuple(i -> size(cf, D + i), N - D); init = 1)
-    num_bins, dk, k_max, k_bins, kd2 = _radial_setup(ks_phys, ms, num_bins, T)
-    F = reshape(cf, prod(ms), nreal)
-    G = reshape(cg, prod(ms), nreal)
-    Sff = zeros(T, num_bins)
-    Sgg = zeros(T, num_bins)
-    Sfg = zeros(Complex{T}, num_bins)
-    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
-        kmag = zero(T)
-        for d in 1:D
-            kmag += kd2[d][I[d]]
-        end
-        kmag = sqrt(kmag)
-        kmag > k_max && continue
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
-        sff = zero(T)
-        sgg = zero(T)
-        sfg = zero(Complex{T})
-        for e in 1:nreal
-            a = F[mi, e]
-            b = G[mi, e]
-            sff += abs2(a)
-            sgg += abs2(b)
-            sfg += a * conj(b)
-        end
-        Sff[bin] += sff
-        Sgg[bin] += sgg
-        Sfg[bin] += sfg
-    end
-    coherence² = zeros(T, num_bins)
-    phase = zeros(T, num_bins)
-    @inbounds for i in 1:num_bins
-        denom = Sff[i] * Sgg[i]
-        coherence²[i] = denom > 0 ? clamp(abs2(Sfg[i]) / denom, zero(T), one(T)) : zero(T)
-        phase[i] = angle(Sfg[i])
-    end
+    nb = _resolve_nb(num_bins, ms)
+    k_bins = Vector{T}(undef, nb)
+    coherence² = Vector{T}(undef, nb)
+    phase = Vector{T}(undef, nb)
+    coherence_spectrum!(coherence², phase, k_bins, ks_phys, cf, cg)
     return k_bins, coherence², phase
 end
 

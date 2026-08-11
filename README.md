@@ -20,7 +20,7 @@ Instead of writing custom FFT grid shifting, scaling, non-uniform coordinate map
   the sphere. Works for any number of field components (scalar, or 1-/2-/3-component vector flows).
 - **Structured & scattered grids**: uniform/rectilinear grids, and non-uniform / scattered / random
   point clouds (e.g. masked by a coastline) — recovered correctly via non-uniform transforms.
-- **Zero-dependency baseline**: works out-of-the-box via direct-sum (`DirectSumBackend`) with no heavy
+- **Zero-dependency baseline**: works out-of-the-box via direct-sum (`DirectSumSpectralBackend`) with no heavy
   C/C++ libraries; load `FFTW` / `FINUFFT` / `FastSphericalHarmonics` / `NUFSHT` to activate the fast
   `O(N log N)` transforms.
 - **Two orthogonal backend axes**: a `transform=` axis (the spectral math above) and an
@@ -68,10 +68,10 @@ By default, the package runs slow-path direct sums (DFT/SHT, ``O(N \cdot M)`` co
 
 | Grid Type | Coordinate System | Required Library | Backend Type | Description |
 |---|---|---|---|---|
-| **Structured** | Cartesian (ND) | `using FFTW` | `FFTBackend()` | Fast Fourier Transform via FFTW |
-| **Scattered** | Cartesian (ND) | `using FINUFFT` | `NUFFTBackend()` | Non-uniform Fast Fourier Transform |
-| **Structured** | Spherical (2D) | `using FastSphericalHarmonics` | `SHTBackend()` | Fast SHT on Clenshaw-Curtis grids |
-| **Scattered** | Spherical (2D) | `using NUFSHT` | `NUFSHTBackend()` | Non-uniform Fast SHT |
+| **Structured** | Cartesian (ND) | `using FFTW` | `FFTSpectralBackend()` | Fast Fourier Transform via FFTW |
+| **Scattered** | Cartesian (ND) | `using FINUFFT` | `FINUFFTBackend()` | Non-uniform Fast Fourier Transform |
+| **Structured** | Spherical (2D) | `using FastSphericalHarmonics` | `FSHTSpectralBackend()` | Fast SHT on Clenshaw-Curtis grids |
+| **Scattered** | Spherical (2D) | `using NUFSHT` | `NUFSHTSpectralBackend()` | Non-uniform Fast SHT |
 | **Any** | Visualization | `using CairoMakie` | (Plotting Functions) | Enclosing plotting extension |
 
 ---
@@ -82,22 +82,27 @@ Below is a complete example showing how to compute and plot the 1D isotropic ene
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW                          # activates the FFTBackend extension
+using FFTW: FFTW                          # activates the FFT extension
 using CairoMakie: CairoMakie as Mke       # activates the plotting extension
+using SpectralBackends: SpectralBackends as SB     # transform tags
+using FlowGeometries: FlowGeometries as FG         # grid / geometry types
 
-# 1. A uniform Cartesian grid — defined by its axes (no per-point coordinate arrays).
+# 1. A uniform Cartesian grid — a FlowGeometries StructuredGrid over a CartesianGeometry, marked
+#    periodic (the Fourier domain). Defined by its axes; no per-point coordinate arrays.
 L = 10.0
 N = 64
-grid = FFS.UniformCartesianGrid(; domain = (L, L), n = (N, N))
-xs, ys = grid.axes
+xs = range(0.0, L; length = N + 1)[1:N]
+ys = range(0.0, L; length = N + 1)[1:N]
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
+    periodic = (true, true), period = (L, L))
 
 # 2. Fields are plain N-D tensors on the grid — here two velocity components (u, v).
 u = [cos(2π * 2 * x / L) + 0.5 * sin(2π * 5 * y / L) for x in xs, y in ys]   # (N, N)
 v = [sin(2π * 2 * x / L) for x in xs, y in ys]
 
 # 3. Spectral coefficients via FFTW. Passing (u, v) stacks them on a trailing component axis,
-#    so `coeffs` is (N, N, 2). The coordinate system is the grid type — no coordinate guessing.
-coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
+#    so `coeffs` is (N, N, 2). The grid's architecture × geometry is the coordinate system.
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 
 # 4. 1D isotropic energy spectrum, folding the 2 components (dim 3) into the kinetic energy.
 k_bins, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 32, dims = 3)
@@ -107,10 +112,13 @@ fig = FFS.plot_spectrum(ks, coeffs; title = "2D Spectral Energy")
 Mke.save("energy_spectrum.png", fig)
 ```
 
-Construct the grid that matches your data — `UniformCartesianGrid`, `ScatteredCartesianGrid`
-(NUFFT), `StructuredSphericalGrid` (SHT), or `ScatteredSphericalGrid` (NUFSHT) — and dispatch is
-exact. For repeated transforms on a fixed grid (e.g. each level/time of an `(x,y,z,t)` field),
-build a plan once with `plan_spectrum` and reuse it via `calculate_spectrum!`.
+Construct the grid that matches your data with [FlowGeometries](https://github.com/jbphyswx/FlowGeometries.jl) —
+a `StructuredGrid`/`UnstructuredGrid` over a `CartesianGeometry` (uniform → FFT, scattered → NUFFT) or a
+`SphericalGeometry` (structured → SHT, scattered → NUFSHT) — and dispatch is exact. Transform tags come
+from [SpectralBackends](https://github.com/jbphyswx/SpectralBackends.jl) and execution backends from
+[ComputationalBackends](https://github.com/jbphyswx/ComputationalBackends.jl). For repeated transforms on
+a fixed grid (e.g. each level/time of an `(x,y,z,t)` field), build a plan once with `plan_spectrum` and
+reuse it via `calculate_spectrum!`.
 
 ---
 
@@ -187,7 +195,7 @@ capability has a runnable, rendered [example in the docs](https://jbphyswx.githu
 See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/) for the full surface.
 
 ### Spectral calculation
-- `calculate_spectrum(grid, field, ms; transform=DirectSumBackend(), execution=AutoBackend(), kwargs...)`: complex coefficients + physical wavenumber grids. `field` is an N-D `AbstractArray` shaped `(spatial…, batch…)` — the grid fixes the leading spatial dims, every trailing dim is a preserved batch axis (components/levels/time/ensemble); a `Tuple` of equal-shaped arrays stacks them on a new trailing axis. The two backend axes are orthogonal and compose (`transform` = which spectral math; `execution` = serial/threaded/GPU/distributed/MPI).
+- `calculate_spectrum(grid, field, ms; transform=SB.DirectSumSpectralBackend(), execution=CB.AutoBackend(), kwargs...)`: complex coefficients + physical wavenumber grids. `field` is an N-D `AbstractArray` shaped `(spatial…, batch…)` — the grid fixes the leading spatial dims, every trailing dim is a preserved batch axis (components/levels/time/ensemble); a `Tuple` of equal-shaped arrays stacks them on a new trailing axis. The two backend axes are orthogonal and compose — `transform` (a `SpectralBackends` tag: which spectral math) × `execution` (a `ComputationalBackends` backend: serial/threaded/GPU/distributed/MPI).
 - `calculate_spectrum!(coeffs, plan, field)` / `plan_spectrum(grid, T, ms; transform, execution, batch=())`: reusable plans over a trailing batch shape for allocation-free, copy-free (real FFT) repeated transforms.
 - `synthesize(grid, coeffs, ms)`: inverse transform (spectral filtering, round-trip).
 

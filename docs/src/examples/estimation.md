@@ -35,12 +35,13 @@ the spectra of the tapered signal yields a low-variance estimate. The taper spec
 realization axis and reuse the [Welch averaging](cross_spectra.md) path.
 
 ```julia
-using FFTW: FFTW                          # activates the FFTBackend extension
+using FFTW: FFTW                          # activates the FFT extension
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 Nx = 256
 L = 2π
-dx = L / Nx
-x = range(0.0, stop = L - dx, length = Nx)
+x = range(0.0, L; length = Nx + 1)[1:Nx]
 freq = [0:(Nx ÷ 2 - 1); -(Nx ÷ 2):-1]
 bg = real(FFTW.ifft(FFTW.fft(randn(Nx)) .* [k == 0 ? 0.0 : abs(k)^(-1.0) for k in freq]))
 k0 = 20
@@ -48,11 +49,11 @@ sig = @. 0.25 * cos(k0 * x) + bg            # tone at k₀ on a k⁻² (red-nois
 
 K = 6
 V = FFS.dpss(Nx, 4.0, K)                    # N×K taper matrix (NW = 4)
-grid = FFS.UniformCartesianGrid((collect(x),); domain_size = (L,))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x; periodic = (true,), period = (L,))
 C = zeros(ComplexF64, Nx, K)
 for k in 1:K
-    c, ks1 = FFS.calculate_spectrum(grid, (V[:, k] .* sig,), (Nx,); transform = FFS.FFTBackend())
-    C[:, k] .= c[:, 1]
+    c, ks1 = FFS.calculate_spectrum(grid, V[:, k] .* sig, (Nx,); transform = SB.FFTSpectralBackend())
+    C[:, k] .= c
     global ks = ks1
 end
 kb, Emt = FFS.welch_power_spectrum(ks, C; num_bins = 48)

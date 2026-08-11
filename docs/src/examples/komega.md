@@ -10,28 +10,27 @@ the `ω = k` diagonal (phase speed `c = ω₀/k₀`); a mode with a different ph
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW                          # activates the FFTBackend extension
+using FFTW: FFTW                          # activates the FFT extension
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 Random.seed!(0)
 
 Nx, Nt = 64, 64
 Lx, Lt = 2π, 2π
-dx, dt = Lx / Nx, Lt / Nt
-x = range(0.0, stop = Lx - dx, length = Nx)
-t = range(0.0, stop = Lt - dt, length = Nt)
+x = range(0.0, Lx; length = Nx + 1)[1:Nx]
+t = range(0.0, Lt; length = Nt + 1)[1:Nt]
 
 k0, ω0 = 6.0, 6.0                          # phase speed c = ω0/k0 = 1  → on the ω = k line
-xv = vec([xi for xi in x, _ in t])
-tv = vec([ti for _ in x, ti in t])
-wave = @. cos(k0 * xv + ω0 * tv)
-background = @. 0.4 * cos(2 * xv + 1.0 * tv + 0.5)   # slower, c = 0.5 → off the line
-f = wave .+ background
+# f(x, t) as an (Nx, Nt) tensor: a wave on the ω = k line plus a slower off-line background.
+f = [cos(k0 * xi + ω0 * ti) + 0.4 * cos(2 * xi + 1.0 * ti + 0.5) for xi in x, ti in t]
 
 # dim 1 = space (→ k), dim 2 = time (→ ω)
-grid = FFS.UniformCartesianGrid((xv, tv); domain_size = (Lx, Lt))
-coeffs, ks = FFS.calculate_spectrum(grid, (f,), (Nx, Nt); transform = FFS.FFTBackend())
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x, t;
+    periodic = (true, true), period = (Lx, Lt))
+coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nt); transform = SB.FFTSpectralBackend())
 kx, kω = ks
-Ekω = abs2.(coeffs[:, :, 1])
+Ekω = abs2.(coeffs)
 ```
 
 ![Wavenumber–frequency spectrum E(k, ω) with the dominant peak on the ω = k dispersion line](../assets/komega.png)

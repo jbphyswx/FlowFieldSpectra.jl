@@ -2,26 +2,28 @@ module FlowFieldSpectraDistributedExt
 
 using Distributed: Distributed
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using ComputationalBackends: ComputationalBackends
+using SpectralBackends: SpectralBackends
+using FlowGeometries: FlowGeometries
 
 # =============================================================================
 # DistributedBackend execution, tensor-native. Point-partitionable transforms (DirectSum / NUFFT /
-# NUFSHT-projection) on a SCATTERED grid split the point axis (dim 1) and sum α_w-weighted partial
-# COEFFICIENTS (complex coeffs are additive over a disjoint point partition; |coeff|² is not). Every
-# other case (FFT / SHT, or NUFSHT solve which couples all points) splits the trailing BATCH axis into
-# disjoint slices and gathers. Each worker runs the inner LOCAL backend, so distribution composes with
-# Serial/Threaded/GPU. `pmap`-into-a-typed-buffer (not `@distributed (+)`, which infers `Any`).
+# NUFSHT-projection) on a SCATTERED (unstructured) grid split the point axis (dim 1) and sum α_w-weighted
+# partial COEFFICIENTS (complex coeffs are additive over a disjoint point partition; |coeff|² is not).
+# Every other case (FFT / SHT, or NUFSHT solve which couples all points) splits the trailing BATCH axis
+# into disjoint slices and gathers. Each worker runs the inner LOCAL backend, so distribution composes
+# with Serial/Threaded/GPU. `pmap`-into-a-typed-buffer (not `@distributed (+)`, which infers `Any`).
 # =============================================================================
 
-_is_scattered(::FFS.ScatteredCartesianGrid) = true
-_is_scattered(::FFS.ScatteredSphericalGrid) = true
-_is_scattered(::FFS.AbstractGrid) = false
+_is_scattered(::FlowGeometries.Grids.AbstractUnstructuredGrid) = true
+_is_scattered(::FlowGeometries.Grids.AbstractGrid) = false
 
 # Round-robin point chunks (balanced across the domain); contiguous batch chunks.
 _index_chunks(N::Integer, nw::Integer) = [collect(w:max(1, nw):N) for w in 1:max(1, nw)]
 _batch_chunks(B::Integer, nw::Integer) = [(((w - 1) * B) ÷ nw + 1):((w * B) ÷ nw) for w in 1:nw]
 
 # ---- point-partition: Σ_w α_w · coeff_w ----
-function _distributed_pointsum(inner, transform, g::FFS.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
+function _distributed_pointsum(inner, transform, g::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
     Nglob = size(field, 1)
     nw = max(1, Distributed.nworkers())
     chunks = _index_chunks(Nglob, nw)
@@ -40,8 +42,8 @@ function _distributed_pointsum(inner, transform, g::FFS.AbstractGrid, field::Abs
 end
 
 # ---- batch-partition: disjoint batch slices, gathered along the (flattened) batch axis ----
-function _distributed_batch(inner, transform, g::FFS.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
-    ns = FFS.ndims_spatial(g)
+function _distributed_batch(inner, transform, g::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
+    ns = ndims(g)
     sp = ntuple(d -> size(field, d), ns)
     batch = ntuple(i -> size(field, ns + i), ndims(field) - ns)
     B = prod(batch; init = 1)
@@ -63,10 +65,10 @@ function _distributed_batch(inner, transform, g::FFS.AbstractGrid, field::Abstra
     return coeffs, FFS._partition_ks(g, ms)
 end
 
-function FFS._calculate_spectrum_distributed(transform, exec::FFS.DistributedBackend,
-        g::FFS.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
-    inner = FFS.Types.local_backend(exec)
-    if transform isa FFS.NUFSHTBackend && get(kwargs, :solve, false)
+function FFS._calculate_spectrum_distributed(transform, exec::ComputationalBackends.AbstractDistributedBackend,
+        g::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
+    inner = ComputationalBackends.local_backend(exec)
+    if transform isa SpectralBackends.AbstractNUFSHTSpectralBackend && get(kwargs, :solve, false)
         return _distributed_batch(inner, transform, g, field, ms; kwargs...)   # CG couples all points
     end
     return (FFS._partitionable(transform) && _is_scattered(g)) ?

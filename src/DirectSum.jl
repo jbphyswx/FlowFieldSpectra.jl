@@ -1,17 +1,16 @@
 module DirectSum
 
-using ..Grids: UniformCartesianGrid, NonuniformCartesianGrid,
-    ScatteredCartesianGrid, AbstractSphericalGrid, StructuredSphericalGrid, ScatteredSphericalGrid,
-    physical_wavenumbers
+using FlowGeometries: FlowGeometries
+using ..Grids: Grids
 using ..SphericalKernels: SphericalKernels
 
 export sph_mode_index
 
 # The direct-sum (DFT / SHT-projection) reference transform. Dependency-free, `O(∏ms · Npts · ∏batch)`
 # — correct for any grid, never FFT-competitive by design. It reads a field tensor `(spatial…, batch…)`
-# and writes coefficients `(spectral…, batch…)`; the batch is the innermost, contiguous loop. Tensor
-# grids read coordinates through their 1-D axes (`axes[d][I[d]]`) — NO per-point coordinate blob is
-# materialized; scattered grids read their per-point vectors (`coords[d][j]`).
+# and writes coefficients `(spectral…, batch…)`; the batch is the innermost, contiguous loop. Structured
+# grids read coordinates through their 1-D axes (`coordinates(g)[d][I[d]]`) — NO per-point coordinate
+# blob is materialized; unstructured grids read their per-node vectors (`coordinates(g, d)[j]`).
 
 """
     sph_mode_index(l, m) -> CartesianIndex
@@ -37,21 +36,21 @@ end
 # Cartesian forward (analysis):  C[k, b] = (1/Npts) Σ_p f[p, b] · exp(-iflag · i · k·x_p)
 # =============================================================================
 
-# Tensor-product grid (uniform or nonuniform): spatial point `P` is a CartesianIndex over the axis
-# lengths; its coordinate along `d` is `axes[d][P[d]]` (no materialization).
+# Structured tensor-product grid (uniform or nonuniform): spatial point `P` is a CartesianIndex over the
+# axis lengths; its coordinate along `d` is `coordinates(g)[d][P[d]]` (no materialization).
 function _calculate_spectrum_cartesian_direct!(
     coeffs::AbstractArray{Complex{FT}},
-    g::Union{UniformCartesianGrid{FT, D}, NonuniformCartesianGrid{FT, D}},
+    g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
     field::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
 ) where {FT, D}
-    axes = g.axes
-    ss = map(length, axes)
+    axes = FlowGeometries.Grids.coordinates(g)
+    ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(coeffs) ÷ M
-    ks = physical_wavenumbers(g.domain_size, ms, FT)
+    ks = Grids.physical_wavenumbers(g, ms)
     fill!(coeffs, zero(Complex{FT}))
     spat = CartesianIndices(ss)
     # Linear indexing (no `reshape`): the (spatial, batch) split is column-major, so mode `mi` of batch
@@ -70,19 +69,19 @@ function _calculate_spectrum_cartesian_direct!(
     return ks
 end
 
-# Scattered point cloud: spatial point `j` reads `coords[d][j]`.
+# Unstructured point cloud: spatial point `j` reads `coordinates(g, d)[j]`.
 function _calculate_spectrum_cartesian_direct!(
     coeffs::AbstractArray{Complex{FT}},
-    g::ScatteredCartesianGrid{FT, D},
+    g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
     field::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
 ) where {FT, D}
-    coords = g.coords
+    coords = FlowGeometries.Grids.coordinates(g)
     N = length(coords[1])
     M = prod(ms)
     B = length(coeffs) ÷ M
-    ks = physical_wavenumbers(g.domain_size, ms, FT)
+    ks = Grids.physical_wavenumbers(g, ms)
     fill!(coeffs, zero(Complex{FT}))
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
         for j in 1:N
@@ -103,17 +102,17 @@ end
 
 function _synthesize_cartesian_direct!(
     out::AbstractArray{Complex{FT}},
-    g::Union{UniformCartesianGrid{FT, D}, NonuniformCartesianGrid{FT, D}},
+    g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
     coeffs::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
 ) where {FT, D}
-    axes = g.axes
-    ss = map(length, axes)
+    axes = FlowGeometries.Grids.coordinates(g)
+    ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(out) ÷ Npts
-    ks = physical_wavenumbers(g.domain_size, ms, FT)
+    ks = Grids.physical_wavenumbers(g, ms)
     fill!(out, zero(Complex{FT}))
     spat = CartesianIndices(ss)
     @inbounds for (pj, P) in enumerate(spat)
@@ -130,16 +129,16 @@ end
 
 function _synthesize_cartesian_direct!(
     out::AbstractArray{Complex{FT}},
-    g::ScatteredCartesianGrid{FT, D},
+    g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
     coeffs::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
 ) where {FT, D}
-    coords = g.coords
+    coords = FlowGeometries.Grids.coordinates(g)
     N = length(coords[1])
     M = prod(ms)
     B = length(out) ÷ N
-    ks = physical_wavenumbers(g.domain_size, ms, FT)
+    ks = Grids.physical_wavenumbers(g, ms)
     fill!(out, zero(Complex{FT}))
     @inbounds for j in 1:N
         for (mi, I) in enumerate(CartesianIndices(ms))
@@ -155,38 +154,38 @@ end
 
 # =============================================================================
 # Spherical forward / inverse (SHT projection / synthesis).
-# Spherical grids are small (N = Nθ·Nφ or the scattered count), so per-point (θ, φ, weight) lists are
-# materialized once — this is NOT the ∏N_d Cartesian blob, just a modest point list.
+# Spherical grids are small (N = nlon·nlat or the scattered count), so per-point (θ, φ, weight) lists
+# are materialized once — this is NOT the ∏N_d Cartesian blob, just a modest point list. θ/φ come from
+# the FlowGeometries adapter's convention bridge (θ = colatitude, φ = longitude).
 # =============================================================================
 
-# Per-point (θ, φ, weight) lists, in the SAME column-major order as a reshaped field:
-#   structured (Nθ, Nφ): point p = iθ + (iφ-1)·Nθ, weight w_θ[iθ]·(2π/Nφ) or uniform 4π/N;
-#   scattered:           point k, weight weights[k] or uniform 4π/N.
-function _sph_point_data(g::StructuredSphericalGrid{FT}) where {FT}
-    Nθ = length(g.θ)
-    Nφ = length(g.φ)
-    N = Nθ * Nφ
-    θpt = Vector{FT}(undef, N)
-    φpt = Vector{FT}(undef, N)
+# Structured `(nlon, nlat)` grid: point p = iλ + (jφ-1)·nlon (longitude fastest, matching the field
+# layout), weight w_lat[jφ]·(2π/nlon) when a quadrature `sampling`/`weights` is supplied, else uniform.
+function _sph_point_data(
+    g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+    ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
+    θpt, φpt = Grids._sph_points(g)
+    nlon = length(FlowGeometries.Grids.coordinates(g, 1))
+    nlat = length(FlowGeometries.Grids.coordinates(g, 2))
+    N = nlon * nlat
+    wlat = Grids._sht_weights(g, nlat; sampling = sampling, weights = weights)
+    dλ = FT(2π) / nlon
     wpt = Vector{FT}(undef, N)
-    dφ = FT(2π) / Nφ
-    @inbounds for iφ in 1:Nφ, iθ in 1:Nθ
-        p = iθ + (iφ - 1) * Nθ
-        θpt[p] = FT(g.θ[iθ])
-        φpt[p] = FT(g.φ[iφ])
-        wpt[p] = g.weights === nothing ? FT(4π) / N : FT(g.weights[iθ]) * dφ
+    @inbounds for p in 1:N
+        jφ = ((p - 1) ÷ nlon) + 1
+        wpt[p] = wlat === nothing ? FT(4π) / N : FT(wlat[jφ]) * dλ
     end
-    return θpt, φpt, wpt
+    return FT.(θpt), FT.(φpt), wpt
 end
 
-function _sph_point_data(g::ScatteredSphericalGrid{FT}) where {FT}
-    θ = g.coords[1]
-    φ = g.coords[2]
-    N = length(θ)
-    θpt = FT.(θ)
-    φpt = FT.(φ)
-    wpt = g.weights === nothing ? fill(FT(4π) / N, N) : FT.(g.weights)
-    return θpt, φpt, wpt
+# Scattered points: per-node (θ, φ); uniform weight unless an explicit per-node `weights` is supplied.
+function _sph_point_data(
+    g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+    ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
+    θpt, φpt = Grids._sph_points(g)
+    N = length(θpt)
+    wpt = weights === nothing ? fill(FT(4π) / N, N) : FT.(weights)
+    return FT.(θpt), FT.(φpt), wpt
 end
 
 # Real spherical harmonic value in the FastSphericalHarmonics convention (verified to match
@@ -203,11 +202,11 @@ end
 
 function _calculate_spectrum_spherical_direct!(
     coeffs::AbstractArray{Complex{FT}},
-    g::AbstractSphericalGrid{FT},
+    g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
     field::AbstractArray,
-    lmax::Int,
+    lmax::Int; sampling = nothing, weights = nothing,
 ) where {FT}
-    θpt, φpt, wpt = _sph_point_data(g)
+    θpt, φpt, wpt = _sph_point_data(g, FT; sampling = sampling, weights = weights)
     N = length(θpt)
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1
@@ -239,11 +238,11 @@ end
 
 function _synthesize_spherical_direct!(
     out::AbstractArray{Complex{FT}},
-    g::AbstractSphericalGrid{FT},
+    g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
     coeffs::AbstractArray,
     lmax::Int,
 ) where {FT}
-    θpt, φpt, _ = _sph_point_data(g)
+    θpt, φpt, _ = _sph_point_data(g, FT)
     N = length(θpt)
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1

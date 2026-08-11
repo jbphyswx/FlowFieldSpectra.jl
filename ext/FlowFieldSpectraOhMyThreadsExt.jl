@@ -2,6 +2,8 @@ module FlowFieldSpectraOhMyThreadsExt
 
 using OhMyThreads: OhMyThreads as OMT
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using ComputationalBackends: ComputationalBackends
+using FlowGeometries: FlowGeometries
 
 # =============================================================================
 # ThreadedBackend execution of the DirectSum transform (forward + inverse), tensor-native. Cartesian
@@ -10,16 +12,16 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 # Inverses parallelize over the independent output points. The batch is the inner contiguous loop.
 # =============================================================================
 
-# ---- Cartesian forward (tensor-product) ----
-function FFS._directsum_cartesian!(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
-        g::Union{FFS.UniformCartesianGrid{FT, D}, FFS.NonuniformCartesianGrid{FT, D}},
+# ---- Cartesian forward (structured tensor-product) ----
+function FFS._directsum_cartesian!(::ComputationalBackends.AbstractThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
-    axes = g.axes
-    ss = map(length, axes)
+    axes = FlowGeometries.Grids.coordinates(g)
+    ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(coeffs) ÷ M
-    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    ks = FFS.Grids.physical_wavenumbers(g, ms)
     F = reshape(field, Npts, B)
     C = reshape(coeffs, M, B)
     fill!(C, zero(Complex{FT}))
@@ -44,14 +46,15 @@ function FFS._directsum_cartesian!(::FFS.ThreadedBackend, coeffs::AbstractArray{
     return ks
 end
 
-# ---- Cartesian forward (scattered) ----
-function FFS._directsum_cartesian!(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
-        g::FFS.ScatteredCartesianGrid{FT, D}, field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
-    coords = g.coords
+# ---- Cartesian forward (unstructured / scattered) ----
+function FFS._directsum_cartesian!(::ComputationalBackends.AbstractThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    coords = FlowGeometries.Grids.coordinates(g)
     N = length(coords[1])
     M = prod(ms)
     B = length(coeffs) ÷ M
-    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    ks = FFS.Grids.physical_wavenumbers(g, ms)
     F = reshape(field, N, B)
     C = reshape(coeffs, M, B)
     fill!(C, zero(Complex{FT}))
@@ -76,9 +79,10 @@ function FFS._directsum_cartesian!(::FFS.ThreadedBackend, coeffs::AbstractArray{
 end
 
 # ---- Spherical forward (point chunks + per-task accumulators) ----
-function FFS._directsum_spherical!(::FFS.ThreadedBackend, coeffs::AbstractArray{Complex{FT}},
-        g::FFS.AbstractSphericalGrid{FT}, field::AbstractArray, lmax::Int) where {FT}
-    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g)
+function FFS._directsum_spherical!(::ComputationalBackends.AbstractThreadedBackend, coeffs::AbstractArray{Complex{FT}},
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry}, field::AbstractArray, lmax::Int;
+        sampling = nothing, weights = nothing) where {FT}
+    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g, FT; sampling = sampling, weights = weights)
     N = length(θpt)
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1
@@ -119,15 +123,15 @@ function FFS._directsum_spherical!(::FFS.ThreadedBackend, coeffs::AbstractArray{
 end
 
 # ---- Cartesian inverse (parallel over independent output points) ----
-function FFS._synthesize_cartesian!(::FFS.ThreadedBackend, out::AbstractArray{Complex{FT}},
-        g::Union{FFS.UniformCartesianGrid{FT, D}, FFS.NonuniformCartesianGrid{FT, D}},
+function FFS._synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{Complex{FT}},
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
-    axes = g.axes
-    ss = map(length, axes)
+    axes = FlowGeometries.Grids.coordinates(g)
+    ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(out) ÷ Npts
-    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    ks = FFS.Grids.physical_wavenumbers(g, ms)
     O = reshape(out, Npts, B)
     C = reshape(coeffs, M, B)
     fill!(O, zero(Complex{FT}))
@@ -151,13 +155,14 @@ function FFS._synthesize_cartesian!(::FFS.ThreadedBackend, out::AbstractArray{Co
     return out
 end
 
-function FFS._synthesize_cartesian!(::FFS.ThreadedBackend, out::AbstractArray{Complex{FT}},
-        g::FFS.ScatteredCartesianGrid{FT, D}, coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
-    coords = g.coords
+function FFS._synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{Complex{FT}},
+        g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+    coords = FlowGeometries.Grids.coordinates(g)
     N = length(coords[1])
     M = prod(ms)
     B = length(out) ÷ N
-    ks = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    ks = FFS.Grids.physical_wavenumbers(g, ms)
     O = reshape(out, N, B)
     C = reshape(coeffs, M, B)
     fill!(O, zero(Complex{FT}))
@@ -180,9 +185,9 @@ function FFS._synthesize_cartesian!(::FFS.ThreadedBackend, out::AbstractArray{Co
 end
 
 # ---- Spherical inverse (parallel over independent output points, per-task Legendre buffer) ----
-function FFS._synthesize_spherical!(::FFS.ThreadedBackend, out::AbstractArray{Complex{FT}},
-        g::FFS.AbstractSphericalGrid{FT}, coeffs::AbstractArray, lmax::Int) where {FT}
-    θpt, φpt, _ = FFS.DirectSum._sph_point_data(g)
+function FFS._synthesize_spherical!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{Complex{FT}},
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry}, coeffs::AbstractArray, lmax::Int) where {FT}
+    θpt, φpt, _ = FFS.DirectSum._sph_point_data(g, FT)
     N = length(θpt)
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1

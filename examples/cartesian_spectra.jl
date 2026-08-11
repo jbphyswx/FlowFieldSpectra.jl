@@ -1,17 +1,22 @@
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW           # activates the FFTBackend extension
-using FINUFFT: FINUFFT     # activates the NUFFTBackend extension
+using FFTW: FFTW           # activates the FFT extension
+using FINUFFT: FINUFFT     # activates the NUFFT extension
 using CairoMakie: CairoMakie as Mke
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 function run_cartesian_example()
     println("--- Running Cartesian Grid Spectra Example ---")
 
-    # 1. Uniform Cartesian grid — defined by its axes (ranges), fields are plain (Nx, Ny) tensors.
+    # 1. Uniform Cartesian grid — a FlowGeometries StructuredGrid over a CartesianGeometry, defined by
+    #    its axes (ranges) and marked periodic (the Fourier domain). Fields are plain (Nx, Ny) tensors.
     L = 2π
     N = 64
-    grid = FFS.UniformCartesianGrid(; domain = (L, L), n = (N, N))
-    xs, ys = grid.axes
+    xs = range(0.0, L; length = N + 1)[1:N]
+    ys = range(0.0, L; length = N + 1)[1:N]
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
+        periodic = (true, true), period = (L, L))
 
     # Taylor–Green vortex velocity field (u, v) as tensors — no flattening.
     u = [cos(2x) * sin(2y) for x in xs, y in ys]
@@ -19,7 +24,7 @@ function run_cartesian_example()
 
     # 2. FFT spectrum. Pass (u, v) — a new trailing component axis; coeffs are (N, N, 2).
     println("Computing uniform Cartesian spectrum via FFTW...")
-    c_fft, k_fft = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
+    c_fft, k_fft = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
     # Kinetic-energy isotropic spectrum: fold the component axis (dim 3) into the energy.
     k_bins, E_k = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 32, dims = 3)
 
@@ -33,8 +38,9 @@ function run_cartesian_example()
     yj = yv .+ (rand(N^2) .- 0.5) .* (0.2 * dx)
     us = @. cos(2 * xj) * sin(2 * yj)
     vs = @. -sin(2 * xj) * cos(2 * yj)
-    gscat = FFS.ScatteredCartesianGrid((xj, yj); domain_size = (L, L))
-    c_nu, k_nu = FFS.calculate_spectrum(gscat, (us, vs), (N, N); transform = FFS.NUFFTBackend())
+    gscat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xj, yj), ones(N^2);
+        periodic = (true, true), period = (L, L))
+    c_nu, k_nu = FFS.calculate_spectrum(gscat, (us, vs), (N, N); transform = FFS.FINUFFTBackend())
     k_bins_s, E_k_s = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 32, dims = 3)
 
     # 4. Figure.

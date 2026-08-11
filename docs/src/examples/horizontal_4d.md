@@ -8,38 +8,39 @@ per-level / per-time spectra of large geophysical datasets.
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FINUFFT: FINUFFT                    # activates the NUFFTBackend extension
+using FINUFFT: FINUFFT                    # activates the NUFFT extension
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 Random.seed!(42)
 
 L = 2π
 N = 48
 nz, nt = 3, 4
 ms = (N, N)
+npts = N * N
 
-# Fixed non-uniform horizontal locations.
-xv = rand(N * N) .* L
-yv = rand(N * N) .* L
-hgrid = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
+# Fixed non-uniform horizontal locations — an unstructured Cartesian grid.
+xv = rand(npts) .* L
+yv = rand(npts) .* L
+hgrid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(npts);
+    periodic = (true, true), period = (L, L))
 
-# f(x,y,z,t): dominant horizontal scale sharpens with height z and drifts in time t.
-nb = nz * nt
-stack = Array{Float64}(undef, length(xv), nb)
-kz = range(2, 6; length = nz)
-for (it, t) in enumerate(range(0, 1; length = nt)), (iz, k0) in enumerate(kz)
-    b = (it - 1) * nz + iz
-    @. stack[:, b] = cos(k0 * xv + 2π * t) + 0.5 * sin((k0 + 1) * yv)
+# f(x, y, z, t) as a real (Npts, nz, nt) tensor — the (z, t) batch is the trailing axes.
+f = Array{Float64}(undef, npts, nz, nt)
+kz = range(2, 6; length = nz)             # dominant horizontal wavenumber per level
+ts = range(0, 1; length = nt)
+for (it, t) in enumerate(ts), (iz, k0) in enumerate(kz)
+    @. f[:, iz, it] = cos(k0 * xv + 2π * t) + 0.5 * sin((k0 + 1) * yv)
 end
 
-# ONE plan build; transform the entire z·t stack in a single exec.
-plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.NUFFTBackend(), n_transf = nb, eps = 1e-9)
-coeffs = zeros(ComplexF64, ms..., nb)
-ks = FFS.calculate_spectrum!(coeffs, plan, stack)
+# ONE plan build for the fixed points; transform the whole (z, t) batch in a single exec.
+plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
+coeffs = zeros(ComplexF64, ms..., nz, nt)     # (N, N, nz, nt)
+ks = FFS.calculate_spectrum!(coeffs, plan, f)
 
-# E(k) per level at the first time step.
+# ONE batch-preserving reduction → E(k, z, t); average over time → E(k, z).
 nbins = 18
-for iz in 1:nz
-    slice = reshape(view(coeffs, :, :, iz), ms..., 1)
-    kb, Ek = FFS.isotropic_spectrum(ks, slice; num_bins = nbins)
-end
+kbins, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = nbins)   # (nbins, nz, nt)
+Ekz = dropdims(sum(E; dims = 3); dims = 3) ./ nt                  # (nbins, nz)
 ```

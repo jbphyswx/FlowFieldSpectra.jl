@@ -9,6 +9,9 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using Random: Random
+using ComputationalBackends: ComputationalBackends as CB
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 comm = MPI.COMM_WORLD
 rank = MPI.Comm_rank(comm)
@@ -20,20 +23,22 @@ N = 200
 xv = rand(N) .* L
 yv = rand(N) .* L
 f = rand(N, 2)
-sc = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
-ug = FFS.UniformCartesianGrid(; domain = (L, L), n = ms)
-xs, ys = ug.axes
+cart = FG.Geometry.CartesianGeometry{Float64}()
+sc = FG.Grids.UnstructuredGrid(cart, (xv, yv), ones(N); periodic = (true, true), period = (L, L))
+xs = range(0.0, L; length = 17)[1:16]
+ys = range(0.0, L; length = 17)[1:16]
+ug = FG.Grids.StructuredGrid(cart, xs, ys; periodic = (true, true), period = (L, L))
 u = [cos(2x) + 0.5 * sin(3y) for x in xs, y in ys]
 ub = cat(u, 2 .* u, 3 .* u, 4 .* u; dims = 3)
 
-cd, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.DirectSumBackend(), execution = FFS.MPIBackend())
-cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.NUFFTBackend(), execution = FFS.MPIBackend(), eps = 1e-12)
-cf, _ = FFS.calculate_spectrum(ug, ub, ms; transform = FFS.FFTBackend(), execution = FFS.MPIBackend())
+cd, _ = FFS.calculate_spectrum(sc, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.MPIBackend())
+cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.FINUFFTBackend(), execution = CB.MPIBackend(), eps = 1e-12)
+cf, _ = FFS.calculate_spectrum(ug, ub, ms; transform = SB.FFTSpectralBackend(), execution = CB.MPIBackend())
 
 if rank == 0
-    dref, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.DirectSumBackend(), execution = FFS.SerialBackend())
-    nref, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.NUFFTBackend(), execution = FFS.SerialBackend(), eps = 1e-12)
-    fref, _ = FFS.calculate_spectrum(ug, ub, ms; transform = FFS.FFTBackend(), execution = FFS.SerialBackend())
+    dref, _ = FFS.calculate_spectrum(sc, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    nref, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
+    fref, _ = FFS.calculate_spectrum(ug, ub, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
     ok = isapprox(cd, dref; rtol = 1e-10, atol = 1e-12) &&
          isapprox(cn, nref; rtol = 1e-9, atol = 1e-10) &&
          isapprox(cf, fref; atol = 1e-12)

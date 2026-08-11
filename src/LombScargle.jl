@@ -1,6 +1,6 @@
 module LombScargle
 
-export lomb_scargle
+export lomb_scargle, lomb_scargle!
 
 """
     lomb_scargle(t, y, freqs; center=true) -> Vector
@@ -25,10 +25,22 @@ no FFT. `freqs` must be positive (the `f=0` term is undefined).
 """
 function lomb_scargle(t::AbstractVector{T}, y::AbstractVector{T}, freqs::AbstractVector;
         center::Bool = true) where {T<:AbstractFloat}
+    P = Vector{T}(undef, length(freqs))
+    return lomb_scargle!(P, t, y, freqs; center = center)
+end
+
+"""
+    lomb_scargle!(P, t, y, freqs; center=true) -> P
+
+In-place [`lomb_scargle`](@ref): writes the periodogram into preallocated `P` (length `length(freqs)`).
+Allocation-free — reuse `P` across many series that share `freqs`.
+"""
+function lomb_scargle!(P::AbstractVector{T}, t::AbstractVector{T}, y::AbstractVector{T},
+        freqs::AbstractVector; center::Bool = true) where {T<:AbstractFloat}
     N = length(t)
     length(y) == N || throw(DimensionMismatch("t and y must have equal length"))
+    length(P) == length(freqs) || throw(DimensionMismatch("P and freqs must have equal length"))
     ȳ = center ? sum(y) / N : zero(T)
-    P = Vector{T}(undef, length(freqs))
 
     @inbounds for (i, f) in enumerate(freqs)
         f > 0 || throw(ArgumentError("frequencies must be strictly positive (got $f)"))

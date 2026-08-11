@@ -6,15 +6,14 @@ energy-density map, and the various 1D reductions. The figures are rendered by t
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW                          # activates the FFTBackend extension
+using FFTW: FFTW                          # activates the FFT extension
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 L = 2π
 N = 64
-dx = L / N
-xs = range(0.0, stop = L - dx, length = N)
-xv = vec([x for x in xs, y in xs])
-yv = vec([y for x in xs, y in xs])
+xs = range(0.0, L; length = N + 1)[1:N]
 
 # Synthetic turbulence: a broadband streamfunction ψ, then u = ∂ψ/∂y, v = -∂ψ/∂x (spectral
 # derivatives), so the velocity is incompressible with an E(k) ∝ k⁻⁵ᐟ³ cascade.
@@ -25,17 +24,20 @@ for j in 1:N, i in 1:N
     k = hypot(freq[i], freq[j])
     ψ̂[i, j] *= k == 0 ? 0.0 : k^(-(11 / 3 + 1) / 2)
 end
-u = vec(real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N])))
-v = vec(real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N])))
+u = real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N]))    # (N, N) field tensors
+v = real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N]))
 
-grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
+# A uniform periodic Cartesian grid (FlowGeometries) defined by its axes; fields are (N, N) tensors.
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
+    periodic = (true, true), period = (L, L))
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 ```
 
 ## Isotropic (radial) energy spectrum
 
 ```julia
-k_bins_iso, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 32)
+# Kinetic energy: fold the component axis (dim 3) into the radial spectrum.
+k_bins_iso, E_k = FFS.isotropic_spectrum(ks, coeffs; num_bins = 32, dims = 3)
 rng = 2:findlast(<=(0.6 * maximum(k_bins_iso)), k_bins_iso)   # resolved inertial range
 ```
 
@@ -62,8 +64,8 @@ for j in 1:N, i in 1:N
     kk = hypot(3.5 * freq[i], freq[j] / 3.5)           # anisotropic weighting
     ĝ[i, j] *= kk == 0 ? 0.0 : kk^(-(0.6 + 1) / 2)
 end
-g = vec(real(FFTW.ifft(ĝ)))
-cg, _ = FFS.calculate_spectrum(grid, (g,), (N, N); transform = FFS.FFTBackend())
+g = real(FFTW.ifft(ĝ))                                 # (N, N) scalar field
+cg, _ = FFS.calculate_spectrum(grid, g, (N, N); transform = SB.FFTSpectralBackend())
 k_bins, θ_bins, Ekθ = FFS.anisotropic_spectrum(ks, cg; num_k_bins = 24, num_θ_bins = 28)
 ```
 
@@ -93,5 +95,5 @@ cfilt = copy(coeffs)
 for c in axes(cfilt, 3)
     @views cfilt[:, :, c] .*= mask
 end
-u_lp = FFS.synthesize(grid, cfilt, (N, N))[1]
+u_lp = FFS.synthesize(grid, cfilt, (N, N))[:, :, 1]   # low-passed u-component field
 ```

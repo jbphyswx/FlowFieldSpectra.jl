@@ -6,6 +6,8 @@ module FlowFieldSpectraKernelAbstractionsExt
 # stays module-qualified via `KA.`.
 using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using ComputationalBackends: ComputationalBackends
+using FlowGeometries: FlowGeometries
 
 # =============================================================================
 # GPUBackend execution of the DirectSum transform on ANY KernelAbstractions device (incl. `KA.CPU()`
@@ -21,7 +23,17 @@ function _to_host(dev::AbstractArray{T}) where {T}
     return host
 end
 
-_on_backend(a, backend::KA.Backend) = (try KA.get_backend(a) == backend catch; false end)
+# Is `a` resident on `backend`? `KA.get_backend` throws a MethodError for an array type it does not
+# know (e.g. a plain host array under some setups); catch ONLY that and report "not on this backend" —
+# never swallow an InterruptException/OutOfMemoryError or a genuine bug.
+function _on_backend(a, backend::KA.Backend)
+    try
+        return KA.get_backend(a) == backend
+    catch err
+        err isa MethodError || rethrow()
+        return false
+    end
+end
 
 # Stage a host vector as a length-N device array of element type FT (identity if already resident).
 function _dev_vec(backend::KA.Backend, v, ::Type{FT}) where {FT}
@@ -50,18 +62,23 @@ end
     end
 end
 
+_batch_shape(g::FlowGeometries.Grids.AbstractGrid, field) =
+    ntuple(i -> size(field, ndims(g) + i), ndims(field) - ndims(g))
+
 # =============================================================================
 # Cartesian direct sum
 # =============================================================================
 
-function FFS._gpu_directsum_cartesian(exec::FFS.GPUBackend, g::FFS.AbstractCartesianGrid{FT, D},
-        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBackend,
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {D}
+    FT = eltype(g)
     backend = exec.backend
-    ss = FFS.spatial_size(g)
+    ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(field) ÷ Npts
-    ks_cpu = FFS.Grids.physical_wavenumbers(g.domain_size, ms, FT)
+    ks_cpu = FFS.Grids.physical_wavenumbers(g, ms)
     ksd = ntuple(d -> _dev_vec(backend, collect(ks_cpu[d]), FT), D)
     fieldd = _dev_field(backend, field, Npts, B, FT)
     coeffs_dev = KA.zeros(backend, Complex{FT}, M, B)
@@ -71,25 +88,22 @@ function FFS._gpu_directsum_cartesian(exec::FFS.GPUBackend, g::FFS.AbstractCarte
     return reshape(_to_host(coeffs_dev), ms..., _batch_shape(g, field)...), ks_cpu
 end
 
-_batch_shape(g::FFS.AbstractCartesianGrid, field) =
-    ntuple(i -> size(field, FFS.ndims_spatial(g) + i), ndims(field) - FFS.ndims_spatial(g))
-
-# Tensor grid: stage the D axes and decode point coordinates on device.
-function _launch_cartesian!(coeffs_dev, backend, g::Union{FFS.UniformCartesianGrid, FFS.NonuniformCartesianGrid},
+# Structured (tensor-product) grid: stage the D axes and decode point coordinates on device.
+function _launch_cartesian!(coeffs_dev, backend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         fieldd, ksd, ss::NTuple{D, Int}, ms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
     FT = real(eltype(coeffs_dev))
-    axesd = ntuple(d -> _dev_vec(backend, collect(g.axes[d]), FT), D)
+    axesd = ntuple(d -> _dev_vec(backend, collect(FlowGeometries.Grids.coordinates(g, d)), FT), D)
     kernel! = _cart_tensor_kernel!(backend)
     kernel!(coeffs_dev, fieldd, axesd, ksd, ss, ms, Npts, M, B, D, iflag; ndrange = M)
     return coeffs_dev
 end
 
-# Scattered grid: stage the D per-point coordinate vectors. `ss` (= (N,)) is unused here — the
-# ambient dimension D comes from `ms`, not from `spatial_size` (which is the single point axis).
-function _launch_cartesian!(coeffs_dev, backend, g::FFS.ScatteredCartesianGrid,
+# Unstructured (scattered) grid: stage the D per-point coordinate vectors. `ss` (= (N,)) is unused
+# here — the ambient dimension D comes from `ms`, not from `size` (which is the single point axis).
+function _launch_cartesian!(coeffs_dev, backend, g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         fieldd, ksd, ss, ms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
     FT = real(eltype(coeffs_dev))
-    coordsd = ntuple(d -> _dev_vec(backend, collect(g.coords[d]), FT), D)
+    coordsd = ntuple(d -> _dev_vec(backend, collect(FlowGeometries.Grids.coordinates(g, d)), FT), D)
     kernel! = _cart_scattered_kernel!(backend)
     kernel!(coeffs_dev, fieldd, coordsd, ksd, ms, Npts, M, B, D, iflag; ndrange = M)
     return coeffs_dev
@@ -138,10 +152,12 @@ end
 # Spherical direct sum — one thread per (row, col) coefficient slot (owns it across batch, no atomics)
 # =============================================================================
 
-function FFS._gpu_directsum_spherical(exec::FFS.GPUBackend, g::FFS.AbstractSphericalGrid{FT},
-        field::AbstractArray, lmax::Int) where {FT}
+function FFS._gpu_directsum_spherical(exec::ComputationalBackends.AbstractGPUBackend,
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+        field::AbstractArray, lmax::Int; sampling = nothing, weights = nothing)
+    FT = eltype(g)
     backend = exec.backend
-    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g)
+    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g, FT; sampling = sampling, weights = weights)
     N = length(θpt)
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1
@@ -154,7 +170,7 @@ function FFS._gpu_directsum_spherical(exec::FFS.GPUBackend, g::FFS.AbstractSpher
     kernel! = _spherical_kernel!(backend)
     kernel!(coeffs_dev, θd, φd, fieldd, wd, lmax, N, B; ndrange = Nθc * Nφc)
     KA.synchronize(backend)
-    nsp = FFS.ndims_spatial(g)                                  # structured: 2 (Nθ,Nφ); scattered: 1 (N)
+    nsp = ndims(g)                                             # structured: 2 (nlon,nlat); scattered: 1 (N)
     batch = ntuple(i -> size(field, nsp + i), ndims(field) - nsp)
     return reshape(_to_host(coeffs_dev), Nθc, Nφc, batch...), (0:lmax, -lmax:lmax)
 end

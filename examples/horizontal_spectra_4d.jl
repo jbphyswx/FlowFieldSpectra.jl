@@ -1,7 +1,9 @@
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FINUFFT: FINUFFT     # activates the NUFFTBackend extension
+using FINUFFT: FINUFFT     # activates the NUFFT extension
 using CairoMakie: CairoMakie as Mke
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 """
     run_horizontal_spectra_4d_example()
@@ -25,7 +27,8 @@ function run_horizontal_spectra_4d_example()
     # Fixed non-uniform horizontal sample locations.
     xv = rand(npts) .* L
     yv = rand(npts) .* L
-    hgrid = FFS.ScatteredCartesianGrid((xv, yv); domain_size = (L, L))
+    hgrid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(npts);
+        periodic = (true, true), period = (L, L))
 
     # f(x, y, z, t) as a real (Npts, nz, nt) tensor — the (z, t) batch is the trailing axes.
     f = Array{Float64}(undef, npts, nz, nt)
@@ -36,7 +39,7 @@ function run_horizontal_spectra_4d_example()
     end
 
     # Build the plan ONCE for the fixed points; transform the whole (z, t) batch in one exec.
-    plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.NUFFTBackend(), batch = (nz, nt), eps = 1e-9)
+    plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
     coeffs = zeros(ComplexF64, ms..., nz, nt)         # (N, N, nz, nt)
     ks = FFS.calculate_spectrum!(coeffs, plan, f)
 

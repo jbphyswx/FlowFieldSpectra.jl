@@ -1,22 +1,29 @@
-module FlowFieldSpectraCUFINUFFTExt
+module FlowFieldSpectracuFINUFFTExt
 
 using FINUFFT: FINUFFT
 using CUDA: CUDA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using ComputationalBackends: ComputationalBackends
+using SpectralBackends: SpectralBackends
+using FlowGeometries: FlowGeometries
 
 # =============================================================================
-# Fast GPU NUFFT for scattered Cartesian grids: NUFFTBackend × GPUBackend{<:CUDABackend}, tensor-native
-# + batched. cuFINUFFT (FINUFFT.jl's CUDA extension) with `ntrans = ∏batch`; nonuniform points fixed by
-# the grid ⇒ `cufinufft_makeplan` + `cufinufft_setpts!` once, `cufinufft_exec!` per call reusing device
-# buffers. Same centered mode order (modeord=0) as the CPU FINUFFT path, so the translation-correction
-# phase is identical. CUDA-only (no portable GPU NUFFT); a non-CUDA device hits the core error stub.
-# Validated only on real NVIDIA hardware via `gpu/`, never on CI.
+# Fast GPU NUFFT for Cartesian grids: NUFFTSpectralBackend × GPUBackend{<:CUDABackend}, tensor-native
+# + batched. cuFINUFFT (FINUFFT.jl's CUDA extension) with `ntrans = ∏batch`; a scattered (unstructured)
+# grid uses the guru plan directly, a nonuniform tensor-product (structured) grid the separable per-axis
+# 1-D path (bottom). Nonuniform points fixed by the grid ⇒ `cufinufft_makeplan` + `cufinufft_setpts!`
+# once, `cufinufft_exec!` per call reusing device buffers. Same centered mode order (modeord=0) as the
+# CPU FINUFFT path. CUDA-only; a non-CUDA device hits the core error stub. Validated only on real NVIDIA
+# hardware via `gpu/`, never on CI. Point scaling / wavenumbers use the grid's periodic length.
 # =============================================================================
 
 _default_eps(::Type{T}) where {T} = T === Float32 ? 1.0e-6 : 1.0e-8
 
-mutable struct CUFINUFFTCartesianPlan{T, D, NM, CJ, FK, PH, KS} <: FFS.AbstractSpectralPlan
-    guru::Any                            # cuFINUFFT guru plan (C resource)
+# Immutable: the C `guru` resource is freed by a finalizer attached to the guru handle itself
+# (cuFINUFFT's `cufinufft_plan` is a mutable object) rather than to this wrapper. `cj`/`fk` are reused
+# device buffers whose contents are mutated in place — never reassigned.
+struct CUFINUFFTCartesianPlan{T, D, NM, G, CJ, FK, PH, KS} <: FFS.AbstractSpectralPlan
+    guru::G                              # cuFINUFFT guru plan (C resource; self-finalizing, see _gpu_nufft_plan).
     cj::CJ                               # device (M, ntrans) strengths buffer
     fk::FK                               # device (ms…, ntrans) modes buffer
     ms::NTuple{D, Int}
@@ -26,7 +33,7 @@ mutable struct CUFINUFFTCartesianPlan{T, D, NM, CJ, FK, PH, KS} <: FFS.AbstractS
     ks_phys::KS
 end
 
-function _gpu_nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_size::NTuple{D},
+function _gpu_nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTuple{D},
         ntrans::Int, iflag::Int, eps::Real) where {T, D}
     CUDA.functional() || throw(ArgumentError("cuFINUFFT requires a functional CUDA device."))
     M = length(coords[1])
@@ -34,7 +41,7 @@ function _gpu_nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_si
         length(coords[d]) == M || throw(DimensionMismatch("coordinate $d length mismatch"))
     end
     offsets = ntuple(d -> T(minimum(coords[d])), D)
-    ranges = ntuple(d -> (r = T(domain_size[d]); r == 0 ? one(T) : r), D)
+    ranges = ntuple(d -> (r = T(Ls[d]); r == 0 ? one(T) : r), D)
     scaled = ntuple(d -> CUDA.CuArray(T(2π) .* (T.(collect(coords[d])) .- offsets[d]) ./ ranges[d]), D)
 
     guru = FINUFFT.cufinufft_makeplan(1, collect(ms), -iflag, ntrans, T(eps); dtype = T)
@@ -48,6 +55,7 @@ function _gpu_nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_si
         FINUFFT.cufinufft_destroy!(guru)
         throw(ArgumentError("cuFINUFFT supports up to 3 dimensions; got $D"))
     end
+    finalizer(FINUFFT.cufinufft_destroy!, guru)   # free the C plan when the guru (held by the returned plan) is GC'd
 
     k_ints = ntuple(d -> collect(-(ms[d] ÷ 2):((ms[d] - 1) ÷ 2)), D)
     inv_M = one(T) / M
@@ -64,10 +72,9 @@ function _gpu_nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, domain_si
     ks_phys = FFS.Grids.physical_wavenumbers(ranges, ms, T)
     cj = CUDA.zeros(Complex{T}, M, ntrans)
     fk = CUDA.zeros(Complex{T}, ms..., ntrans)
-    plan = CUFINUFFTCartesianPlan{T, D, D + 1, typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys)}(
+    plan = CUFINUFFTCartesianPlan{T, D, D + 1, typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys)}(
         guru, cj, fk, ms, ntrans, M, phase, ks_phys,
     )
-    finalizer(p -> FINUFFT.cufinufft_destroy!(p.guru), plan)
     return plan
 end
 
@@ -90,46 +97,52 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::CUFINU
     return plan.ks_phys
 end
 
-function FFS.plan_spectrum(::FFS.NUFFTBackend, ::FFS.GPUBackend{<:CUDA.CUDABackend},
-        g::FFS.ScatteredCartesianGrid, ::Type{T}, ms::NTuple{D, Int};
+function FFS.plan_spectrum(::FFS.FINUFFTBackend, ::ComputationalBackends.GPUBackend{<:CUDA.CUDABackend},
+        g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, ::Type{T}, ms::NTuple{D, Int};
         batch::Tuple = (), iflag::Int = 1, eps::Real = _default_eps(T)) where {T, D}
-    return _gpu_nufft_plan(T, g.coords, ms, g.domain_size, prod(batch; init = 1), iflag, eps)
+    coords = FlowGeometries.Grids.coordinates(g)
+    Ls = ntuple(d -> T(FlowGeometries.Grids.period(g, d)), D)
+    return _gpu_nufft_plan(T, coords, ms, Ls, prod(batch; init = 1), iflag, eps)
 end
 
-function FFS._calculate_spectrum_gpu_nufft(::FFS.GPUBackend{<:CUDA.CUDABackend},
-        g::FFS.ScatteredCartesianGrid, field::AbstractArray, ms::Tuple;
-        iflag::Int = 1, eps::Union{Nothing, Real} = nothing, kwargs...)
+# One-shot — scattered (unstructured) Cartesian grid → guru cuFINUFFT.
+function FFS._calculate_spectrum_gpu_nufft(::FFS.FINUFFTBackend, ::ComputationalBackends.GPUBackend{<:CUDA.CUDABackend},
+        g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        field::AbstractArray, ms::Tuple; iflag::Int = 1, eps::Union{Nothing, Real} = nothing, kwargs...)
     D = length(ms)
-    T = float(real(eltype(g.coords[1])))
+    coords = FlowGeometries.Grids.coordinates(g)
+    T = float(real(eltype(g)))
+    Ls = ntuple(d -> T(FlowGeometries.Grids.period(g, d)), D)
     batch = ntuple(i -> size(field, 1 + i), ndims(field) - 1)
     epsv = eps === nothing ? _default_eps(T) : eps
-    plan = _gpu_nufft_plan(T, g.coords, NTuple{D, Int}(ms), g.domain_size, prod(batch; init = 1), iflag, epsv)
+    plan = _gpu_nufft_plan(T, coords, NTuple{D, Int}(ms), Ls, prod(batch; init = 1), iflag, epsv)
     coeffs_dev = CUDA.zeros(Complex{T}, ms..., batch...)
     ks = FFS.calculate_spectrum!(coeffs_dev, plan, field)
     return Array(coeffs_dev), ks
 end
 
 # =============================================================================
-# Separable GPU NUFFT for a nonuniform tensor-product grid (NonuniformCartesianGrid): the D-dim kernel
+# Separable GPU NUFFT for a nonuniform tensor-product (structured) Cartesian grid: the D-dim kernel
 # factorizes, so it is a sequence of 1-D cuFINUFFT type-1 transforms — one per axis — with every other
 # spatial + batch dim carried as the `ntrans` batch. Device-side analog of the CPU separable path
 # (FINUFFTExt._nufft_axis); each 1-D transform needs only its own length-N_d axis (no ∏N_d coords).
 # Because every transform is 1-D, this supports any D. CUDA-only; validated only on `gpu/`, never CI.
 # =============================================================================
-function FFS._calculate_spectrum_gpu_nufft(::FFS.GPUBackend{<:CUDA.CUDABackend},
-        g::FFS.NonuniformCartesianGrid{FT0, D}, field::AbstractArray, ms::Tuple;
-        iflag::Int = 1, eps::Union{Nothing, Real} = nothing, kwargs...) where {FT0, D}
+function FFS._calculate_spectrum_gpu_nufft(::FFS.FINUFFTBackend, ::ComputationalBackends.GPUBackend{<:CUDA.CUDABackend},
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        field::AbstractArray, ms::Tuple; iflag::Int = 1, eps::Union{Nothing, Real} = nothing, kwargs...)
     CUDA.functional() || throw(ArgumentError("cuFINUFFT requires a functional CUDA device."))
+    D = ndims(g)
     T = float(real(eltype(field)))
     epsv = T(eps === nothing ? _default_eps(T) : eps)
-    npts = prod(ntuple(d -> length(g.axes[d]), D))
+    npts = length(g)
     A = CUDA.CuArray{Complex{T}}(undef, size(field)...)
     copyto!(A, field)                                            # host/device → device, widen real→complex
     for d in 1:D
-        A = _gpu_nufft_axis(A, d, g.axes[d], Int(ms[d]), T(g.domain_size[d]), iflag, epsv)
+        A = _gpu_nufft_axis(A, d, FlowGeometries.Grids.coordinates(g, d), Int(ms[d]), T(FlowGeometries.Grids.period(g, d)), iflag, epsv)
     end
     A ./= npts
-    ks = FFS.Grids.physical_wavenumbers(ntuple(d -> T(g.domain_size[d]), D), NTuple{D, Int}(ms), T)
+    ks = FFS.Grids.physical_wavenumbers(g, NTuple{D, Int}(ms))
     return Array(A), ks
 end
 
@@ -161,4 +174,4 @@ function _gpu_nufft_axis(A::CUDA.CuArray{Complex{T}}, d::Int, axis::AbstractVect
     return permutedims(Fr, invperm(collect(perm)))               # restore dim order; dim d now length m
 end
 
-end # module FlowFieldSpectraCUFINUFFTExt
+end # module FlowFieldSpectracuFINUFFTExt

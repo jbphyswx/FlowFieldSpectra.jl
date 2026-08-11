@@ -9,8 +9,11 @@ projects = ["test", "docs", "examples", "gpu", "benchmark"]
 
 
 [deps]
+ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
+FlowGeometries = "0ccd6995-f618-4175-b01e-f437d0cb4974"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
+SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
 
 [weakdeps]
 AbstractFFTs = "621f4979-c628-5d54-868e-fcf4e3e8185c"
@@ -22,11 +25,12 @@ FINUFFT = "d8beea63-0952-562e-9c6a-8e8ef7364055"
 FastSphericalHarmonics = "d335c211-7587-445e-a753-f0b1fb7e445f"
 KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 MPI = "da04e1cc-30fd-572f-bb4f-1f8673147195"
+NonuniformFFTs = "cd96f58b-6017-4a02-bb9e-f4d81626177f"
 NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [extensions]
-FlowFieldSpectraCUFINUFFTExt = ["CUDA", "FINUFFT"]
+FlowFieldSpectracuFINUFFTExt = ["CUDA", "FINUFFT"]
 FlowFieldSpectraGPUFFTExt = ["KernelAbstractions", "AbstractFFTs"]
 FlowFieldSpectraCairoMakieExt = "CairoMakie"
 FlowFieldSpectraDistributedExt = "Distributed"
@@ -35,6 +39,7 @@ FlowFieldSpectraFINUFFTExt = "FINUFFT"
 FlowFieldSpectraFastSphericalHarmonicsExt = "FastSphericalHarmonics"
 FlowFieldSpectraKernelAbstractionsExt = "KernelAbstractions"
 FlowFieldSpectraMPIExt = "MPI"
+FlowFieldSpectraNonuniformFFTsExt = "NonuniformFFTs"
 FlowFieldSpectraNUFSHTExt = "NUFSHT"
 FlowFieldSpectraNUFSHTKernelAbstractionsExt = ["NUFSHT", "KernelAbstractions"]
 FlowFieldSpectraOhMyThreadsExt = "OhMyThreads"
@@ -51,23 +56,27 @@ test = ["NUFSHT", "Test"]
 AbstractFFTs = "1"
 CUDA = "5, 6"
 CairoMakie = "0.15"
+ComputationalBackends = "0.1"
 Distributed = "1.11"
 FFTW = "1"
 FINUFFT = "3"
 FastSphericalHarmonics = "1"
+FlowGeometries = "0.1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1.10"
 MPI = "0.20"
+NonuniformFFTs = "0.9.6"
 NUFSHT = "0.1"
 OhMyThreads = "0.8"
 PrecompileTools = "1.2, 1.3"
+SpectralBackends = "0.1"
 Test = "1"
-# Floor is 1.11 because the package uses Project.toml `[sources]` and `[workspace]` (both added in
-# Julia 1.11) to pull in the as-yet-unregistered NUFSHT.jl. Once NUFSHT (and friends) are in the
-# General registry this can drop back to 1.10 (possibly 1.9) — nothing in the source needs 1.11.
 julia = "1.11"
 
 
 
 [sources]
+ComputationalBackends = { url = "https://github.com/jbphyswx/ComputationalBackends.jl" }
+FlowGeometries = { url = "https://github.com/jbphyswx/FlowGeometries.jl" }
 NUFSHT = { url = "https://github.com/jbphyswx/NUFSHT.jl" }
+SpectralBackends = { url = "https://github.com/jbphyswx/SpectralBackends.jl" }

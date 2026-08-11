@@ -3,19 +3,22 @@ module FlowFieldSpectraFFTWExt
 using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra as LA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using ComputationalBackends: ComputationalBackends
+using SpectralBackends: SpectralBackends
+using FlowGeometries: FlowGeometries
 
 # =============================================================================
-# FFT for uniform Cartesian grids on the tensor-native model. The field is `(N_1,…,N_D, batch…)`;
-# FFTW transforms the spectral dims `1:D` and batches over the trailing dims natively. Real input
-# takes the `rfft` fast path — read DIRECTLY, no widen-copy into a Complex buffer — reconstructed to
-# the identical full centered complex spectrum. Buffers are owned by the plan, so steady-state
-# `calculate_spectrum!` allocates nothing and copies the input zero times.
+# FFT for uniform structured Cartesian grids on the tensor-native model. The field is
+# `(N_1,…,N_D, batch…)`; FFTW transforms the spectral dims `1:D` and batches over the trailing dims
+# natively. Real input takes the `rfft` fast path — read DIRECTLY, no widen-copy into a Complex buffer
+# — reconstructed to the identical full centered complex spectrum. Buffers are owned by the plan, so
+# steady-state `calculate_spectrum!` allocates nothing and copies the input zero times.
 #
-# FFT is a full transform, so `ms == spatial_size(grid)`.
+# FFT is a full transform, so `ms == size(grid)`. Physical wavenumbers use the grid's periodic length.
 # =============================================================================
 
-_exec_nthreads(::FFS.ThreadedBackend) = Threads.nthreads()
-_exec_nthreads(::FFS.AbstractExecutionBackend) = 1
+_exec_nthreads(::ComputationalBackends.AbstractThreadedBackend) = Threads.nthreads()
+_exec_nthreads(::ComputationalBackends.AbstractExecutionBackend) = 1
 
 # Real-input plan: rfft over dims 1:D (reads the real field directly), + full-spectrum reconstruction.
 struct RFFTPlan{RT, D, NT, P, HB, FB, KS} <: FFS.AbstractSpectralPlan
@@ -74,8 +77,9 @@ end
 _shifts(ns::NTuple{D, Int}, nbatch::Int) where {D} =
     ntuple(i -> i <= D ? div(ns[i], 2) : 0, D + nbatch)
 
-# Plan builders (dispatch on real vs complex element type).
-function _fftw_plan(::Type{T}, ns::NTuple{D, Int}, domain_size, batch::Tuple, nthreads::Int) where {T<:Real, D}
+# Plan builders (dispatch on real vs complex element type). `ks_phys` is taken from the grid's periodic
+# domain length via `FFS.Grids.physical_wavenumbers(g, ns)`.
+function _fftw_plan(::Type{T}, g, ns::NTuple{D, Int}, batch::Tuple, nthreads::Int) where {T<:Real, D}
     FFTW.set_num_threads(nthreads)
     sample = zeros(T, ns..., batch...)
     fwd = FFTW.plan_rfft(sample, 1:D)
@@ -83,20 +87,20 @@ function _fftw_plan(::Type{T}, ns::NTuple{D, Int}, domain_size, batch::Tuple, nt
     half = Array{Complex{T}}(undef, h1, ns[2:D]..., batch...)
     full = Array{Complex{T}}(undef, ns..., batch...)
     shifts = _shifts(ns, length(batch))
-    ks = FFS.Grids.physical_wavenumbers(ntuple(d -> T(domain_size[d]), D), ns, T)
+    ks = FFS.Grids.physical_wavenumbers(g, ns)
     return RFFTPlan{T, D, D + length(batch), typeof(fwd), typeof(half), typeof(full), typeof(ks)}(
         fwd, half, full, ns, shifts, one(T) / prod(ns), ks,
     )
 end
 
-function _fftw_plan(::Type{Complex{RT}}, ns::NTuple{D, Int}, domain_size, batch::Tuple,
+function _fftw_plan(::Type{Complex{RT}}, g, ns::NTuple{D, Int}, batch::Tuple,
         nthreads::Int; iflag::Int = 1) where {RT<:Real, D}
     FFTW.set_num_threads(nthreads)
     sample = zeros(Complex{RT}, ns..., batch...)
     fwd = iflag == 1 ? FFTW.plan_fft(sample, 1:D) : FFTW.plan_bfft(sample, 1:D)
     out = similar(sample)
     shifts = _shifts(ns, length(batch))
-    ks = FFS.Grids.physical_wavenumbers(ntuple(d -> RT(domain_size[d]), D), ns, RT)
+    ks = FFS.Grids.physical_wavenumbers(g, ns)
     return CFFTPlan{RT, D, D + length(batch), typeof(fwd), typeof(out), typeof(ks)}(
         fwd, out, ns, shifts, one(RT) / prod(ns), ks,
     )
@@ -128,10 +132,10 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::CFFTP
 end
 
 # Validate FFT applicability + split off the batch shape.
-@inline function _fft_setup(g::FFS.UniformCartesianGrid, field::AbstractArray, ms::Tuple)
-    ns = FFS.spatial_size(g)
+@inline function _fft_setup(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, field::AbstractArray, ms::Tuple)
+    ns = size(g)
     Tuple(ms) == ns || throw(ArgumentError(
-        "FFTBackend requires ms == spatial_size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform. " *
+        "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform. " *
         "Use NUFFT/DirectSum for a different mode count."))
     D = length(ns)
     ndims(field) >= D || throw(DimensionMismatch("field has $(ndims(field)) dims, grid needs $D spatial"))
@@ -139,25 +143,29 @@ end
     return ns, batch
 end
 
-function FFS.plan_spectrum(::FFS.FFTBackend, exec::FFS.AbstractExecutionBackend,
-        g::FFS.UniformCartesianGrid, ::Type{T}, ms::NTuple{D, Int};
+function FFS.plan_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec::ComputationalBackends.AbstractExecutionBackend,
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, ::Type{T}, ms::NTuple{D, Int};
         batch::Tuple = (), iflag::Int = 1) where {T, D}
-    ns = FFS.spatial_size(g)
-    Tuple(ms) == ns || throw(ArgumentError("FFTBackend requires ms == spatial_size(grid) = $ns (got $(Tuple(ms)))"))
+    FlowGeometries.Grids.isuniform(g) || throw(ArgumentError(
+        "FFTSpectralBackend needs a uniform axis in every direction; got a stretched axis. Use NUFFTSpectralBackend."))
+    ns = size(g)
+    Tuple(ms) == ns || throw(ArgumentError("FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms)))"))
     return T <: Real ?
-        _fftw_plan(T, ns, g.domain_size, batch, _exec_nthreads(exec)) :
-        _fftw_plan(T, ns, g.domain_size, batch, _exec_nthreads(exec); iflag = iflag)
+        _fftw_plan(T, g, ns, batch, _exec_nthreads(exec)) :
+        _fftw_plan(T, g, ns, batch, _exec_nthreads(exec); iflag = iflag)
 end
 
-# One-shot allocating entry (routed from the (transform, execution, grid) dispatch).
-function FFS._calculate_spectrum_fft(exec::FFS.AbstractExecutionBackend, g::FFS.UniformCartesianGrid,
+# One-shot allocating entry (routed from the (transform, execution, grid) dispatch; the hub already
+# checked `isuniform`).
+function FFS._calculate_spectrum_fft(exec::ComputationalBackends.AbstractExecutionBackend,
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::Tuple; iflag::Int = 1, kwargs...)
     ns, batch = _fft_setup(g, field, ms)
     T = eltype(field)
     RT = real(float(T))
     plan = T <: Real ?
-        _fftw_plan(float(T), ns, g.domain_size, batch, _exec_nthreads(exec)) :
-        _fftw_plan(Complex{RT}, ns, g.domain_size, batch, _exec_nthreads(exec); iflag = iflag)
+        _fftw_plan(float(T), g, ns, batch, _exec_nthreads(exec)) :
+        _fftw_plan(Complex{RT}, g, ns, batch, _exec_nthreads(exec); iflag = iflag)
     coeffs = Array{Complex{RT}}(undef, ns..., batch...)
     # If the field's float type differs from the plan's, convert once (rare; keeps the hot path exact).
     f = eltype(field) === (T <: Real ? float(T) : Complex{RT}) ? field : (T <: Real ? float.(field) : Complex{RT}.(field))

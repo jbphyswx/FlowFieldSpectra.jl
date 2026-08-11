@@ -8,15 +8,14 @@ flow with a Kolmogorov `k⁻⁵ᐟ³` energy cascade — for which the enstrophy
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW                          # activates the FFTBackend extension
+using FFTW: FFTW                          # activates the FFT extension
 using Random: Random
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 L = 2π
 N = 128
-dx = L / N
-xs = range(0.0, stop = L - dx, length = N)
-xv = vec([x for x in xs, y in xs])
-yv = vec([y for x in xs, y in xs])
+xs = range(0.0, L; length = N + 1)[1:N]
 
 # Synthetic incompressible turbulence: build a broadband streamfunction ψ, then derive the
 # velocity by spectral differentiation u = ∂ψ/∂y, v = -∂ψ/∂x (so ∇·u = 0 by construction).
@@ -28,19 +27,21 @@ for j in 1:N, i in 1:N
     k = hypot(freq[i], freq[j])
     ψ̂[i, j] *= k == 0 ? 0.0 : k^(-(11 / 3 + 1) / 2)
 end
-u = vec(real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N])))
-v = vec(real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N])))
+u = real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N]))    # (N, N) field tensors
+v = real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N]))
 
-grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = FFS.FFTBackend())
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
+    periodic = (true, true), period = (L, L))
+coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 
 # Spectral operators: divergence ≈ 0 (incompressible); vorticity → enstrophy spectrum.
 divc = FFS.spectral_divergence(ks, coeffs)
 vortc = FFS.spectral_vorticity(ks, coeffs)
 @show maximum(abs, divc)                   # ~machine epsilon: the field is divergence-free
 
-k, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = 40)
-_, Z = FFS.isotropic_spectrum(ks, vortc; num_bins = 40)
+# Fold the trailing component axis (dim 3) into each energy spectrum.
+k, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = 40, dims = 3)
+_, Z = FFS.isotropic_spectrum(ks, vortc; num_bins = 40, dims = 3)
 
 rng = 2:findlast(<=(0.6 * maximum(k)), k)  # resolved inertial range
 ```

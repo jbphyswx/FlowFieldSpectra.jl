@@ -5,23 +5,24 @@ documented here for contributors. They may change without notice.
 
 ## Execution-backend helpers
 
-Introspection helpers for the execution axis (used internally and by the distribution extensions;
-reachable as `FlowFieldSpectra.Types.<name>`).
-
-```@docs
-FlowFieldSpectra.Types.local_backend
-FlowFieldSpectra.Types.is_distributed
-FlowFieldSpectra.Types.resolve_backend
-```
+The execution-axis introspection helpers (`local_backend`, `is_distributed`, `resolve_backend`) are
+provided by [ComputationalBackends.jl](https://github.com/jbphyswx/ComputationalBackends.jl) and used
+internally and by the distribution extensions. The default `AutoBackend` is resolved locally through
+an internal `_resolve_execution` (Threaded when `OhMyThreads` is loaded and `Threads.nthreads() > 1`,
+else Serial), so precompilation never calls ComputationalBackends' `resolve_backend(::AutoBackend)`
+(which errors by design).
 
 ## Grids
 
+FlowFieldSpectra builds on FlowGeometries' grid/geometry types and reads them through FlowGeometries'
+own accessors; the only grid-related internals are the spectral wavenumber grid and the spherical
+`(θ, φ)` / quadrature-weight bridge (FlowGeometries stores `(λ, φ_lat)`; the transforms want
+`(θ = colatitude, φ = longitude)`).
+
 ```@docs
 FlowFieldSpectra.Grids.physical_wavenumbers
-FlowFieldSpectra.Grids.spatial_dims
-FlowFieldSpectra.Grids.ndims_spatial
-FlowFieldSpectra.Grids.spatial_size
-FlowFieldSpectra.Grids.npoints
+FlowFieldSpectra.Grids._sph_points
+FlowFieldSpectra.Grids._sht_weights
 ```
 
 ## Transform problem & layout
@@ -32,7 +33,6 @@ FlowFieldSpectra.Problem.batch_shape
 FlowFieldSpectra.Problem.n_batch
 FlowFieldSpectra.Problem.batch_length
 FlowFieldSpectra.Problem.coeff_output_size
-FlowFieldSpectra.Problem.coeff_eltype
 FlowFieldSpectra.Problem.stack_fields
 ```
 

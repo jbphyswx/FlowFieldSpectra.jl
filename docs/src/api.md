@@ -13,23 +13,16 @@ sph_mode_index
 
 ## Grids
 
-The coordinate system is the grid type — construct the grid that matches your data.
-
-```@docs
-AbstractGrid
-AbstractCartesianGrid
-AbstractSphericalGrid
-UniformCartesianGrid
-NonuniformCartesianGrid
-ScatteredCartesianGrid
-StructuredSphericalGrid
-ScatteredSphericalGrid
-gauss_legendre_sphere
-AbstractQuadrature
-ClenshawCurtis
-GaussLegendre
-Equiangular
-```
+The coordinate system is the grid type — construct the grid that matches your data. Grids come from
+[FlowGeometries.jl](https://github.com/jbphyswx/FlowGeometries.jl): a Cartesian grid is a
+`FG.Grids.StructuredGrid` / `FG.Grids.UnstructuredGrid` over a `FG.Geometry.CartesianGeometry`, and a
+spherical grid the same over a `FG.Geometry.SphericalGeometry`. Structured vs. scattered is the grid
+*architecture*, and uniform vs. non-uniform is the `FG.Grids.isuniform` value trait (an `AbstractRange`
+axis is uniform, a `Vector` is not) — there are no separate FlowFieldSpectra grid types. Spherical
+sampling schemes (`ClenshawCurtisSampling`, `GaussLegendreSampling`, `DriscollHealySampling`) live in
+`FG.SphericalSampling`; build a structured spherical grid with `FG.Connectivity.structured_grid`.
+FlowFieldSpectra reads every grid through FlowGeometries' own accessors (`size`, `ndims`, `length`,
+`coordinates`, `isuniform`, `period`, …). See the FlowGeometries documentation for construction.
 
 ## Reductions
 
@@ -95,28 +88,31 @@ TransformProblem
 
 ## Transform backends (which spectral math)
 
-The two backend axes are orthogonal and compose: pass one `transform=` and one `execution=`.
+The two backend axes are orthogonal and compose: pass one `transform=` and one `execution=`. See
+[Backends and Extensions](@ref) for the selection matrix and profiles.
+
+The `transform=` keyword takes a marker tag from
+[SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl):
+`DirectSumSpectralBackend` (the default), `FFTSpectralBackend`, `NUFFTSpectralBackend`,
+`FSHTSpectralBackend`, `NUFSHTSpectralBackend` (all `<: SpectralBackends.AbstractSpectralBackend`).
+Transform options such as `eps`, `tol`, `iflag`, and `solve` are `calculate_spectrum` keyword
+arguments.
+
+A NUFFT *provider* is a library choice, not spectral math, so FlowFieldSpectra owns two symmetric,
+concrete NUFFT backends (neither is a default; `SpectralBackends.NUFFTSpectralBackend` selects neither):
 
 ```@docs
-AbstractSpectralBackend
-DirectSumBackend
-FFTBackend
-NUFFTBackend
-SHTBackend
-NUFSHTBackend
+FlowFieldSpectra.FINUFFTBackend
+FlowFieldSpectra.NonuniformFFTsBackend
 ```
 
 ## Execution backends (where/how it runs)
 
-```@docs
-AbstractExecutionBackend
-SerialBackend
-ThreadedBackend
-GPUBackend
-DistributedBackend
-MPIBackend
-AutoBackend
-```
+The `execution=` keyword takes a tag from
+[ComputationalBackends.jl](https://github.com/jbphyswx/ComputationalBackends.jl):
+`SerialBackend`, `ThreadedBackend`, `GPUBackend`, `DistributedBackend`, `MPIBackend`, and
+`AutoBackend` (the default, resolved locally to `ThreadedBackend`/`SerialBackend`), all
+`<: ComputationalBackends.AbstractExecutionBackend`.
 
 ## Plotting & analysis
 

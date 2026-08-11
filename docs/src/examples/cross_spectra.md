@@ -6,21 +6,21 @@ correlated fields share a common large-scale mode plus independent small-scale s
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FFTW: FFTW                          # activates the FFTBackend extension
+using FFTW: FFTW                          # activates the FFT extension
+using SpectralBackends: SpectralBackends as SB
+using FlowGeometries: FlowGeometries as FG
 
 L = 2π
 N = 64
-dx = L / N
-xs = range(0.0, stop = L - dx, length = N)
-xv = vec([x for x in xs, y in xs])
-yv = vec([y for x in xs, y in xs])
+xs = range(0.0, L; length = N + 1)[1:N]
 
-u = @. cos(2xv) + 0.5 * sin(6yv)             # shared mode at k≈2, own structure at k≈6
-w = @. cos(2xv) - 0.4 * cos(9xv)             # shared mode at k≈2, own structure at k≈9
+u = [cos(2x) + 0.5 * sin(6y) for x in xs, y in xs]     # shared mode at k≈2, own structure at k≈6
+w = [cos(2x) - 0.4 * cos(9x) for x in xs, y in xs]     # shared mode at k≈2, own structure at k≈9
 
-grid = FFS.UniformCartesianGrid((xv, yv); domain_size = (L, L))
-cu, ks = FFS.calculate_spectrum(grid, (u,), (N, N); transform = FFS.FFTBackend())
-cw, _ = FFS.calculate_spectrum(grid, (w,), (N, N); transform = FFS.FFTBackend())
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
+    periodic = (true, true), period = (L, L))
+cu, ks = FFS.calculate_spectrum(grid, u, (N, N); transform = SB.FFTSpectralBackend())
+cw, _ = FFS.calculate_spectrum(grid, w, (N, N); transform = SB.FFTSpectralBackend())
 
 k, Co = FFS.cospectrum(ks, cu, cw; num_bins = 24)
 ```
@@ -51,12 +51,12 @@ Cf = zeros(ComplexF64, N, N, nreal)
 Cg = zeros(ComplexF64, N, N, nreal)
 for r in 1:nreal
     a = 1.0 + 0.1 * randn()                    # shared-mode amplitude jitter
-    fr = @. a * exp(im * 2 * xv) + 0.5 * exp(im * (5 * xv) + im * 2π * rand())
-    gr = @. a * exp(im * (2 * xv - ϕ)) + 0.5 * exp(im * (7 * yv) + im * 2π * rand())
-    cfr, _ = FFS.calculate_spectrum(grid, (fr,), (N, N); transform = FFS.FFTBackend())
-    cgr, _ = FFS.calculate_spectrum(grid, (gr,), (N, N); transform = FFS.FFTBackend())
-    Cf[:, :, r] .= cfr[:, :, 1]
-    Cg[:, :, r] .= cgr[:, :, 1]
+    fr = [a * exp(im * 2x) + 0.5 * exp(im * (5x) + im * 2π * rand()) for x in xs, y in xs]
+    gr = [a * exp(im * (2x - ϕ)) + 0.5 * exp(im * (7y) + im * 2π * rand()) for x in xs, y in xs]
+    cfr, _ = FFS.calculate_spectrum(grid, fr, (N, N); transform = SB.FFTSpectralBackend())
+    cgr, _ = FFS.calculate_spectrum(grid, gr, (N, N); transform = SB.FFTSpectralBackend())
+    Cf[:, :, r] .= cfr
+    Cg[:, :, r] .= cgr
 end
 
 kw, Ef = FFS.welch_power_spectrum(ks, Cf; num_bins = 24)

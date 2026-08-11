@@ -1,17 +1,18 @@
 module Problem
 
-using ..Grids: Grids, AbstractGrid, ndims_spatial, spatial_size
+using FlowGeometries: FlowGeometries
 
 export TransformProblem, spatial_shape, batch_shape, n_batch, batch_length,
-    coeff_output_size, coeff_eltype, stack_fields
+    coeff_output_size, stack_fields
 
 # =============================================================================
 # The shape contract, taken from the grid — never guessed.
 #
-# A field on `grid` is an AbstractArray shaped `(spatial…, batch…)`: the first `ndims_spatial(grid)`
-# dims are spatial (and must equal `spatial_size(grid)`), and EVERY trailing dim is a batch dim
-# (components / vertical levels / time / ensemble — any number), carried through the transform and
-# (by default) through the reductions. The coefficient array is `(spectral…, batch…)`.
+# A field on `grid` is an AbstractArray shaped `(spatial…, batch…)`: the first `ndims(grid)` dims are
+# spatial (and must equal `size(grid)`), and EVERY trailing dim is a batch dim (components / vertical
+# levels / time / ensemble — any number), carried through the transform and (by default) through the
+# reductions. The coefficient array is `(spectral…, batch…)`. `ndims`/`size` come from FlowGeometries:
+# `ndims(grid)` is `N` for a structured grid and `1` for an unstructured point cloud.
 # =============================================================================
 
 """
@@ -22,24 +23,24 @@ batch dims. Built from `(grid, field)` via [`TransformProblem`](@ref); drives bu
 coefficient output size.
 """
 struct TransformProblem{NS, B}
-    spatial::NTuple{NS, Int}      # == spatial_size(grid)
+    spatial::NTuple{NS, Int}      # == size(grid)
     batch::NTuple{B, Int}         # trailing batch sizes (possibly empty)
 end
 
 """
     TransformProblem(grid, field::AbstractArray) -> TransformProblem
 
-Validate `field` against `grid` and split its axes: the first `ndims_spatial(grid)` dims must equal
-`spatial_size(grid)`; the remainder are the batch shape.
+Validate `field` against `grid` and split its axes: the first `ndims(grid)` dims must equal
+`size(grid)`; the remainder are the batch shape.
 """
-@inline function TransformProblem(grid::AbstractGrid, field::AbstractArray{T, N}) where {T, N}
-    ss = spatial_size(grid)
-    ns = ndims_spatial(grid)
+@inline function TransformProblem(grid::FlowGeometries.Grids.AbstractGrid, field::AbstractArray{T, N}) where {T, N}
+    ss = size(grid)
+    ns = ndims(grid)
     N >= ns || throw(DimensionMismatch(
         "field has $N dims but grid $(nameof(typeof(grid))) needs at least $ns leading spatial dim(s) of size $ss"))
     @inbounds for d in 1:ns
         size(field, d) == ss[d] || throw(DimensionMismatch(
-            "field leading dim $d = $(size(field, d)) ≠ grid spatial size $(ss[d]) (spatial_size = $ss)"))
+            "field leading dim $d = $(size(field, d)) ≠ grid spatial size $(ss[d]) (size = $ss)"))
     end
     batch = ntuple(d -> size(field, ns + d), N - ns)
     return TransformProblem(ss, batch)
@@ -63,13 +64,6 @@ batch_length(p::TransformProblem) = prod(p.batch; init = 1)
 Shape of the coefficient array: `(spectral…, batch…)`.
 """
 coeff_output_size(spectral::Tuple, p::TransformProblem) = (spectral..., p.batch...)
-
-"""
-    coeff_eltype(grid) -> Type
-
-Complex coefficient element type for a grid (`Complex{FT}`).
-"""
-coeff_eltype(::AbstractGrid{FT}) where {FT} = Complex{FT}
 
 """
     stack_fields(fields::Tuple) -> AbstractArray

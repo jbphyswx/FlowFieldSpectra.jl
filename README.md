@@ -4,6 +4,7 @@
 
 [![Build Status](https://github.com/jbphyswx/FlowFieldSpectra.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/jbphyswx/FlowFieldSpectra.jl/actions/workflows/CI.yml)
 [![Dev Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/)
+[![Coverage](https://codecov.io/gh/jbphyswx/FlowFieldSpectra.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/jbphyswx/FlowFieldSpectra.jl)
 
 `FlowFieldSpectra.jl` simplifies computing spectral coefficients, energy spectra, and spatial reductions (such as isotropic radial integration or dimension transects) across multi-dimensional grids. It supports **Cartesian** and **Spherical** coordinates on both **structured/uniform** and **unstructured/scattered** grids.
 

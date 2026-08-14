@@ -22,7 +22,7 @@ _default_eps(::Type{T}) where {T} = T === Float32 ? 1.0e-6 : 1.0e-8
 # Immutable: the C `guru` resource is freed by a finalizer attached to the guru handle itself
 # (cuFINUFFT's `cufinufft_plan` is a mutable object) rather than to this wrapper. `cj`/`fk` are reused
 # device buffers whose contents are mutated in place — never reassigned.
-struct CUFINUFFTCartesianPlan{T, D, NM, G, CJ, FK, PH, KS} <: FFS.AbstractSpectralPlan
+struct cuFINUFFTCartesianPlan{T, D, NM, G, CJ, FK, PH, KS} <: FFS.AbstractSpectralPlan
     guru::G                              # cuFINUFFT guru plan (C resource; self-finalizing, see _gpu_nufft_plan).
     cj::CJ                               # device (M, ntrans) strengths buffer
     fk::FK                               # device (ms…, ntrans) modes buffer
@@ -72,19 +72,19 @@ function _gpu_nufft_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTupl
     ks_phys = FFS.Grids.physical_wavenumbers(ranges, ms, T)
     cj = CUDA.zeros(Complex{T}, M, ntrans)
     fk = CUDA.zeros(Complex{T}, ms..., ntrans)
-    plan = CUFINUFFTCartesianPlan{T, D, D + 1, typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys)}(
+    plan = cuFINUFFTCartesianPlan{T, D, D + 1, typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys)}(
         guru, cj, fk, ms, ntrans, M, phase, ks_phys,
     )
     return plan
 end
 
 """
-    calculate_spectrum!(coeffs, plan::CUFINUFFTCartesianPlan, field) -> ks_phys
+    calculate_spectrum!(coeffs, plan::cuFINUFFTCartesianPlan, field) -> ks_phys
 
 Execute a prebuilt cuFINUFFT guru plan in place on the GPU. `field` `(N, batch…)` fills the device
 strengths buffer; `coeffs` `(ms…, batch…)` (device or host) receives the phase-corrected modes.
 """
-function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::CUFINUFFTCartesianPlan{T, D},
+function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::cuFINUFFTCartesianPlan{T, D},
         field) where {T, D}
     copyto!(plan.cj, field)                                      # host/device → device, linear (widen)
     FINUFFT.cufinufft_exec!(plan.guru, plan.cj, plan.fk)

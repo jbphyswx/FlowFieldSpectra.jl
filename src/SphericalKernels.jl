@@ -10,13 +10,13 @@ functions ``\\bar P_\\ell^m`` up to degree `lmax`. Built once per transform via
 [`legendre_tables`](@ref); the per-point table is then filled in `O(lmax²)` with no `sqrt`
 calls by [`fill_legendre!`](@ref).
 """
-struct LegendreTables{FT}
+struct LegendreTables{FT, V<:AbstractVector{FT}, M<:AbstractMatrix{FT}}
     lmax::Int
     P00::FT            # \bar P_0^0 = 1/sqrt(4π)
-    c::Vector{FT}      # sectoral: \bar P_m^m = \bar P_{m-1}^{m-1} * c[m] * sinθ   (m = 1:lmax)
-    d::Vector{FT}      # first step: \bar P_{m+1}^m = x * d[m+1] * \bar P_m^m       (m = 0:lmax-1)
-    a::Matrix{FT}      # upward recurrence coefficient a[l+1, m+1]
-    b::Matrix{FT}      # upward recurrence coefficient b[l+1, m+1]
+    c::V               # sectoral: \bar P_m^m = \bar P_{m-1}^{m-1} * c[m] * sinθ   (m = 1:lmax)
+    d::V               # first step: \bar P_{m+1}^m = x * d[m+1] * \bar P_m^m       (m = 0:lmax-1)
+    a::M               # upward recurrence coefficient a[l+1, m+1]
+    b::M               # upward recurrence coefficient b[l+1, m+1]
 end
 
 """
@@ -41,7 +41,7 @@ function legendre_tables(::Type{FT}, lmax::Int) where {FT}
             b[l+1, m+1] = sqrt(FT(2l + 1) * FT((l - 1)^2 - m^2) / (FT(2l - 3) * FT(l^2 - m^2)))
         end
     end
-    return LegendreTables{FT}(lmax, one(FT) / sqrt(FT(4π)), c, d, a, b)
+    return LegendreTables(lmax, one(FT) / sqrt(FT(4π)), c, d, a, b)
 end
 
 """

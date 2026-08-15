@@ -107,7 +107,7 @@ struct NUFFTNonuniformRealPlan{T, D, P, CJ, FK, PH, MIR, US, GK, KS} <: FFS.Abst
     us_ovs::US                       # ref to plan.data.ûs[1] (oversampled spectrum; refilled each exec)
     novs::NTuple{D, Int}             # oversampled sizes Ñ (axis 1 is the full Ñ₁, not the rfft length)
     gk::GK                           # NTuple{D,Vector} kernel Fourier coefficients (deconvolution)
-    normfactor::Float64              # ∏ 2π/Ñ_d
+    normfactor::T                    # ∏ 2π/Ñ_d, in the plan's real precision T
     ks_phys::KS
 end
 
@@ -139,7 +139,7 @@ function _nu_plan(::Type{Tr}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTuple{D},
     us_ovs = plan.data.ûs[1]                                        # oversampled spectrum (refilled each exec)
     novs = ntuple(d -> d == 1 ? 2 * (size(us_ovs, 1) - 1) : size(us_ovs, d), D)   # Ñ (axis 1 is rfft → full)
     gk = ntuple(d -> NonuniformFFTs.fourier_coefficients(plan.kernels[d]), D)
-    normfactor = prod(2π / novs[d] for d in 1:D)
+    normfactor = prod(2 * Tr(π) / novs[d] for d in 1:D)
     return NUFFTNonuniformRealPlan{Tr, D, typeof(plan), typeof(cj), typeof(fk_half), typeof(phase), typeof(mir), typeof(us_ovs), typeof(gk), typeof(ks_phys)}(
         plan, cj, fk_half, ms, M, iflag, phase, mir, us_ovs, novs, gk, normfactor, ks_phys,
     )

@@ -193,6 +193,38 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(c_sol[FFS.sph_mode_index(2, 0)], 1.0, atol = 0.05)
     end
 
+    Test.@testset "NUFSHT reusable plan (scattered-spherical)" begin
+        Random.seed!(11)
+        lmax = 6; Nθ = lmax + 1; Nφ = 2 * lmax + 1; ms = (Nθ, Nφ)
+        N = 4 * Nθ^2
+        θ = rand(N) .* (0.8π) .+ 0.1π
+        φ = rand(N) .* 2π
+        g = sph_scat(θ, φ)
+        # Forward type-1: one plan matches the one-shot AND is reusable across many fields (no re-planning).
+        plan = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend())
+        cbuf = zeros(ComplexF64, Nθ, Nφ)
+        for _ in 1:3
+            f = randn(N)
+            cref, _ = FFS.calculate_spectrum(g, f, ms; transform = SB.NUFSHTSpectralBackend())
+            ks = FFS.calculate_spectrum!(cbuf, plan, f)
+            Test.@test isapprox(cbuf, cref; atol = 1e-12)
+            Test.@test ks == (0:lmax, -lmax:lmax)
+        end
+        # Batched (ntrans = B).
+        B = 3; fb = randn(N, B)
+        cb_ref, _ = FFS.calculate_spectrum(g, fb, ms; transform = SB.NUFSHTSpectralBackend())
+        planb = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), batch = (B,))
+        cb = zeros(ComplexF64, Nθ, Nφ, B); FFS.calculate_spectrum!(cb, planb, fb)
+        Test.@test isapprox(cb, cb_ref; atol = 1e-12)
+        # CG solve: reusable plan (persistent workspace) matches the one-shot solve.
+        C_true = zeros(Nθ, Nφ); C_true[FSH.sph_mode(2, 0)] = 1.0
+        p2 = NUFSHT.make_plan(Float64, θ, φ, lmax); fv = zeros(N); NUFSHT.nusht_type2!(fv, C_true, p2)
+        cs_ref, _ = FFS.calculate_spectrum(g, fv, ms; transform = SB.NUFSHTSpectralBackend(), solve = true, rtol = 1e-10, maxiter = 2000)
+        psolve = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), solve = true, rtol = 1e-10, maxiter = 2000)
+        cs = zeros(ComplexF64, Nθ, Nφ); FFS.calculate_spectrum!(cs, psolve, fv)
+        Test.@test isapprox(cs, cs_ref; atol = 1e-9)
+    end
+
     Test.@testset "Gauss-Legendre exact DirectSum + fast GPU SHT (KA.CPU)" begin
         lmax = 8; Nθ = lmax + 1; Nφ = 2 * lmax + 1
         g = sph_gl(lmax)
@@ -243,6 +275,13 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         cgb, _ = FFS.calculate_spectrum(g, fb, (Nθ, Nφ); transform = SB.NUFSHTSpectralBackend(), execution = gpu)
         Test.@test size(cgb) == (Nθ, Nφ, 2)
         Test.@test isapprox(cgb[:, :, 1], cg; atol = 1e-10)
+        # Reusable device plan: build once, execute in-place — matches the one-shot GPU path.
+        gplan = FFS.plan_spectrum(g, Float64, (Nθ, Nφ); transform = SB.NUFSHTSpectralBackend(), execution = gpu)
+        cgp = zeros(ComplexF64, Nθ, Nφ); FFS.calculate_spectrum!(cgp, gplan, f)
+        Test.@test isapprox(cgp, cg; atol = 1e-10)
+        gplanb = FFS.plan_spectrum(g, Float64, (Nθ, Nφ); transform = SB.NUFSHTSpectralBackend(), execution = gpu, batch = (2,))
+        cgpb = zeros(ComplexF64, Nθ, Nφ, 2); FFS.calculate_spectrum!(cgpb, gplanb, fb)
+        Test.@test isapprox(cgpb, cgb; atol = 1e-10)
     end
 
     Test.@testset "Legendre Recurrence" begin
@@ -583,6 +622,28 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(cn32, cd32; atol = 1.0f-3)
         # NUFFTSpectralBackend selects no provider — it errors, directing to a concrete one.
         Test.@test_throws ArgumentError FFS.calculate_spectrum(g, coords[1], (12, 12); transform = SB.NUFFTSpectralBackend())
+
+        # Device-generic path (GPUBackend): the KA ext threads the backend into PlanNUFFT and
+        # reconstructs with broadcasts / a KA kernel. Exercised on KA.CPU (device path on host arrays);
+        # it must equal the CPU path bit-for-bit-close (same plan + math, scalar loop vs kernel).
+        Test.@test Base.get_extension(FFS, :FlowFieldSpectraNonuniformFFTsKernelAbstractionsExt) !== nothing
+        gpu = CB.GPUBackend(KA.CPU())
+        nug(gg, ff, mss; kw...) = FFS.calculate_spectrum(gg, ff, mss; transform = FFS.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10, kw...)[1]
+        for ms in [(12, 10), (11, 9)]                                            # 2D even (Nyquist kernel) + odd (mirror)
+            cd = (rand(M) .* L, rand(M) .* L); gd = scg(cd, (L, L))
+            fd = @. cos(2 * cd[1]) + 0.5 * sin(3 * cd[2])
+            Test.@test isapprox(nug(gd, fd, ms), nu(gd, fd, ms); atol = 1.0e-10)
+        end
+        cdev = (rand(M) .* L, rand(M) .* L); gdev = scg(cdev, (L, L))
+        fcd = @. cis(2 * cdev[1]) + 0.4 * cis(3 * cdev[2])                        # complex
+        Test.@test isapprox(nug(gdev, fcd, (12, 12)), nu(gdev, fcd, (12, 12)); atol = 1.0e-10)
+        fbd = hcat((cos.((1 + b) .* cdev[1]) for b in 1:3)...)                    # batch
+        Test.@test isapprox(nug(gdev, fbd, (12, 12)), nu(gdev, fbd, (12, 12)); atol = 1.0e-10)
+        frd = cos.(2 .* cdev[1])
+        Test.@test isapprox(nug(gdev, frd, (12, 12); iflag = -1), nu(gdev, frd, (12, 12); iflag = -1); atol = 1.0e-10)
+        plang = FFS.plan_spectrum(gdev, Float64, (12, 12); transform = FFS.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10)  # reusable device plan
+        cpg = zeros(ComplexF64, 12, 12); FFS.calculate_spectrum!(cpg, plang, frd)
+        Test.@test isapprox(cpg, nug(gdev, frd, (12, 12)); atol = 1.0e-10)
     end
 
     include("test_allocs.jl")

@@ -40,6 +40,7 @@ FlowFieldSpectraFastSphericalHarmonicsExt = "FastSphericalHarmonics"
 FlowFieldSpectraKernelAbstractionsExt = "KernelAbstractions"
 FlowFieldSpectraMPIExt = "MPI"
 FlowFieldSpectraNonuniformFFTsExt = "NonuniformFFTs"
+FlowFieldSpectraNonuniformFFTsKernelAbstractionsExt = ["NonuniformFFTs", "KernelAbstractions"]
 FlowFieldSpectraNUFSHTExt = "NUFSHT"
 FlowFieldSpectraNUFSHTKernelAbstractionsExt = ["NUFSHT", "KernelAbstractions"]
 FlowFieldSpectraOhMyThreadsExt = "OhMyThreads"

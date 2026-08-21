@@ -117,8 +117,12 @@ device (`KA.allocate` + `copyto!`), and the transform runs there:
   device (`FFTW` for CPU arrays, `CUDA` for CUDA, `AMDGPU` for ROCm). This is *not* CUDA-specific.
 - **`DirectSumSpectralBackend`** uses the portable KernelAbstractions direct-sum kernels on any KA device.
 - **`FINUFFTBackend`** on a GPU uses cuFINUFFT — **CUDA-only** (FINUFFT.jl provides no portable GPU
-  NUFFT). On a non-CUDA device it raises (use `DirectSumSpectralBackend` for a portable GPU scattered
-  transform, or `FINUFFTBackend`/`NonuniformFFTsBackend` on a CPU execution backend).
+  NUFFT). On a non-CUDA device it raises.
+- **`NonuniformFFTsBackend`** on a GPU is **device-generic** through KernelAbstractions: it threads the
+  execution backend into `NonuniformFFTs.PlanNUFFT(…; backend=…)` and reconstructs FFS's full centered
+  spectrum with broadcasts / a KA kernel (real-input fast path included), so the same code runs on CUDA,
+  ROCm, and `KA.CPU()`. This is the portable GPU scattered-Cartesian NUFFT; `DirectSumSpectralBackend`
+  remains the ``O(N M)`` portable fallback.
 - **Spherical** (`FSHTSpectralBackend`/`NUFSHTSpectralBackend`/`DirectSumSpectralBackend`) always uses
   the KA spherical direct-sum kernel — FastSphericalHarmonics and NUFSHT are CPU-only, so **there is no
   fast GPU spherical-harmonic transform**.
@@ -127,9 +131,10 @@ device (`KA.allocate` + `copyto!`), and the transform runs there:
 | :--- | :--- | :--- | :--- |
 | `FFTSpectralBackend` | uniform Cartesian | CUFFT (via AbstractFFTs) | FFTW on `KA.CPU()`, rocFFT on ROCm, … (via AbstractFFTs) |
 | `FINUFFTBackend` | scattered Cartesian | **cuFINUFFT** — `using CUDA, FINUFFT` | errors (cuFINUFFT is CUDA-only) |
+| `NonuniformFFTsBackend` | scattered Cartesian | NonuniformFFTs (device-generic, via `CUDA`) | NonuniformFFTs on any KA device (`KA.CPU()`, ROCm, …) |
 | `DirectSumSpectralBackend` | any Cartesian | KA direct-sum kernel | KA direct-sum kernel |
 | `DirectSumSpectralBackend`/`FSHTSpectralBackend`/`NUFSHTSpectralBackend` | any spherical | KA spherical direct-sum kernel | KA spherical direct-sum kernel |
 
-The device-generic FFT and direct-sum paths are exercised on CI via `GPUBackend(KA.CPU())`. The
-CUDA-specific paths (CUFFT on `CuArray`, cuFINUFFT) are validated on real CUDA hardware via the
-package's `gpu/` project — CI has no GPU.
+The device-generic FFT, direct-sum, and NonuniformFFTs NUFFT paths are exercised on CI via
+`GPUBackend(KA.CPU())`. The CUDA-specific paths (CUFFT on `CuArray`, cuFINUFFT) are validated on real
+CUDA hardware via the package's `gpu/` project — CI has no GPU.

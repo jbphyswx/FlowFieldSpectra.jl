@@ -48,15 +48,20 @@ quadspectrum
 
 ```@docs
 welch_power_spectrum
+welch_power_spectrum!
 coherence_spectrum
+coherence_spectrum!
 lomb_scargle
+lomb_scargle!
 ```
 
 ## Derived quantities & post-processing
 
 ```@docs
 spectral_divergence
+spectral_divergence!
 spectral_vorticity
+spectral_vorticity!
 compensate
 band_energy
 ```

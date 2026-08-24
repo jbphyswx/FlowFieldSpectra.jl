@@ -23,8 +23,7 @@ using FlowGeometries: FlowGeometries
 #         already computed, so we read it straight from `plan.data.ûs` and apply the SAME deconvolution
 #         `copy_deconvolve_to_non_oversampled!` uses (`normfactor / ∏ĝₖ`) — no extra transform.
 #     (This reaches into NonuniformFFTs internals — `data.ûs`, kernel `fourier_coefficients`, the
-#     oversampling factor — validated against the complex plan; FFS pins NonuniformFFTs to 0.9.x, so a
-#     breaking internal change would land as 0.10.) Since the field is real, `iflag=-1` is the
+#     oversampling factor — validated against the complex plan) Since the field is real, `iflag=-1` is the
 #     elementwise conjugate of the `iflag=+1` result.
 # A scattered grid maps directly; a nonuniform tensor-product (structured) grid materializes its point
 # cloud and reuses the scattered path. Points are FIXED by the grid, so plans + `set_points!` run ONCE.

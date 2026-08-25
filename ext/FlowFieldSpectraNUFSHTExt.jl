@@ -21,13 +21,13 @@ _nthreads(::ComputationalBackends.AbstractExecutionBackend) = 1
     NUSHTSphericalPlan{T}
 
 Reusable scattered-spherical NUFSHT plan: the fixed-node NUFSHT plan (point preset + FINUFFT setup),
-the reused real-coefficient buffer, and — for `solve=true` — the CG workspace, all built once for a
+the reused real-coefficient buffer, and — for `solve=true` — the LSMR solve workspace, all built once for a
 fixed point set and batch shape. Reuse across many fields via `calculate_spectrum!`.
 """
 struct NUSHTSphericalPlan{T, NB, P, CR, WS, KS} <: FFS.AbstractSpectralPlan
     plan::P                       # NUFSHT.NUSHTplan (fixed nodes + FINUFFT setup)
     C_real::CR                    # (Nθ, Nφ, B) real NUFSHT coeff buffer (FSH sph_mode layout), reused
-    ws::WS                        # CGWorkspace for solve=true (built once); nothing otherwise
+    ws::WS                        # LSMRWorkspace for solve=true (built once); nothing otherwise
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -44,42 +44,45 @@ Base.show(io::IO, p::NUSHTSphericalPlan{T}) where {T} =
     print(io, "NUSHTSphericalPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, p.solve ? ", solve" : "", ")")
 
 function _nusht_plan(::Type{FT}, g, ms::Tuple, batch::NTuple{NB, Int}, exec;
-        tol::Real, solve::Bool, maxiter::Int, rtol::Real) where {FT, NB}
+        tol::Real, solve::Bool, maxiter::Int, rtol::Real, nufft) where {FT, NB}
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
     θ, φ = FFS.Grids._sph_points(g)
     B = prod(batch; init = 1)
-    plan = NUFSHT.make_plan(FT, θ, φ, lmax; tol = tol, ntrans = B, nthreads = _nthreads(exec))
+    plan = NUFSHT.make_plan(FT, θ, φ, lmax; tol = tol, ntrans = B, nthreads = _nthreads(exec), nufft = nufft)
     C_real = zeros(FT, Nθ, Nφ, B)
-    ws = solve ? NUFSHT.CGWorkspace(plan) : nothing
+    ws = solve ? NUFSHT.LSMRWorkspace(plan) : nothing
     ks = (0:lmax, -lmax:lmax)
     return NUSHTSphericalPlan{FT, NB, typeof(plan), typeof(C_real), typeof(ws), typeof(ks)}(
         plan, C_real, ws, lmax, Nθ, Nφ, batch, B, solve, maxiter, FT(rtol), ks)
 end
 
 """
-    plan_spectrum(NUFSHTSpectralBackend(), execution, grid, T, ms; batch=(), tol, solve, maxiter, rtol)
+    plan_spectrum(NUFSHTSpectralBackend(), execution, grid, T, ms; batch=(), tol, solve, maxiter, rtol, nufft)
 
 Reusable [`FFS.AbstractSpectralPlan`](@ref) for the scattered-spherical NUFSHT on a fixed point set.
 Presets the points / NUFSHT plan / CG setup once; execute across many fields with
-`calculate_spectrum!(coeffs, plan, field)`.
+`calculate_spectrum!(coeffs, plan, field)`. `nufft` selects NUFSHT's internal NUFFT engine (a
+`SpectralBackends` marker; default `AutoSpectralBackend()`); pass `SpectralBackends.NonuniformFFTsBackend()`
+for the real-data half-spectrum fast path on a real field.
 """
 function FFS.plan_spectrum(::SB.AbstractNUFSHTSpectralBackend,
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
         ::Type{T}, ms::Tuple; batch::Tuple = (), tol::Real = 1.0e-8, solve::Bool = false,
-        maxiter::Int = 500, rtol::Real = 1.0e-6, kwargs...) where {T}
+        maxiter::Int = 500, rtol::Real = 1.0e-6, nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+        kwargs...) where {T}
     FT = real(float(T))
     return _nusht_plan(FT, g, ms, NTuple{length(batch), Int}(batch), exec;
-        tol = tol, solve = solve, maxiter = maxiter, rtol = rtol)
+        tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft)
 end
 
 """
     calculate_spectrum!(coeffs, plan::NUSHTSphericalPlan, field) -> ks
 
 Fill preallocated `coeffs` `(Nθ, Nφ, batch…)` with the scattered-spherical spectrum of `field`
-`(N, batch…)`, reusing `plan`'s nodes / NUFSHT plan / CG workspace (no re-planning).
+`(N, batch…)`, reusing `plan`'s nodes / NUFSHT plan / LSMR solve workspace (no re-planning).
 """
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUSHTSphericalPlan{T}, field) where {T}
     if plan.solve
@@ -106,10 +109,11 @@ end
 # One-shot: build a plan for this field's batch shape, then execute it once.
 function FFS._calculate_spectrum_nufsht(exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry}, field::AbstractArray, ms::Tuple;
-        tol::Real = 1.0e-8, solve::Bool = false, maxiter::Int = 500, rtol::Real = 1.0e-6, kwargs...)
+        tol::Real = 1.0e-8, solve::Bool = false, maxiter::Int = 500, rtol::Real = 1.0e-6,
+        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(), kwargs...)
     FT = real(float(eltype(field)))
     batch = ntuple(i -> size(field, 1 + i), ndims(field) - 1)
-    plan = _nusht_plan(FT, g, ms, batch, exec; tol = tol, solve = solve, maxiter = maxiter, rtol = rtol)
+    plan = _nusht_plan(FT, g, ms, batch, exec; tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft)
     coeffs = zeros(Complex{FT}, plan.Nθ, plan.Nφ, batch...)
     FFS.calculate_spectrum!(coeffs, plan, field)
     return coeffs, plan.ks

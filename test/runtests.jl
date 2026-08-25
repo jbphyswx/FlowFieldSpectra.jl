@@ -223,6 +223,15 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         psolve = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), solve = true, rtol = 1e-10, maxiter = 2000)
         cs = zeros(ComplexF64, Nθ, Nφ); FFS.calculate_spectrum!(cs, psolve, fv)
         Test.@test isapprox(cs, cs_ref; atol = 1e-9)
+        # `nufft=` selects NUFSHT's internal NUFFT engine: the real-data NonuniformFFTs engine yields the
+        # same SHT coefficients as the default (FINUFFT) engine, via both the one-shot and a reusable plan.
+        fn = randn(N)
+        c_fin, _ = FFS.calculate_spectrum(g, fn, ms; transform = SB.NUFSHTSpectralBackend())
+        c_nff, _ = FFS.calculate_spectrum(g, fn, ms; transform = SB.NUFSHTSpectralBackend(), nufft = NUFSHT.NonuniformFFTsBackend())
+        Test.@test isapprox(c_nff, c_fin; atol = 1e-7)
+        planN = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), nufft = NUFSHT.NonuniformFFTsBackend())
+        cN = zeros(ComplexF64, Nθ, Nφ); FFS.calculate_spectrum!(cN, planN, fn)
+        Test.@test isapprox(cN, c_fin; atol = 1e-7)
     end
 
     Test.@testset "Gauss-Legendre exact DirectSum + fast GPU SHT (KA.CPU)" begin

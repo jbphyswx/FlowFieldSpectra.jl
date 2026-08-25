@@ -78,6 +78,7 @@ Choose your backend based on the grid structure (structured vs. scattered/non-un
 - **Complexity**: ``O(M \log M + N \log(1/\epsilon))`` (where ``M`` is number of modes, ``N`` is number of points).
 - **Dependencies**: Requires `using NUFSHT`.
 - **Note on Coefficient Recovery**: Because scattered points are unstructured, the direct SHT projection (adjoint) is not the exact inverse. The backend supports an iterative Conjugate Gradient solver via `solve=true` to accurately reconstruct coefficients from scattered data.
+- **NUFFT engine**: `nufft=` picks NUFSHT's internal non-uniform FFT (a `NUFSHT`/`SpectralBackends` marker; default `AutoSpectralBackend()` ⇒ FINUFFT). Pass `nufft=NUFSHT.NonuniformFFTsBackend()` for the real-data half-spectrum fast path on a real field. A reusable plan (`plan_spectrum` + `calculate_spectrum!`) presets the points / NUFSHT plan / CG workspace once for a fixed point set.
 
 ---
 

@@ -29,7 +29,7 @@ struct NUSHTSphericalGPUPlan{T, NB, P, FD, CD, HB, WS, KS} <: FFS.AbstractSpectr
     fd::FD             # device (N, B) field buffer (host field copied in per call)
     Cd::CD             # device (Nθ, Nφ, B) real coeff buffer
     Cr_host::HB        # host (Nθ, Nφ, B) staging for the small layout remap
-    ws::WS             # device CGWorkspace for solve=true; nothing otherwise
+    ws::WS             # device LSMRWorkspace for solve=true; nothing otherwise
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -46,7 +46,7 @@ Base.show(io::IO, p::NUSHTSphericalGPUPlan{T}) where {T} =
     print(io, "NUSHTSphericalGPUPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, p.solve ? ", solve" : "", ")")
 
 function _nusht_gpu_plan(::Type{FT}, backend, g, ms::Tuple, batch::NTuple{NB, Int};
-        tol::Real, solve::Bool, maxiter::Int, rtol::Real) where {FT, NB}
+        tol::Real, solve::Bool, maxiter::Int, rtol::Real, nufft) where {FT, NB}
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
@@ -55,11 +55,11 @@ function _nusht_gpu_plan(::Type{FT}, backend, g, ms::Tuple, batch::NTuple{NB, In
     B = prod(batch; init = 1)
     θd = KA.allocate(backend, FT, N); copyto!(θd, FT.(θ))
     φd = KA.allocate(backend, FT, N); copyto!(φd, FT.(φ))
-    plan = NUFSHT.make_plan(FT, θd, φd, lmax; tol = tol, ntrans = B)   # device-resident
+    plan = NUFSHT.make_plan(FT, θd, φd, lmax; tol = tol, ntrans = B, nufft = nufft)   # device-resident
     fd = KA.allocate(backend, FT, N, B)
     Cd = KA.zeros(backend, FT, Nθ, Nφ, B)
     Cr_host = zeros(FT, Nθ, Nφ, B)
-    ws = solve ? NUFSHT.CGWorkspace(plan) : nothing
+    ws = solve ? NUFSHT.LSMRWorkspace(plan) : nothing
     ks = (0:lmax, -lmax:lmax)
     return NUSHTSphericalGPUPlan{FT, NB, typeof(plan), typeof(fd), typeof(Cd), typeof(Cr_host), typeof(ws), typeof(ks)}(
         plan, fd, Cd, Cr_host, ws, lmax, Nθ, Nφ, batch, B, solve, maxiter, FT(rtol), ks)
@@ -68,10 +68,11 @@ end
 function FFS.plan_spectrum(::SB.AbstractNUFSHTSpectralBackend, exec::ComputationalBackends.GPUBackend{<:KA.Backend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
         ::Type{T}, ms::Tuple; batch::Tuple = (), tol::Real = 1.0e-8, solve::Bool = false,
-        maxiter::Int = 500, rtol::Real = 1.0e-6, kwargs...) where {T}
+        maxiter::Int = 500, rtol::Real = 1.0e-6, nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+        kwargs...) where {T}
     FT = real(float(T))
     return _nusht_gpu_plan(FT, exec.backend, g, ms, NTuple{length(batch), Int}(batch);
-        tol = tol, solve = solve, maxiter = maxiter, rtol = rtol)
+        tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft)
 end
 
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUSHTSphericalGPUPlan{T}, field) where {T}
@@ -101,10 +102,11 @@ end
 function FFS._calculate_spectrum_nufsht(exec::ComputationalBackends.GPUBackend{<:KA.Backend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
         field::AbstractArray, ms::Tuple;
-        tol::Real = 1.0e-8, solve::Bool = false, maxiter::Int = 500, rtol::Real = 1.0e-6, kwargs...)
+        tol::Real = 1.0e-8, solve::Bool = false, maxiter::Int = 500, rtol::Real = 1.0e-6,
+        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(), kwargs...)
     FT = real(float(eltype(field)))
     batch = ntuple(i -> size(field, 1 + i), ndims(field) - 1)   # scattered sphere: 1 spatial dim
-    plan = _nusht_gpu_plan(FT, exec.backend, g, ms, batch; tol = tol, solve = solve, maxiter = maxiter, rtol = rtol)
+    plan = _nusht_gpu_plan(FT, exec.backend, g, ms, batch; tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft)
     coeffs = zeros(Complex{FT}, plan.Nθ, plan.Nφ, batch...)
     FFS.calculate_spectrum!(coeffs, plan, field)
     return coeffs, plan.ks

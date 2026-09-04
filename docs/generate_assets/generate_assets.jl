@@ -136,7 +136,8 @@ function generate_spherical_figure()
     C_true[FFS.sph_mode_index(2, 1)] = 1.0
     C_true[FFS.sph_mode_index(5, -3)] = 0.8
     C_true[FFS.sph_mode_index(8, 4)] = 0.5
-    f_val = real(FFS.synthesize(sht_grid, C_true, (Nθ, Nφ)))      # (nlon, nlat)
+    f_val = real(FFS.synthesize(sht_grid, C_true, (Nθ, Nφ);
+        transform = SB.DirectSumSpectralBackend()))               # (nlon, nlat)
 
     c_sht, _ = FFS.calculate_spectrum(sht_grid, f_val, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())
     deg, E_l = FFS.spherical_energy_spectrum(c_sht)

@@ -1,5 +1,7 @@
 module Averaging
 
+using ..Packing: Packing
+
 export welch_power_spectrum, welch_power_spectrum!, coherence_spectrum, coherence_spectrum!
 
 # =============================================================================
@@ -9,8 +11,8 @@ export welch_power_spectrum, welch_power_spectrum!, coherence_spectrum, coherenc
 # =============================================================================
 
 # Fill `k_bins` (length nb) with radial bin centers; return `(dk, k_max)`. No allocation.
-@inline function _fill_kbins!(k_bins::AbstractVector{T}, ks_phys::NTuple{D, Any}) where {T, D}
-    k_max = minimum(ntuple(d -> maximum(abs, ks_phys[d]), D))
+@inline function _fill_kbins!(k_bins::AbstractVector{T}, ks_phys::Tuple) where {T}
+    k_max = Packing.kmax(T, ks_phys)
     nb = length(k_bins)
     dk = k_max / nb
     @inbounds for i in 1:nb
@@ -41,12 +43,7 @@ function welch_power_spectrum!(E_k::AbstractVector{T}, k_bins::AbstractVector{T}
     fill!(E_k, zero(T))
     # Linear indexing `coeffs[mi + (e-1)·M]` (mode mi, realization e) avoids a reshape-header alloc.
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
-        kmag = zero(T)
-        for d in 1:D
-            kv = T(ks_phys[d][I[d]])
-            kmag += kv * kv
-        end
-        kmag = sqrt(kmag)
+        kmag = sqrt(Packing.ksq(T, ks_phys, I))
         kmag > k_max && continue
         p = zero(T)
         for e in 1:nreal
@@ -54,7 +51,7 @@ function welch_power_spectrum!(E_k::AbstractVector{T}, k_bins::AbstractVector{T}
         end
         p /= nreal
         bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
-        E_k[bin] += T(0.5) * p
+        E_k[bin] += T(0.5) * Packing.mode_fold(ks_phys, I) * p
     end
     E_k ./= dk
     return nothing
@@ -105,12 +102,7 @@ function coherence_spectrum!(coherence²::AbstractVector{T}, phase::AbstractVect
     fill!(phase, zero(T))
     Sfg = zeros(Complex{T}, nb)
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
-        kmag = zero(T)
-        for d in 1:D
-            kv = T(ks_phys[d][I[d]])
-            kmag += kv * kv
-        end
-        kmag = sqrt(kmag)
+        kmag = sqrt(Packing.ksq(T, ks_phys, I))
         kmag > k_max && continue
         bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
         sff = zero(T)
@@ -123,9 +115,12 @@ function coherence_spectrum!(coherence²::AbstractVector{T}, phase::AbstractVect
             sgg += abs2(b)
             sfg += a * conj(b)
         end
-        coherence²[bin] += sff
-        phase[bin] += sgg
-        Sfg[bin] += sfg
+        # Fold the missing negative half: the auto-spectra double on interior halved modes, the cross
+        # spectrum takes its conjugate partner (`X+conj(X)`). Inert on a full layout (`w==1`).
+        w = Packing.mode_fold(ks_phys, I)
+        coherence²[bin] += w * sff
+        phase[bin] += w * sgg
+        Sfg[bin] += sfg + (w - one(w)) * conj(sfg)
     end
     @inbounds for i in 1:nb
         denom = coherence²[i] * phase[i]                       # Sff · Sgg

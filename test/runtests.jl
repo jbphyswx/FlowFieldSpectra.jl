@@ -27,6 +27,14 @@ using FlowGeometries: FlowGeometries as FG
 # =============================================================================
 _cg(::Type{T}) where {T} = FG.Geometry.CartesianGeometry{T}()
 
+# Packed coefficient size for a Cartesian transform of full sizes `ms`: a real field halves axis 1.
+pks(ms::Tuple, real::Bool = true) = FFS.Packing.packed_size(NTuple{length(ms), Int}(ms), Val(real))
+
+# Two-sided Parseval sum over a packed spectrum: each stored mode counts with its fold weight, so this
+# equals `mean(abs2, field)` under the 1/∏N normalization on any layout.
+parseval(ks::Tuple, c::AbstractArray) =
+    sum(I -> FFS.Packing.mode_fold(ks, I) * abs2(c[I]), CartesianIndices(c))
+
 # Uniform Cartesian grid from per-axis point counts + periodic domain lengths.
 function ucg(::Type{T}, domain::Tuple, n::Tuple) where {T}
     D = length(n)
@@ -99,18 +107,36 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
         c_direct, k_direct = FFS.calculate_spectrum(g, (u, v), ms; transform = SB.DirectSumSpectralBackend())
         c_fft, k_fft = FFS.calculate_spectrum(g, (u, v), ms; transform = SB.FFTSpectralBackend())
-        Test.@test size(c_fft) == (ms..., 2)
+        Test.@test size(c_fft) == (pks(ms)..., 2)                # real field ⇒ axis 1 halved
         Test.@test isapprox(c_direct, c_fft, atol = 1e-12)
         Test.@test all(isapprox(k_direct[d], k_fft[d], rtol = 1e-12) for d in 1:2)
+        # `unpacked` restores the full native cube, which the complex transform produces directly.
+        c_cplx, _ = FFS.calculate_spectrum(g, ComplexF64.(cat(u, v; dims = 3)), ms; transform = SB.FFTSpectralBackend())
+        Test.@test size(c_cplx) == (ms..., 2)
+        Test.@test isapprox(FFS.unpacked(c_fft, ms), c_cplx; atol = 1e-12)
 
         k_bins, E_k = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 8, dims = 3)
         Test.@test length(k_bins) == 8
         Test.@test all(E_k .>= 0.0)
-        Test.@test isapprox(sum(abs2, c_fft), Statistics.mean(abs2, u) + Statistics.mean(abs2, v); rtol = 1e-5)
+        Test.@test isapprox(parseval(k_fft, c_fft), Statistics.mean(abs2, u) + Statistics.mean(abs2, v); rtol = 1e-5)
 
         k_red, E_red = FFS.transect_spectrum(k_fft, c_fft, (1,))
         Test.@test length(k_red) == 1
         Test.@test size(E_red) == (ms[2], 2)
+
+        # A transect recovers the folded Parseval total whichever axis it keeps: a kept FULL axis carries
+        # both signs of its wavenumber, and a kept HALVED axis reports |k₁| with the −k₁ energy folded in.
+        # So the answer cannot depend on which axis the real-input layout happened to halve.
+        dk1 = Float64(k_fft[1][2] - k_fft[1][1])
+        dk2 = Float64(k_fft[2][2] - k_fft[2][1])
+        total = 0.5 * parseval(k_fft, c_fft)
+        _, E_keep_full = FFS.transect_spectrum(k_fft, c_fft, (1,))       # keep axis 2 (full, signed)
+        _, E_keep_half = FFS.transect_spectrum(k_fft, c_fft, (2,))       # keep axis 1 (halved)
+        Test.@test isapprox(sum(E_keep_full) / dk1, total; rtol = 1e-12)
+        Test.@test isapprox(sum(E_keep_half) / dk2, total; rtol = 1e-12)
+        # A real field's spectrum is symmetric on a kept full axis, so ±k report the same energy.
+        Test.@test maximum(i -> abs(E_keep_full[i, 1] - E_keep_full[mod(ms[2] - i + 1, ms[2]) + 1, 1]),
+            2:ms[2]) < 1e-14
     end
 
     Test.@testset "Cartesian Scattered Parity (Direct vs FINUFFT)" begin
@@ -123,7 +149,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         g = scg((xv, yv), (L, L))
         c_direct, k_direct = FFS.calculate_spectrum(g, (u, v), ms; transform = SB.DirectSumSpectralBackend())
         c_nufft, k_nufft = FFS.calculate_spectrum(g, (u, v), ms; transform = FFS.FINUFFTBackend(), eps = 1e-12)
-        Test.@test size(c_nufft) == (ms..., 2)
+        Test.@test size(c_nufft) == (pks(ms)..., 2)
         Test.@test isapprox(c_direct, c_nufft, atol = 1e-10)
         Test.@test all(isapprox(k_direct[d], k_nufft[d], rtol = 1e-12) for d in 1:2)
     end
@@ -137,14 +163,14 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         f = [cos(2x) + 0.5sin(3y) + 0.3cos(x + 2y) for x in xax, y in yax]
         c_d, k_d = FFS.calculate_spectrum(g, f, ms; transform = SB.DirectSumSpectralBackend())
         c_n, k_n = FFS.calculate_spectrum(g, f, ms; transform = FFS.FINUFFTBackend(), eps = 1e-13)
-        Test.@test size(c_n) == ms
+        Test.@test size(c_n) == pks(ms)
         Test.@test isapprox(c_d, c_n, atol = 1e-10)
         Test.@test all(isapprox(k_d[d], k_n[d], rtol = 1e-12) for d in 1:2)
 
         fb = cat(cat(f, 2f, -0.5f; dims = 3), 0.7 .* cat(f, 2f, -0.5f; dims = 3); dims = 4)  # (13,11,3,2)
         cb_d, _ = FFS.calculate_spectrum(g, fb, ms; transform = SB.DirectSumSpectralBackend())
         cb_n, _ = FFS.calculate_spectrum(g, fb, ms; transform = FFS.FINUFFTBackend(), eps = 1e-13)
-        Test.@test size(cb_n) == (ms..., 3, 2)
+        Test.@test size(cb_n) == (pks(ms)..., 3, 2)
         Test.@test isapprox(cb_d, cb_n, atol = 1e-10)
 
         zax = sort(rand(6)) .* 2π
@@ -166,7 +192,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         for (l, m, v) in ((2, 1, 1.0), (3, -2, 0.5), (0, 0, 0.7), (5, 4, -0.3))
             C[FFS.sph_mode_index(l, m)] = v
         end
-        f = real(FFS.synthesize(g, C, (Nθ, Nφ)))                     # (nlon, nlat) field on the CC grid
+        f = real(FFS.synthesize(g, C, (Nθ, Nφ); transform = SB.DirectSumSpectralBackend()))
         c_sht, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())
         Test.@test size(c_sht) == (Nθ, Nφ)
         for l in 0:lmax, m in -l:l
@@ -242,7 +268,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         for (l, m, v) in modes
             C[FFS.sph_mode_index(l, m)] = v
         end
-        f = real(FFS.synthesize(g, C, (Nθ, Nφ)))
+        f = real(FFS.synthesize(g, C, (Nθ, Nφ); transform = SB.DirectSumSpectralBackend()))
         c_dir, _ = FFS.calculate_spectrum(g, f, (Nθ, Nφ); transform = SB.DirectSumSpectralBackend(), sampling = GL)
         for (l, m, v) in modes
             Test.@test isapprox(real(c_dir[FFS.sph_mode_index(l, m)]), v; atol = 1e-10)
@@ -330,7 +356,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         cn_t, _ = FFS.calculate_spectrum(sc, uv_scat, ms; transform = FFS.FINUFFTBackend(), execution = CB.ThreadedBackend(), eps = 1e-12)
         Test.@test isapprox(cn_s, cn_t; atol = 1e-10)
 
-        c_ip_s = zeros(ComplexF64, ms...); c_ip_t = zeros(ComplexF64, ms...)
+        c_ip_s = zeros(ComplexF64, pks(ms)...); c_ip_t = zeros(ComplexF64, pks(ms)...)
         FFS.calculate_spectrum!(c_ip_s, sc, uv_scat, ms; execution = CB.SerialBackend())
         FFS.calculate_spectrum!(c_ip_t, sc, uv_scat, ms; execution = CB.ThreadedBackend())
         Test.@test isapprox(c_ip_s, c_ip_t; atol = 1e-12)
@@ -347,14 +373,17 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
         lmaxs = 4; gsc = sph_cc(lmaxs)
         Cc = zeros(ComplexF64, lmaxs + 1, 2lmaxs + 1); Cc[FFS.sph_mode_index(2, 1)] = 1.0
-        fv = real(FFS.synthesize(gsc, Cc, (lmaxs + 1, 2lmaxs + 1)))
+        fv = real(FFS.synthesize(gsc, Cc, (lmaxs + 1, 2lmaxs + 1); transform = SB.DirectSumSpectralBackend()))
         csht_s, _ = FFS.calculate_spectrum(gsc, fv, (lmaxs + 1, 2lmaxs + 1); transform = SB.FSHTSpectralBackend(), execution = CB.SerialBackend())
         csht_t, _ = FFS.calculate_spectrum(gsc, fv, (lmaxs + 1, 2lmaxs + 1); transform = SB.FSHTSpectralBackend(), execution = CB.ThreadedBackend())
         Test.@test csht_s == csht_t
 
-        coeffs, _ = FFS.calculate_spectrum(ug, u, ms; transform = SB.DirectSumSpectralBackend())
-        rs = FFS.synthesize(ug, coeffs, ms; execution = CB.SerialBackend())
-        rt = FFS.synthesize(ug, coeffs, ms; execution = CB.ThreadedBackend())
+        coeffs, kcoef = FFS.calculate_spectrum(ug, u, ms; transform = SB.DirectSumSpectralBackend())
+        # This compares the SERIAL and THREADED direct-sum inverses, so both name that transform.
+        rs = FFS.synthesize(ug, coeffs, ms; transform = SB.DirectSumSpectralBackend(),
+            execution = CB.SerialBackend(), ks = kcoef)
+        rt = FFS.synthesize(ug, coeffs, ms; transform = SB.DirectSumSpectralBackend(),
+            execution = CB.ThreadedBackend(), ks = kcoef)
         Test.@test isapprox(rs, rt; atol = 1e-12)
         Test.@test isapprox(rs, u; atol = 1e-10)
 
@@ -436,14 +465,14 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             f = collect([sum(cos((d + 1) * pt[d]) + 0.3 * sin(d * pt[d]) for d in 1:D) for pt in Iterators.product(axs...)])
             f = f .- Statistics.mean(f)
             ms = ntuple(_ -> N, D)
-            c_fft, _ = FFS.calculate_spectrum(g, f, ms; transform = SB.FFTSpectralBackend())
+            c_fft, k_fft = FFS.calculate_spectrum(g, f, ms; transform = SB.FFTSpectralBackend())
             c_dir, _ = FFS.calculate_spectrum(g, f, ms; transform = SB.DirectSumSpectralBackend())
             Test.@test isapprox(c_fft, c_dir; atol = 1e-10)
-            Test.@test isapprox(sum(abs2, c_fft), Statistics.mean(abs2, f); rtol = 1e-10)
+            Test.@test isapprox(parseval(k_fft, c_fft), Statistics.mean(abs2, f); rtol = 1e-10)
         end
     end
 
-    Test.@testset "Real-input rfft fast path == full FFT (D=1/2/3)" begin
+    Test.@testset "Real-input packed half unpacks to the full FFT (D=1/2/3)" begin
         Random.seed!(13)
         for D in 1:3
             N = D == 3 ? 6 : 12; L = 2π
@@ -453,7 +482,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             ms = ntuple(_ -> N, D)
             c_real, _ = FFS.calculate_spectrum(g, f, ms; transform = SB.FFTSpectralBackend())
             c_cplx, _ = FFS.calculate_spectrum(g, ComplexF64.(f), ms; transform = SB.FFTSpectralBackend())
-            Test.@test isapprox(c_real, c_cplx; atol = 1e-12)
+            Test.@test size(c_real) == pks(ms)
+            Test.@test size(c_cplx) == ms
+            Test.@test isapprox(FFS.unpacked(c_real, ms), c_cplx; atol = 1e-12)
         end
     end
 
@@ -487,7 +518,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         v = [sin(x) for x in xs, y in ys]
         c1, _ = FFS.calculate_spectrum(g, (u, v), (N, N); transform = SB.FFTSpectralBackend())
         plan = FFS.plan_spectrum(g, Float64, (N, N); transform = SB.FFTSpectralBackend(), batch = (2,))
-        cc = zeros(ComplexF64, N, N, 2)
+        cc = zeros(ComplexF64, pks((N, N))..., 2)
         FFS.calculate_spectrum!(cc, plan, cat(u, v; dims = 3))
         Test.@test cc ≈ c1
 
@@ -499,7 +530,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             fstack[:, b] .= cos.(b .* xv) .+ sin.(b .* yv)
         end
         bplan = FFS.plan_spectrum(sg, Float64, (N, N); transform = FFS.FINUFFTBackend(), batch = (nb,), eps = 1e-10)
-        C = zeros(ComplexF64, N, N, nb)
+        C = zeros(ComplexF64, pks((N, N))..., nb)
         FFS.calculate_spectrum!(C, bplan, fstack)
         for b in (1, nb)
             cb, _ = FFS.calculate_spectrum(sg, fstack[:, b], (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-10)
@@ -520,7 +551,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         x = ucg_axis(Float64, L, N)
         g = ucg((L,), (N,))
         nens = 60; kc = 5
-        cf = zeros(ComplexF64, N, nens); cg = zeros(ComplexF64, N, nens)
+        nh = pks((N,))[1]                                        # real 1-D field ⇒ halved axis
+        cf = zeros(ComplexF64, nh, nens); cg = zeros(ComplexF64, nh, nens)
         for e in 1:nens
             ϕ = 2π * rand()
             shared = cos.(kc .* x .+ ϕ)
@@ -555,7 +587,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         x = ucg_axis(Float64, L, N)
         g = ucg((L,), (N,))
         k0 = 7; sig = cos.(k0 .* x)
-        C = zeros(ComplexF64, N, K)
+        C = zeros(ComplexF64, pks((N,))[1], K)                   # real 1-D field ⇒ halved axis
         for k in 1:K
             C[:, k] .= FFS.calculate_spectrum(g, V[:, k] .* sig, (N,); transform = SB.FFTSpectralBackend())[1]
         end
@@ -584,9 +616,17 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         xs = ucg_axis(Float64, L, N); ys = ucg_axis(Float64, L, N)
         g = ucg((L, L), (N, N))
         u = [cos(2x) + 0.5 * sin(3y) - 0.3 * cos(x + 2y) for x in xs, y in ys]
-        coeffs, _ = FFS.calculate_spectrum(g, u, (N, N); transform = SB.DirectSumSpectralBackend())
-        urec = FFS.synthesize(g, coeffs, (N, N))
+        # The packed half inverts directly to a real field; the full native spectrum takes
+        # `real_output=false` and returns complex.
+        # This testset gates the DIRECT-SUM inverse, so every call here names it.
+        ds = SB.DirectSumSpectralBackend()
+        coeffs, kk = FFS.calculate_spectrum(g, u, (N, N); transform = ds)
+        urec = FFS.synthesize(g, coeffs, (N, N); transform = ds, ks = kk)
+        Test.@test eltype(urec) === Float64
         Test.@test isapprox(urec, u; atol = 1e-10)
+        ufull = FFS.synthesize(g, FFS.unpacked(coeffs, (N, N)), (N, N); transform = ds, real_output = false)
+        Test.@test isapprox(real.(ufull), u; atol = 1e-10)
+        Test.@test_throws DimensionMismatch FFS.synthesize(g, FFS.unpacked(coeffs, (N, N)), (N, N); transform = ds)
 
         lmax = 6; Nθ, Nφ = lmax + 1, 2lmax + 1
         N_pts = 4 * Nθ * Nφ
@@ -595,7 +635,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         θs = acos.(clamp.(z, -1.0, 1.0)); φs = mod.(ga .* (0:(N_pts - 1)), 2π)
         sg = sph_scat(θs, φs)
         C = zeros(ComplexF64, Nθ, Nφ); C[FFS.sph_mode_index(3, 1)] = 1.0
-        fs = FFS.synthesize(sg, C, (Nθ, Nφ))
+        fs = FFS.synthesize(sg, C, (Nθ, Nφ); transform = ds)
         Test.@test length(fs) == N_pts
         Test.@test all(isfinite, fs)
     end
@@ -651,10 +691,22 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         frd = cos.(2 .* cdev[1])
         Test.@test isapprox(nug(gdev, frd, (12, 12); iflag = -1), nu(gdev, frd, (12, 12); iflag = -1); atol = 1.0e-10)
         plang = FFS.plan_spectrum(gdev, Float64, (12, 12); transform = FFS.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10)  # reusable device plan
-        cpg = zeros(ComplexF64, 12, 12); FFS.calculate_spectrum!(cpg, plang, frd)
+        cpg = zeros(ComplexF64, pks((12, 12))...); FFS.calculate_spectrum!(cpg, plang, frd)
         Test.@test isapprox(cpg, nug(gdev, frd, (12, 12)); atol = 1.0e-10)
     end
 
+    include("test_spherical_layouts.jl")
+    include("test_spherical_parity.jl")
+    include("test_curvilinear.jl")
+    include("test_spheroid.jl")
+    include("test_auto_transform.jl")
+    include("test_dispatch_matrix.jl")
+    include("test_preprocessing.jl")
+    include("test_hybrid_plan.jl")
+    include("test_real_spherical.jl")
+    include("test_reference_parity.jl")
+    include("test_directsum_plan.jl")
+    include("test_device_genericity.jl")
     include("test_allocs.jl")
     include("test_gpu.jl")
     include("test_distributed.jl")

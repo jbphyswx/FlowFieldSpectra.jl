@@ -9,6 +9,23 @@ synthesize
 plan_spectrum
 AbstractSpectralPlan
 sph_mode_index
+sph_coeff_type
+```
+
+Every transform has a reusable plan, the direct sum included: `plan_spectrum` holds what a grid fixes —
+FFTW's plan, a NUFFT's point sorting, the direct sum's per-axis DFT matrices and working arrays, a
+spherical grid's nodes and quadrature — so `calculate_spectrum!(coeffs, plan, field)` in a time loop
+allocates nothing.
+
+### The packed layout
+
+A real Cartesian field transforms to the rfft-packed half `(m_1÷2+1, m_2…, batch…)`, the complete
+Hermitian representation of its spectrum. `unpacked` expands that half to the full native-order cube
+when a caller wants every mode addressable.
+
+```@docs
+unpacked
+unpacked!
 ```
 
 ## Grids
@@ -68,7 +85,12 @@ band_energy
 
 ## Preprocessing & normalization conventions
 
+`preprocess::Preprocess` on [`calculate_spectrum`](@ref) detrends, tapers and zero-pads the field before
+transforming; [`preprocess_field`](@ref) applies the same spec explicitly, for the plan path and for
+multitaper (one plan, `K` tapered copies as a batch).
+
 ```@docs
+preprocess_field
 Preprocess
 AbstractWindow
 NoWindow

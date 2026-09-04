@@ -14,6 +14,15 @@ export spectral_divergence, spectral_divergence!, spectral_vorticity, spectral_v
 # the `!` variants allocate nothing (a `reshape` header is a per-call allocation under bounds checking).
 @inline _lin(mi, M, c, e, ncomp) = mi + (c - 1) * M + (e - 1) * M * ncomp
 
+# Σ_d i·k_d·û_d for the divergence, folded over the heterogeneous axis tuple by recursion so `ks[d]`
+# with a runtime `d` never boxes; `d` also selects the velocity component via `_lin`.
+@inline function _div_term(::Type{T}, ks::Tuple, I::CartesianIndex, coeffs, mi::Int, M::Int, e::Int, D::Int, d::Int) where {T}
+    kv = T(first(ks)[I[d]])
+    return im * kv * coeffs[_lin(mi, M, d, e, D)] + _div_term(T, Base.tail(ks), I, coeffs, mi, M, e, D, d + 1)
+end
+@inline _div_term(::Type{T}, ::Tuple{}, ::CartesianIndex, ::Any, ::Int, ::Int, ::Int, ::Int, ::Int) where {T} =
+    zero(Complex{T})
+
 """
     spectral_divergence!(out, ks_phys::Tuple, coeffs) -> out
 
@@ -27,6 +36,8 @@ function spectral_divergence!(out::AbstractArray{Complex{T}}, ks_phys::Tuple,
     ms = ntuple(d -> size(coeffs, d), D)
     ncomp = size(coeffs, D + 1)
     ncomp == D || throw(ArgumentError("divergence needs D = $D components on dim $(D+1), got $ncomp"))
+    map(length, ks_phys) == ms ||
+        throw(DimensionMismatch("ks_phys lengths $(map(length, ks_phys)) must match coeff spectral sizes $ms"))
     extra = ntuple(i -> size(coeffs, D + 1 + i), N - D - 1)
     size(out) == (ms..., 1, extra...) ||
         throw(DimensionMismatch("out must have shape (ms…, 1, extra…) = $((ms..., 1, extra...)), got $(size(out))"))
@@ -34,11 +45,7 @@ function spectral_divergence!(out::AbstractArray{Complex{T}}, ks_phys::Tuple,
     E = prod(extra; init = 1)
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
         for e in 1:E
-            acc = zero(Complex{T})
-            for d in 1:D
-                acc += im * T(ks_phys[d][I[d]]) * coeffs[_lin(mi, M, d, e, D)]
-            end
-            out[_lin(mi, M, 1, e, 1)] = acc
+            out[_lin(mi, M, 1, e, 1)] = _div_term(T, ks_phys, I, coeffs, mi, M, e, D, 1)
         end
     end
     return out
@@ -70,6 +77,8 @@ function spectral_vorticity!(out::AbstractArray{Complex{T}}, ks_phys::Tuple,
     D = length(ks_phys)
     N >= D + 1 || throw(ArgumentError("coeffs must have shape (ms…, D, extra…)"))
     ms = ntuple(d -> size(coeffs, d), D)
+    map(length, ks_phys) == ms ||
+        throw(DimensionMismatch("ks_phys lengths $(map(length, ks_phys)) must match coeff spectral sizes $ms"))
     ncomp = size(coeffs, D + 1)
     extra = ntuple(i -> size(coeffs, D + 1 + i), N - D - 1)
     M = prod(ms)

@@ -27,7 +27,8 @@ function run_spherical_example()
     C_true[FFS.sph_mode_index(2, 1)] = 1.0
     C_true[FFS.sph_mode_index(4, -2)] = 0.6
     C_true_r = real.(C_true)                            # real coeffs (FSH sph_mode layout) for NUFSHT
-    f_val = real(FFS.synthesize(sht_grid, C_true, (Nθ, Nφ)))      # (nlon, nlat) field on the grid
+    f_val = real(FFS.synthesize(sht_grid, C_true, (Nθ, Nφ);
+        transform = SB.DirectSumSpectralBackend()))               # (nlon, nlat) field on the grid
 
     println("Computing structured SHT via FastSphericalHarmonics...")
     c_sht, _ = FFS.calculate_spectrum(sht_grid, f_val, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())

@@ -15,7 +15,11 @@ using FlowGeometries: FlowGeometries
 # replicated (SPMD).
 # =============================================================================
 
+# A grid whose cells carry their own coordinates admits a disjoint point partition. A curvilinear grid
+# does too: its coordinate arrays hold one value per cell and index linearly, so a subset of its cells is
+# a node cloud.
 _is_scattered(::FlowGeometries.Grids.AbstractUnstructuredGrid) = true
+_is_scattered(::FlowGeometries.Grids.AbstractCurvilinearGrid) = true
 _is_scattered(::FlowGeometries.Grids.AbstractGrid) = false
 
 @inline _comm(b::ComputationalBackends.MPIBackend) = b.comm === nothing ? MPI.COMM_WORLD : b.comm
@@ -25,16 +29,35 @@ function _mpi_pointsum(b::ComputationalBackends.MPIBackend, transform, g::FlowGe
     comm = _comm(b)
     rank = MPI.Comm_rank(comm)
     nrank = MPI.Comm_size(comm)
-    Nglob = size(field, 1)
+    # The partition is over POINTS, so the field's spatial dims collapse to one point axis; the batch dims
+    # ride through untouched, keeping the coefficient shape. `reshape` is a no-op on a node cloud, whose
+    # spatial part is already one axis.
+    Nglob = prod(ntuple(d -> size(field, d), ndims(g)))
+    fieldP = reshape(field, Nglob, FFS.Grids.field_batch_shape(g, field)...)
     idx = (rank + 1):nrank:Nglob                      # round-robin point share
     sg = FFS._subgrid(g, idx)
-    sf = collect(selectdim(field, 1, idx))
-    cw, _ = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), sg, sf, ms; kwargs...)
+    sf = collect(selectdim(fieldP, 1, idx))
+    cw, kw = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), sg, sf, ms; kwargs...)
     FT = real(eltype(cw))
-    coeffs = Array{complex(FT)}(undef, size(cw))       # contiguous buffer for in-place Allreduce
-    coeffs .= FT(FFS._partition_alpha(g, length(idx), Nglob)) .* Array(cw)
+    α = FT(FFS._partition_alpha(g, length(idx), Nglob))
+    coeffs = Array{eltype(cw)}(undef, size(cw))        # contiguous buffer for in-place Allreduce
+    coeffs .= α .* Array(cw)
     MPI.Allreduce!(coeffs, +, comm)
-    return coeffs, FFS._partition_ks(g, ms)
+    ks = FFS._partition_ks(g, ms, eltype(field) <: Real)
+    # Every rank owns a point share, so all of them hold twin slices of the same shape; the twins are
+    # linear in the field, so the same α-weighted sum that assembles the coefficients assembles them.
+    return coeffs, _allreduce_twin(FFS._ks_twin(kw), ks, α, comm)
+end
+
+_allreduce_twin(::Nothing, ks::Tuple, α, comm) = ks
+function _allreduce_twin(t::FFS.Packing.NyquistTwin, ks::Tuple, α, comm)
+    slices = map(t.slices) do s
+        buf = Array{eltype(s)}(undef, size(s))
+        buf .= α .* s
+        isempty(buf) || MPI.Allreduce!(buf, +, comm)
+        buf
+    end
+    return (FFS.Packing.with_twin(ks[1], FFS.Packing.NyquistTwin(slices)), Base.tail(ks)...)
 end
 
 # ---- batch-partition: disjoint batch slices Allreduced into a zero buffer ----
@@ -49,16 +72,31 @@ function _mpi_batch(b::ComputationalBackends.MPIBackend, transform, g::FlowGeome
     fieldB = reshape(field, sp..., B)
     bc = (rank * B ÷ nrank + 1):((rank + 1) * B ÷ nrank)   # this rank's disjoint batch range
     FT = real(float(eltype(field)))
-    spatial_out = FFS._coeff_spatial(g, ms)
-    coeffsB = zeros(complex(FT), spatial_out..., B)
+    R = eltype(field) <: Real
+    spatial_out = FFS._coeff_spatial(g, ms, R)
+    coeffsB = zeros(FFS._coeff_eltype(g, eltype(field), FT), spatial_out..., B)
+    tw = nothing
     if !isempty(bc)
         fslice = collect(selectdim(fieldB, ns + 1, bc))
-        cw, _ = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), g, fslice, ms; kwargs...)
+        cw, kw = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), g, fslice, ms; kwargs...)
         @inbounds selectdim(coeffsB, ndims(coeffsB), bc) .= reshape(Array(cw), spatial_out..., length(bc))
+        tw = FFS._ks_twin(kw)
     end
     MPI.Allreduce!(coeffsB, +, comm)                   # disjoint slices ⇒ sum assembles the full array
     coeffs = reshape(coeffsB, spatial_out..., batch...)
-    return coeffs, FFS._partition_ks(g, ms)
+    ks = FFS._partition_ks(g, ms, R)
+    # A rank with no batch columns never built a twin, so whether one exists is agreed by reduction and
+    # the buffer shapes come from `ms`; disjoint batch slices then sum into the full-batch twin.
+    if MPI.Allreduce(tw === nothing ? 0 : 1, max, comm) == 1
+        msn = NTuple{length(ms), Int}(Tuple(ms))
+        bufs = FFS._alloc_twins(Complex{FT}, msn, B)
+        tw === nothing || FFS._scatter_batch_twins!(bufs, tw, bc, B)
+        for buf in bufs
+            isempty(buf) || MPI.Allreduce!(buf, +, comm)
+        end
+        ks = FFS._reshape_batch_twins(ks, bufs, batch)
+    end
+    return coeffs, ks
 end
 
 function FFS._calculate_spectrum_mpi(transform, exec::ComputationalBackends.MPIBackend,

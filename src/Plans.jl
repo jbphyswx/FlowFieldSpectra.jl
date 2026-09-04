@@ -6,8 +6,8 @@ export AbstractSpectralPlan, plan_spectrum
     AbstractSpectralPlan
 
 Supertype for reusable transform plans. A plan is tied to the *fixed* geometry of a problem —
-the grid coordinates, the spectral resolution `ms`, the number of batched transforms `n_transf`,
-and the element type — but not to the field *values*. Build a plan once with
+the grid coordinates, the spectral resolution `ms`, the trailing `batch` shape, and the element type —
+but not to the field *values*. Build a plan once with
 [`plan_spectrum`](@ref) and reuse it across many fields / batch slices / time steps via
 `calculate_spectrum!`, avoiding repeated FFTW/FINUFFT plan construction and point sorting.
 
@@ -17,7 +17,7 @@ extensions); this module only declares the shared interface.
 abstract type AbstractSpectralPlan end
 
 """
-    plan_spectrum(grid, ::Type{T}, ms; transform=DirectSumSpectralBackend(), execution=AutoBackend(), batch=(), kwargs...)
+    plan_spectrum(grid, ::Type{T}, ms; transform=AutoSpectralBackend(), execution=AutoBackend(), batch=(), kwargs...)
     plan_spectrum(transform, execution, grid, ::Type{T}, ms; batch=(), kwargs...)
 
 Construct a reusable [`AbstractSpectralPlan`](@ref) for the `transform`×`execution` backend pair on

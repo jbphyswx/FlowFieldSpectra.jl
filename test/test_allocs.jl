@@ -53,26 +53,39 @@ function _zero_profile(N::Int)
     # Explicit SerialBackend: the zero-alloc guarantee is for the serial path. A ThreadedBackend plan
     # (what AutoBackend resolves to under `-t≥2`) carries FFTW/FINUFFT's internal task-spawn floor — a
     # real library cost, not a leak — so it is a bound, not `== 0`.
+    pms = FFS.Packing.packed_size(ms, Val(true))              # real fields ⇒ packed half on axis 1
+
     fplan = FFS.plan_spectrum(ug, Float64, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
-    cf = zeros(ComplexF64, ms...)
+    cf = zeros(ComplexF64, pms...)
     _a_planexec(cf, fplan, u)
     fftexec = _a_planexec(cf, fplan, u)
 
     nplan = FFS.plan_spectrum(sg, Float64, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend())
-    cnu = zeros(ComplexF64, ms...)
+    cnu = zeros(ComplexF64, pms...)
     _a_planexec(cnu, nplan, fscat)
     nuexec = _a_planexec(cnu, nplan, fscat)
 
-    cds = zeros(ComplexF64, ms...)
-    _a_dsum!(cds, sg, fscat, ms, CB.SerialBackend())
-    dsum = _a_dsum!(cds, sg, fscat, ms, CB.SerialBackend())
+    # The direct sum through its reusable plan, on a scattered cloud and on a stretched tensor grid: both
+    # hold their per-axis matrices, working arrays and Nyquist-twin storage, so a repeated execution
+    # allocates nothing.
+    cds = zeros(ComplexF64, pms...)
+    dsplan = FFS.plan_spectrum(sg, Float64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    _a_planexec(cds, dsplan, fscat)
+    dsum = _a_planexec(cds, dsplan, fscat)
 
-    # Spectral operators / averaging in-place variants (`c` is a (ms…) scalar field ⇒ D = 2).
-    cvec = cat(c, c; dims = 3)                               # 2-component vector field (ms…, 2)
-    dout = Array{ComplexF64}(undef, N, N, 1)
+    nax = collect(xs) .+ (0.03 * L / N) .* sinpi.(2 .* (0:(N - 1)) ./ N)
+    ng = nucg((nax, nax), (L, L))
+    cdt = zeros(ComplexF64, pms...)
+    dtplan = FFS.plan_spectrum(ng, Float64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    _a_planexec(cdt, dtplan, u)
+    dsum_tensor = _a_planexec(cdt, dtplan, u)
+
+    # Spectral operators / averaging in-place variants (`c` is a (pms…) scalar field ⇒ D = 2).
+    cvec = cat(c, c; dims = 3)                               # 2-component vector field (pms…, 2)
+    dout = Array{ComplexF64}(undef, pms..., 1)
     _a_div!(dout, ks, cvec)
     divg = _a_div!(dout, ks, cvec)
-    wout = Array{ComplexF64}(undef, N, N, 1)
+    wout = Array{ComplexF64}(undef, pms..., 1)
     _a_vort!(wout, ks, cvec)
     vort = _a_vort!(wout, ks, cvec)
 
@@ -89,14 +102,14 @@ function _zero_profile(N::Int)
     _a_lomb!(Pl, tl, yl, fl)
     lomb = _a_lomb!(Pl, tl, yl, fl)
 
-    return (; iso, sph, tr, fftexec, nuexec, dsum, divg, vort, welch, lomb, coh)
+    return (; iso, sph, tr, fftexec, nuexec, dsum, dsum_tensor, divg, vort, welch, lomb, coh)
 end
 
 Test.@testset "Allocations" begin
     p16 = _zero_profile(16)
     p32 = _zero_profile(32)
     Test.@testset "in-place / prebuilt-plan paths allocate zero (grid-independent)" begin
-        for k in (:iso, :sph, :tr, :fftexec, :nuexec, :dsum, :divg, :vort, :welch, :lomb)
+        for k in (:iso, :sph, :tr, :fftexec, :nuexec, :dsum, :dsum_tensor, :divg, :vort, :welch, :lomb)
             Test.@test getfield(p16, k) == 0
             Test.@test getfield(p32, k) == 0
         end

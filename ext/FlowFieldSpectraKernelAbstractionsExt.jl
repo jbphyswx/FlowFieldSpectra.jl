@@ -16,37 +16,30 @@ using FlowGeometries: FlowGeometries
 # device (`axes[d][decode(p)[d]]`) — NO ∏N_d coordinate blob is staged. The batch is the inner loop.
 # =============================================================================
 
-# Device→host copy (device-generic; `copyto!` exists for every KA/GPUArrays backend).
-function _to_host(dev::AbstractArray{T}) where {T}
-    host = Array{T}(undef, size(dev)...)
-    copyto!(host, dev)
-    return host
-end
+# Is `a` resident on `backend`? Only a strided array can be, and `KA.get_backend` answers for a host
+# `Array` and for each vendor's device array. A lazy wrapper — the reshaped, scaled `SeparableMeasure`
+# a grid's quadrature weights come back as — is resident nowhere and is materialized by `_host_dense`.
+_resident(::Any, ::KA.Backend) = false
+_resident(a::DenseArray, backend::KA.Backend) = KA.get_backend(a) === backend
 
-# Is `a` resident on `backend`? `KA.get_backend` throws a MethodError for an array type it does not
-# know (e.g. a plain host array under some setups); catch ONLY that and report "not on this backend" —
-# never swallow an InterruptException/OutOfMemoryError or a genuine bug.
-function _on_backend(a, backend::KA.Backend)
-    try
-        return KA.get_backend(a) == backend
-    catch err
-        err isa MethodError || rethrow()
-        return false
-    end
-end
+# A dense array of element type `FT`, ready for `copyto!` onto a device array. A device array converts in
+# place (staying on its own backend); a lazy wrapper materializes in one pass.
+_host_dense(::Type{FT}, v::DenseArray) where {FT} = eltype(v) === FT ? v : FT.(v)
+_host_dense(::Type{FT}, v) where {FT} = collect(FT, v)
 
-# Stage a host vector as a length-N device array of element type FT (identity if already resident).
+# Stage a vector as a length-N device array of element type FT (identity if already resident).
 function _dev_vec(backend::KA.Backend, v, ::Type{FT}) where {FT}
-    _on_backend(v, backend) && eltype(v) === FT && return v
+    _resident(v, backend) && eltype(v) === FT && return v
     d = KA.allocate(backend, FT, length(v))
-    copyto!(d, collect(FT.(v)))
+    copyto!(d, _host_dense(FT, v))
     return d
 end
 
-# Stage a field `(spatial…, batch…)` as a device `(Npts, B)` array.
+# Stage a field `(spatial…, batch…)` as a device `(Npts, B)` array; `copyto!` converts and transfers in
+# one step (`reshape` is a view, so no `(Npts, B)` host temp), and only widens when the type differs.
 function _dev_field(backend::KA.Backend, field, Npts::Int, B::Int, ::Type{FT}) where {FT}
     d = KA.allocate(backend, FT, Npts, B)
-    copyto!(d, reshape(collect(FT.(field)), Npts, B))
+    copyto!(d, reshape(eltype(field) === FT ? field : FT.(field), Npts, B))
     return d
 end
 
@@ -62,9 +55,6 @@ end
     end
 end
 
-_batch_shape(g::FlowGeometries.Grids.AbstractGrid, field) =
-    ntuple(i -> size(field, ndims(g) + i), ndims(field) - ndims(g))
-
 # =============================================================================
 # Cartesian direct sum
 # =============================================================================
@@ -76,44 +66,75 @@ function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBac
     backend = exec.backend
     ss = size(g)
     Npts = prod(ss)
-    M = prod(ms)
+    R = eltype(field) <: Real
+    ks_cpu = FFS.Grids.physical_wavenumbers(g, ms, Val(R))
+    pms = FFS.Packing.packed_size(ms, Val(R))
+    M = prod(pms)
     B = length(field) ÷ Npts
-    ks_cpu = FFS.Grids.physical_wavenumbers(g, ms)
     ksd = ntuple(d -> _dev_vec(backend, collect(ks_cpu[d]), FT), D)
-    fieldd = _dev_field(backend, field, Npts, B, FT)
+    ET = eltype(field) <: Real ? FT : Complex{FT}          # stage the field in its own float type
+    fieldd = _dev_field(backend, field, Npts, B, ET)
     coeffs_dev = KA.zeros(backend, Complex{FT}, M, B)
-    _launch_cartesian!(coeffs_dev, backend, g, fieldd, ksd, ss, ms, Npts, M, B, iflag)
+    _launch_cartesian!(coeffs_dev, backend, g, fieldd, ksd, ss, pms, Npts, M, B, iflag)
     KA.synchronize(backend)
     coeffs_dev ./= Npts
-    return reshape(_to_host(coeffs_dev), ms..., _batch_shape(g, field)...), ks_cpu
+    tw = _gpu_nyquist_twin(backend, g, field, fieldd, ms, iflag, ss, Npts, B, FT)
+    ks_out = tw === nothing ? ks_cpu : (FFS.Packing.with_twin(ks_cpu[1], tw), Base.tail(ks_cpu)...)
+    return reshape(FFS._to_host(coeffs_dev), pms..., FFS.Grids.field_batch_shape(g, field)...), ks_out
 end
 
-# Structured (tensor-product) grid: stage the D axes and decode point coordinates on device.
+# The twin the packed half needs where index negation misses `+N_d/2`, evaluated on device by rerunning
+# the forward kernel over each masked mode set: the mask shape replaces `pms` and the masked wavenumbers
+# replace `ks`. `nothing` when negation already reaches every partner.
+function _gpu_nyquist_twin(backend, g, field, fieldd, ms::NTuple{D, Int}, iflag::Int, ss, Npts, B,
+        ::Type{FT}) where {FT, D}
+    (D >= 2 && eltype(field) <: Real && !FlowGeometries.Grids.isuniform(g)) || return nothing
+    ks_cpu = FFS.Grids.physical_wavenumbers(g, ms, Val(true))
+    pms = FFS.Packing.packed_size(ms, Val(true))
+    batch = FFS.Grids.field_batch_shape(g, field)
+    slices = ntuple(FFS.Packing.n_twin_slices(Val(D))) do mask
+        sl = FFS.DirectSum._twin_shape(ms, pms, mask)
+        S = prod(sl)
+        out = KA.zeros(backend, Complex{FT}, S, B)
+        if S > 0
+            kaxd = ntuple(d -> _dev_vec(backend, FFS.DirectSum._twin_kaxis(FT, ks_cpu, ms, mask, d, sl[d]), FT), D)
+            _launch_cartesian!(out, backend, g, fieldd, kaxd, ss, sl, Npts, S, B, iflag)
+            KA.synchronize(backend)
+            out ./= Npts
+        end
+        return reshape(FFS._to_host(out), sl..., batch...)
+    end
+    return FFS.Packing.NyquistTwin(slices)
+end
+
+# Structured (tensor-product) grid: stage the D axes and decode point coordinates on device. `pms` is the
+# packed mode count per axis (axis 1 halved for a real field).
 function _launch_cartesian!(coeffs_dev, backend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        fieldd, ksd, ss::NTuple{D, Int}, ms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
+        fieldd, ksd, ss::NTuple{D, Int}, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
     FT = real(eltype(coeffs_dev))
     axesd = ntuple(d -> _dev_vec(backend, collect(FlowGeometries.Grids.coordinates(g, d)), FT), D)
     kernel! = _cart_tensor_kernel!(backend)
-    kernel!(coeffs_dev, fieldd, axesd, ksd, ss, ms, Npts, M, B, D, iflag; ndrange = M)
+    kernel!(coeffs_dev, fieldd, axesd, ksd, ss, pms, Npts, M, B, D, iflag; ndrange = M)
     return coeffs_dev
 end
 
-# Unstructured (scattered) grid: stage the D per-point coordinate vectors. `ss` (= (N,)) is unused
-# here — the ambient dimension D comes from `ms`, not from `size` (which is the single point axis).
-function _launch_cartesian!(coeffs_dev, backend, g::FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        fieldd, ksd, ss, ms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
+# Pointwise grid: stage the D per-point coordinate arrays. The ambient dimension D is `length(pms)`; `ss`
+# is the grid's own spatial shape and is unused here. A curvilinear grid holds one coordinate value per
+# cell in an N-D array, so `vec` gives the point list the kernel indexes.
+function _launch_cartesian!(coeffs_dev, backend, g::FFS.Grids.PointwiseCartesian,
+        fieldd, ksd, ss, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
     FT = real(eltype(coeffs_dev))
-    coordsd = ntuple(d -> _dev_vec(backend, collect(FlowGeometries.Grids.coordinates(g, d)), FT), D)
+    coordsd = ntuple(d -> _dev_vec(backend, vec(collect(FlowGeometries.Grids.coordinates(g, d))), FT), D)
     kernel! = _cart_scattered_kernel!(backend)
-    kernel!(coeffs_dev, fieldd, coordsd, ksd, ms, Npts, M, B, D, iflag; ndrange = M)
+    kernel!(coeffs_dev, fieldd, coordsd, ksd, pms, Npts, M, B, D, iflag; ndrange = M)
     return coeffs_dev
 end
 
 KA.@kernel function _cart_tensor_kernel!(coeffs, @Const(field), @Const(axesd), @Const(ksd),
-        @Const(ss), @Const(ms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
+        @Const(ss), @Const(pms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
     mi = @index(Global)
     if mi <= M
-        I = _ka_decode(mi, ms)
+        I = _ka_decode(mi, pms)
         FT = eltype(axesd[1])
         @inbounds for p in 1:N
             P = _ka_decode(p, ss)
@@ -130,10 +151,10 @@ KA.@kernel function _cart_tensor_kernel!(coeffs, @Const(field), @Const(axesd), @
 end
 
 KA.@kernel function _cart_scattered_kernel!(coeffs, @Const(field), @Const(coordsd), @Const(ksd),
-        @Const(ms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
+        @Const(pms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
     mi = @index(Global)
     if mi <= M
-        I = _ka_decode(mi, ms)
+        I = _ka_decode(mi, pms)
         FT = eltype(coordsd[1])
         @inbounds for p in 1:N
             phi = zero(FT)
@@ -153,7 +174,7 @@ end
 # =============================================================================
 
 function FFS._gpu_directsum_spherical(exec::ComputationalBackends.AbstractGPUBackend,
-        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
         field::AbstractArray, lmax::Int; sampling = nothing, weights = nothing)
     FT = eltype(g)
     backend = exec.backend
@@ -165,14 +186,15 @@ function FFS._gpu_directsum_spherical(exec::ComputationalBackends.AbstractGPUBac
     θd = _dev_vec(backend, θpt, FT)
     φd = _dev_vec(backend, φpt, FT)
     wd = _dev_vec(backend, wpt, FT)
-    fieldd = _dev_field(backend, field, N, B, FT)
-    coeffs_dev = KA.zeros(backend, Complex{FT}, Nθc, Nφc, B)
+    ET = eltype(field) <: Real ? FT : Complex{FT}          # stage the field in its own float type
+    fieldd = _dev_field(backend, field, N, B, ET)
+    # The kernel accumulates in `eltype(coeffs)`, so a real field's coefficients stay real on device.
+    coeffs_dev = KA.zeros(backend, FFS.sph_coeff_type(eltype(field), FT), Nθc, Nφc, B)
     kernel! = _spherical_kernel!(backend)
     kernel!(coeffs_dev, θd, φd, fieldd, wd, lmax, N, B; ndrange = Nθc * Nφc)
     KA.synchronize(backend)
-    nsp = ndims(g)                                             # structured: 2 (nlon,nlat); scattered: 1 (N)
-    batch = ntuple(i -> size(field, nsp + i), ndims(field) - nsp)
-    return reshape(_to_host(coeffs_dev), Nθc, Nφc, batch...), (0:lmax, -lmax:lmax)
+    batch = FFS.Grids.field_batch_shape(g, field)
+    return reshape(FFS._to_host(coeffs_dev), Nθc, Nφc, batch...), (0:lmax, -lmax:lmax)
 end
 
 KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(field), @Const(w),
@@ -191,11 +213,15 @@ KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(fi
             CT = eltype(coeffs)
             sfac = m == 0 ? one(FT) : (isodd(abs_m) ? -sqrt(FT(2)) : sqrt(FT(2)))
             @inbounds for p in 1:N
+                wp = w[p]
+                # A node of zero weight contributes nothing, and skipping it keeps a masked cell's value
+                # out of the sum entirely: masked data is commonly NaN, and `0 * NaN` is NaN.
+                iszero(wp) && continue
                 xj = cos(θ[p])
                 sj = sin(θ[p])
                 P = _ka_normalized_legendre(l, abs_m, xj, sj)
                 Ylm = sfac * P * (m >= 0 ? cos(m * φ[p]) : sin(abs_m * φ[p]))   # real SH (FSH convention)
-                gw = Ylm * w[p]
+                gw = Ylm * wp
                 for b in 1:B
                     coeffs[row, col, b] += CT(field[p, b] * gw)
                 end

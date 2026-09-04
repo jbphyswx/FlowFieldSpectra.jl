@@ -2,6 +2,7 @@ using BenchmarkTools: BenchmarkTools, BenchmarkGroup, @benchmarkable, tune!, run
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FFTW: FFTW
 using FINUFFT: FINUFFT
+using NonuniformFFTs: NonuniformFFTs
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using NUFSHT: NUFSHT
 using Random: Random
@@ -120,6 +121,163 @@ let
     fsph = real(FFS.synthesize(gs, Ct, (Nθ, Nφ)))
     c_sph, _ = FFS.calculate_spectrum(gs, fsph, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())
     SUITE["reductions"]["spherical_energy_spectrum"] = @benchmarkable FFS.spherical_energy_spectrum($c_sph; lmax = $lmax)
+end
+
+# =============================================================================
+# Reusable plans: `plan_spectrum` once, then `calculate_spectrum!` per field. The one-shot beside each
+# plan is what the plan is measured against, since the difference is the per-call setup the plan holds —
+# FFTW's plan, a NUFFT's point sorting, a spherical grid's nodes and quadrature. `BenchmarkTools` records
+# the allocations alongside the time, which is the quantity a time loop actually feels.
+#
+# CAVEAT, observed: a group's TIMING can differ several-fold between a whole-suite run and that group run
+# alone — the NUFSHT plan measured 5.5 ms in a multi-group run against 0.32 ms alone and 0.14 ms outside
+# the suite entirely, while its MEMORY was identical in all three. FFTW's thread count is process-global
+# and every group here holds live FFTW/FINUFFT plans; which of those carries across was not established.
+# Re-run a single group before believing a surprising time from it.
+# =============================================================================
+SUITE["plans"] = BenchmarkGroup()
+
+# Uniform Cartesian: FFTW plan.
+for N in [128, 256, 512]
+    SUITE["plans"]["fft_N=$N"] = BenchmarkGroup()
+    xs = _uaxis(2π, N)
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; periodic = (true, true), period = (2π, 2π))
+    Random.seed!(1)
+    f = randn(N, N)
+    ms = (N, N)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = SB.FFTSpectralBackend())
+    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    SUITE["plans"]["fft_N=$N"]["one_shot"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.FFTSpectralBackend())
+    SUITE["plans"]["fft_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+end
+
+# Uniform in one direction, stretched in the other: the hybrid FFT/NUFFT composite.
+for N in [64, 128, 256]
+    SUITE["plans"]["hybrid_N=$N"] = BenchmarkGroup()
+    L = 2π
+    uni = _uaxis(L, N)
+    str = [L * (i - 1) / N + 0.04 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
+    g = FG.Grids.StructuredGrid(CARTGEOM, uni, str; periodic = (true, true), period = (L, L))
+    Random.seed!(2)
+    f = randn(N, N)
+    ms = (N, N)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = SB.FFTSpectralBackend())
+    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    SUITE["plans"]["hybrid_N=$N"]["one_shot"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.FFTSpectralBackend())
+    SUITE["plans"]["hybrid_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+end
+
+# Scattered Cartesian: the NUFFT guru plan.
+for M in [10_000, 100_000]
+    SUITE["plans"]["nufft_M=$M"] = BenchmarkGroup()
+    L = 2π
+    ms = (64, 64)
+    Random.seed!(3)
+    xv = rand(M) .* L
+    yv = rand(M) .* L
+    g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(L^2 / M, M);
+        periodic = (true, true), period = (L, L))
+    f = randn(M)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = FFS.NonuniformFFTsBackend(), eps = 1e-9)
+    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    SUITE["plans"]["nufft_M=$M"]["one_shot"] = @benchmarkable FFS.calculate_spectrum($g, $f, $ms;
+        transform = FFS.NonuniformFFTsBackend(), eps = 1e-9)
+    SUITE["plans"]["nufft_M=$M"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+end
+
+# Cartesian direct sum: the plan holds the per-axis DFT matrices, the contraction's working arrays and
+# the Nyquist-twin storage. A stretched grid takes the factorized tensor path and carries a twin; a
+# scattered cloud takes the direct sum.
+for N in [32, 64, 128]
+    SUITE["plans"]["directsum_N=$N"] = BenchmarkGroup()
+    L = 2π
+    str = [L * (i - 1) / N + 0.03 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
+    g = FG.Grids.StructuredGrid(CARTGEOM, str, str; periodic = (true, true), period = (L, L))
+    Random.seed!(6)
+    f = randn(N, N)
+    ms = (N, N)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
+    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    SUITE["plans"]["directsum_N=$N"]["one_shot"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
+    SUITE["plans"]["directsum_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+end
+
+for M in [2_000, 8_000]
+    SUITE["plans"]["directsum_cloud_M=$M"] = BenchmarkGroup()
+    L = 2π
+    ms = (32, 32)
+    Random.seed!(7)
+    xv = rand(M) .* L
+    yv = rand(M) .* L
+    g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(L^2 / M, M);
+        periodic = (true, true), period = (L, L))
+    f = randn(M)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
+    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    SUITE["plans"]["directsum_cloud_M=$M"]["one_shot"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
+    SUITE["plans"]["directsum_cloud_M=$M"]["plan_exec"] =
+        @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+end
+
+# Spherical direct sum: the plan holds the nodes, the ring table, the quadrature and the Legendre tables.
+for lmax in [32, 64, 96]
+    SUITE["plans"]["sph_directsum_lmax=$lmax"] = BenchmarkGroup()
+    ms = (lmax + 1, 2 * lmax + 1)
+    g = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.GaussLegendreSampling(), lmax + 1)
+    Random.seed!(4)
+    f = randn(size(g)...)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
+    buf = zeros(Float64, ms...)                      # a real field's spherical coefficients are real
+    SUITE["plans"]["sph_directsum_lmax=$lmax"]["one_shot"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
+    SUITE["plans"]["sph_directsum_lmax=$lmax"]["plan_exec"] =
+        @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+end
+
+# NUFSHT's `batch_chunk`: how many batch slices one execution carries. The optimum is a property of the
+# NUFFT engine NUFSHT resolves and of the core count — one engine parallelizes over points and one over
+# transforms — so this sweep is what a caller reads before setting it, and the default (0, the whole
+# batch) is what every other row is measured against.
+for lmax in [16, 32]
+    SUITE["plans"]["nufsht_chunk_lmax=$lmax"] = BenchmarkGroup()
+    ms = (lmax + 1, 2 * lmax + 1)
+    N_pts = 8 * (lmax + 1)^2
+    ga = π * (3 - sqrt(5))
+    λ = [mod(ga * i, 2π) for i in 1:N_pts]
+    φ = asin.([-1 + 2 * (i - 0.5) / N_pts for i in 1:N_pts])
+    g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φ), fill(4π / N_pts, N_pts))
+    Random.seed!(8)
+    B = 16
+    f = randn(N_pts, B)
+    for bc in [0, 1, 2, 4, 8, 16]
+        p = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(),
+            batch = (B,), batch_chunk = bc)
+        buf = zeros(Float64, ms..., B)
+        SUITE["plans"]["nufsht_chunk_lmax=$lmax"]["chunk=$bc"] =
+            @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
+    end
+end
+
+# Scattered spherical: the NUFSHT plan (points preset once).
+for lmax in [16, 32]
+    SUITE["plans"]["nufsht_lmax=$lmax"] = BenchmarkGroup()
+    ms = (lmax + 1, 2 * lmax + 1)
+    N_pts = 8 * (lmax + 1)^2
+    ga = π * (3 - sqrt(5))
+    λ = [mod(ga * i, 2π) for i in 1:N_pts]
+    φ = asin.([-1 + 2 * (i - 0.5) / N_pts for i in 1:N_pts])
+    g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φ), fill(4π / N_pts, N_pts))
+    Random.seed!(5)
+    f = randn(N_pts)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend())
+    buf = zeros(Float64, ms...)
+    SUITE["plans"]["nufsht_lmax=$lmax"]["one_shot"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.NUFSHTSpectralBackend())
+    SUITE["plans"]["nufsht_lmax=$lmax"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

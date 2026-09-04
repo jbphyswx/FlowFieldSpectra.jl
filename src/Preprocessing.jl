@@ -4,7 +4,8 @@ using LinearAlgebra: SymTridiagonal, eigen
 
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey,
     AbstractDetrend, NoDetrend, Demean, LinearDetrend,
-    Preprocess, window_function, window_function!, window_correction, detrend!, dpss
+    Preprocess, window_function, window_function!, window_correction, detrend!, dpss,
+    is_identity, axis_taper, detrend_spatial!, apply_window!
 
 # =============================================================================
 # Window tapers (dispatch on type, not Symbol)
@@ -201,7 +202,99 @@ end
 
 function Preprocess(; detrend::AbstractDetrend = Demean(), window::AbstractWindow = NoWindow(),
         pad::Real = 1.0)
+    pad >= 1 || throw(ArgumentError("pad must be ≥ 1 (1.0 means no padding); got $pad"))
     return Preprocess(detrend, window, Float64(pad))
+end
+
+"""`is_identity(spec)` — whether `spec` leaves a field untouched, so the transform reads it directly."""
+is_identity(p::Preprocess) = p.detrend isa NoDetrend && p.window isa NoWindow && p.pad == 1
+
+# =============================================================================
+# Applying a spec to a field
+# =============================================================================
+
+"""
+    axis_taper(::Type{FT}, window, n) -> Vector{FT}
+
+Length-`n` taper for one axis, scaled to unit mean square (`Σw²/n == 1`).
+
+Under that scaling the tapered field carries the variance of the original, so Parseval holds on the
+coefficients with no correction applied afterwards: with `C_w(k) = (1/N) Σ w f e^{-ikx}`, the folded sum
+`Σ_k |C_w|²` is `mean|w·f|²`, which returns `mean|f|²` exactly when `Σw²/n = 1` on every axis (the tensor
+product's mean square is the product of the axes'). `NoWindow` already satisfies it, so a rectangular
+window is an exact no-op.
+"""
+function axis_taper(::Type{FT}, window::AbstractWindow, n::Integer) where {FT}
+    w = window_function(window, n, FT)
+    ms = sum(abs2, w) / n
+    ms > 0 || throw(ArgumentError("$(nameof(typeof(window))) has zero energy over $n samples"))
+    return w .* inv(sqrt(ms))
+end
+
+"""
+    detrend_spatial!(field, detrend, nsp::Int)
+
+Detrend the leading `nsp` spatial dims of `field` in place, per batch slice.
+
+`Demean` subtracts each slice's spatial mean, which needs no axes and so applies to any grid.
+`LinearDetrend` subtracts the least-squares linear trend along each spatial axis in turn — a separable
+plane removal — and so reads an axis order; a caller whose grid has none gets an `ArgumentError` from
+the entry point.
+"""
+detrend_spatial!(field, ::NoDetrend, nsp::Int) = field
+
+function detrend_spatial!(field::AbstractArray{T}, ::Demean, nsp::Int) where {T}
+    N = prod(ntuple(d -> size(field, d), nsp))
+    B = length(field) ÷ N
+    @inbounds for b in 1:B
+        off = (b - 1) * N
+        s = zero(T)
+        for j in 1:N
+            s += field[off + j]
+        end
+        m = s / N
+        for j in 1:N
+            field[off + j] -= m
+        end
+    end
+    return field
+end
+
+function detrend_spatial!(field::AbstractArray{T}, ::LinearDetrend, nsp::Int) where {T}
+    sp = ntuple(d -> size(field, d), nsp)
+    N = prod(sp)
+    B = length(field) ÷ N
+    @inbounds for b in 1:B
+        slice = reshape(view(field, ((b - 1) * N + 1):(b * N)), sp...)
+        for d in 1:nsp
+            pre = prod(ntuple(i -> sp[i], d - 1))
+            n = sp[d]
+            post = N ÷ (pre * n)
+            for q in 0:(post - 1), p in 1:pre
+                detrend!(view(reshape(slice, pre, n, post), p, :, q + 1), LinearDetrend())
+            end
+        end
+    end
+    return field
+end
+
+"""
+    apply_window!(field, tapers::Tuple, nsp::Int)
+
+Multiply the leading `nsp` spatial dims of `field` by the tensor product of `tapers`, in place, over
+every batch slice. One taper per spatial axis, each already scaled by [`axis_taper`](@ref).
+"""
+function apply_window!(field::AbstractArray{T}, tapers::Tuple, nsp::Int) where {T}
+    sp = ntuple(d -> size(field, d), nsp)
+    N = prod(sp)
+    B = length(field) ÷ N
+    @inbounds for b in 1:B
+        off = (b - 1) * N
+        for (j, I) in enumerate(CartesianIndices(sp))
+            field[off + j] *= prod(ntuple(d -> tapers[d][I[d]], nsp))
+        end
+    end
+    return field
 end
 
 # =============================================================================

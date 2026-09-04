@@ -24,12 +24,14 @@ Device-resident reusable NUFSHT plan (GPU execution): the device NUFSHT plan, th
 buffers, the host staging buffer for the layout remap, and — for `solve=true` — the device CG
 workspace. Built once for a fixed point set + batch shape; reuse via `calculate_spectrum!`.
 """
-struct NUSHTSphericalGPUPlan{T, NB, P, FD, CD, HB, WS, KS} <: FFS.AbstractSpectralPlan
+struct NUSHTSphericalGPUPlan{T, NB, P, FD, FH, CD, HB, WS, QW, KS} <: FFS.AbstractSpectralPlan
     plan::P            # device-resident NUFSHT plan (fixed nodes)
     fd::FD             # device (N, B) field buffer (host field copied in per call)
+    fh::FH             # host (N, B) real staging for one component of a complex field
     Cd::CD             # device (Nθ, Nφ, B) real coeff buffer
     Cr_host::HB        # host (Nθ, Nφ, B) staging for the small layout remap
     ws::WS             # device LSMRWorkspace for solve=true; nothing otherwise
+    qwd::QW            # device (N, 1) per-node quadrature weights, Σw = 4π; nothing for solve=true
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -46,40 +48,80 @@ Base.show(io::IO, p::NUSHTSphericalGPUPlan{T}) where {T} =
     print(io, "NUSHTSphericalGPUPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, p.solve ? ", solve" : "", ")")
 
 function _nusht_gpu_plan(::Type{FT}, backend, g, ms::Tuple, batch::NTuple{NB, Int};
-        tol::Real, solve::Bool, maxiter::Int, rtol::Real, nufft) where {FT, NB}
+        tol::Real, solve::Bool, maxiter::Int, rtol::Real, nufft,
+        sampling = nothing, weights = nothing) where {FT, NB}
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-    θ, φ = FFS.Grids._sph_points(g)
+    θ, φ, w = FFS.DirectSum._sph_point_data(g, FT; sampling = sampling, weights = weights)
     N = length(θ)
     B = prod(batch; init = 1)
     θd = KA.allocate(backend, FT, N); copyto!(θd, FT.(θ))
     φd = KA.allocate(backend, FT, N); copyto!(φd, FT.(φ))
     plan = NUFSHT.make_plan(FT, θd, φd, lmax; tol = tol, ntrans = B, nufft = nufft)   # device-resident
     fd = KA.allocate(backend, FT, N, B)
+    fh = zeros(FT, N, B)
     Cd = KA.zeros(backend, FT, Nθ, Nφ, B)
     Cr_host = zeros(FT, Nθ, Nφ, B)
     ws = solve ? NUFSHT.LSMRWorkspace(plan) : nothing
+    # `nusht_type1!` is the unweighted adjoint, so the quadrature reaches it through the field. Shaped
+    # `(N, 1)` so one broadcast weights every transform in the batch. The solve reads the raw field.
+    qwd = if solve
+        nothing
+    else
+        d = KA.allocate(backend, FT, N, 1)
+        copyto!(d, reshape(FT.(collect(w)), N, 1))
+        d
+    end
     ks = (0:lmax, -lmax:lmax)
-    return NUSHTSphericalGPUPlan{FT, NB, typeof(plan), typeof(fd), typeof(Cd), typeof(Cr_host), typeof(ws), typeof(ks)}(
-        plan, fd, Cd, Cr_host, ws, lmax, Nθ, Nφ, batch, B, solve, maxiter, FT(rtol), ks)
+    return NUSHTSphericalGPUPlan{FT, NB, typeof(plan), typeof(fd), typeof(fh), typeof(Cd), typeof(Cr_host), typeof(ws), typeof(qwd), typeof(ks)}(
+        plan, fd, fh, Cd, Cr_host, ws, qwd, lmax, Nθ, Nφ, batch, B, solve, maxiter, FT(rtol), ks)
 end
 
 function FFS.plan_spectrum(::SB.AbstractNUFSHTSpectralBackend, exec::ComputationalBackends.GPUBackend{<:KA.Backend},
-        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
         ::Type{T}, ms::Tuple; batch::Tuple = (), tol::Real = 1.0e-8, solve::Bool = false,
         maxiter::Int = 500, rtol::Real = 1.0e-6, nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
-        kwargs...) where {T}
+        sampling = nothing, weights = nothing, kwargs...) where {T}
     FT = real(float(T))
     return _nusht_gpu_plan(FT, exec.backend, g, ms, NTuple{length(batch), Int}(batch);
-        tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft)
+        tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft,
+        sampling = sampling, weights = weights)
 end
 
-function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUSHTSphericalGPUPlan{T}, field) where {T}
-    copyto!(plan.fd, field)                                    # host field → device buffer
+function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, plan::NUSHTSphericalGPUPlan{T}, field) where {T}
+    fill!(coeffs, zero(eltype(coeffs)))
+    _nusht_gpu_pass!(coeffs, plan, field, real, one(T))
+    eltype(field) <: Real || _nusht_gpu_pass!(coeffs, plan, field, imag, im)
+    return plan.ks
+end
+
+# The host array staged to the device for one component: a real field crosses directly, and one component
+# of a complex field is written into the plan's host buffer first.
+@inline _gpu_component(::AbstractMatrix, field::AbstractArray{<:Real}, part) = field
+@inline function _gpu_component(fh::AbstractMatrix{FT}, field::AbstractArray{<:Complex}, part) where {FT}
+    N = size(fh, 1)
+    @inbounds for b in axes(fh, 2)
+        off = (b - 1) * N
+        for j in 1:N
+            fh[j, b] = FT(part(field[off + j]))
+        end
+    end
+    return fh
+end
+
+# One real field component through the device NUFSHT, added into `coeffs` at weight `scale`. NUFSHT's
+# transform is real and linear, so a real field runs this once with `real` (the identity on it) at weight
+# 1, and a complex field runs it again with `imag` at weight `im`.
+function _nusht_gpu_pass!(coeffs, plan::NUSHTSphericalGPUPlan{T}, field, part, scale) where {T}
+    copyto!(plan.fd, _gpu_component(plan.fh, field, part))     # host field → device buffer
     if plan.solve
         NUFSHT.nusht_solve!(plan.Cd, plan.fd, plan.plan; ws = plan.ws, maxiter = plan.maxiter, rtol = plan.rtol)
     else
+        # Weight the field into the quadrature the projection integrates. `ifelse` selects a value, so a
+        # zero-weight node yields zero even where the field holds `NaN`.
+        qwd = plan.qwd
+        plan.fd .= ifelse.(iszero.(qwd), zero(T), plan.fd .* qwd)
         NUFSHT.nusht_type1!(plan.Cd, plan.fd, plan.plan)
     end
     copyto!(plan.Cr_host, plan.Cd)                             # device → host for the small layout remap
@@ -89,27 +131,93 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::NUSHTS
     @inbounds for b in 1:plan.B
         for l in 0:lmax
             for m in -l:l
-                Cc[FFS.sph_mode_index(l, m), b] = Cr[NUFSHT.FastSphericalHarmonics.sph_mode(l, m), b]
+                Cc[FFS.sph_mode_index(l, m), b] += scale * Cr[NUFSHT.FastSphericalHarmonics.sph_mode(l, m), b]
             end
         end
     end
-    return plan.ks
+    return coeffs
 end
 
 # One-shot GPU: build a device plan for this field's batch shape, then execute it once.
 # More specific than the NUFSHT-only `AbstractGPUBackend` stub, so it wins when KernelAbstractions is
 # loaded.
 function FFS._calculate_spectrum_nufsht(exec::ComputationalBackends.GPUBackend{<:KA.Backend},
-        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
         field::AbstractArray, ms::Tuple;
         tol::Real = 1.0e-8, solve::Bool = false, maxiter::Int = 500, rtol::Real = 1.0e-6,
-        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(), kwargs...)
+        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(),
+        sampling = nothing, weights = nothing, kwargs...)
     FT = real(float(eltype(field)))
-    batch = ntuple(i -> size(field, 1 + i), ndims(field) - 1)   # scattered sphere: 1 spatial dim
-    plan = _nusht_gpu_plan(FT, exec.backend, g, ms, batch; tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft)
-    coeffs = zeros(Complex{FT}, plan.Nθ, plan.Nφ, batch...)
+    batch = FFS.Grids.field_batch_shape(g, field)
+    plan = _nusht_gpu_plan(FT, exec.backend, g, ms, batch; tol = tol, solve = solve, maxiter = maxiter,
+        rtol = rtol, nufft = nufft, sampling = sampling, weights = weights)
+    coeffs = zeros(FFS.sph_coeff_type(eltype(field), FT), plan.Nθ, plan.Nφ, batch...)
     FFS.calculate_spectrum!(coeffs, plan, field)
     return coeffs, plan.ks
+end
+
+# =============================================================================
+# Inverse (synthesis) on a device backend via `nusht_type2!`, the adjoint pair of the `nusht_type1!` the
+# forward runs. Nodes are placed on the execution backend, so `NUFSHT.make_plan` builds a device-resident
+# plan. Coefficients arrive in `sph_mode_index` layout and are remapped on the host into NUFSHT's
+# FastSphericalHarmonics `sph_mode` real buffer, which is then staged to the device; the remap is over
+# the mode set, whose size is independent of the node count. NUFSHT's coefficients are real, so a complex
+# coefficient array is evaluated one real component at a time, which the transform's linearity permits.
+# =============================================================================
+
+function FFS._synthesize(::SB.AbstractNUFSHTSpectralBackend,
+        exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
+        coeffs::AbstractArray, ms::NTuple{2, Int}; real_output::Bool = true, iflag::Int = 1,
+        ks = nothing, tol::Real = 1.0e-8,
+        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(), kwargs...)
+    FT = real(float(eltype(coeffs)))
+    backend = exec.backend
+    lmax = ms[1] - 1
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+    size(coeffs)[1:2] == (Nθ, Nφ) || throw(DimensionMismatch(
+        "spherical coefficients must be (Nθ, Nφ) = ($Nθ, $Nφ) on the spectral dims; got $(size(coeffs)[1:2])."))
+    θ, φ = FFS.Grids._sph_points(g)
+    N = length(θ)
+    batch = ntuple(i -> size(coeffs, 2 + i), ndims(coeffs) - 2)
+    B = prod(batch; init = 1)
+    θd = KA.allocate(backend, FT, N); copyto!(θd, FT.(θ))
+    φd = KA.allocate(backend, FT, N); copyto!(φd, FT.(φ))
+    plan = NUFSHT.make_plan(FT, θd, φd, lmax; tol = tol, ntrans = B, nufft = nufft)
+    Cr_host = zeros(FT, Nθ, Nφ, B)
+    Cd = KA.zeros(backend, FT, Nθ, Nφ, B)
+    fd = KA.allocate(backend, FT, N, B)
+    f_host = zeros(FT, N, B)
+    Cc = reshape(coeffs, Nθ, Nφ, B)
+    # Synthesis writes the grid's own spatial shape, matching what the forward consumed; a node cloud's
+    # `size` is `(N,)`, so the two coincide there.
+    sp = size(g)
+    # Branch on the output element type, so `_synth_nusht_gpu!` specializes on a concrete array.
+    return real_output ?
+        _synth_nusht_gpu!(zeros(FT, sp..., batch...), Cc, Cr_host, Cd, fd, f_host, plan, lmax, N, B, 1) :
+        _synth_nusht_gpu!(zeros(Complex{FT}, sp..., batch...), Cc, Cr_host, Cd, fd, f_host, plan, lmax, N, B, 2)
+end
+
+# `ET` fixes the destination type; `ncomp` is 1 for a real field and 2 for a complex one, whose real and
+# imaginary coefficient parts are evaluated in turn and recombined.
+function _synth_nusht_gpu!(out::AbstractArray{ET}, Cc, Cr_host, Cd, fd, f_host, plan, lmax::Int,
+        N::Int, B::Int, ncomp::Int) where {ET}
+    O = reshape(out, N, B)
+    @inbounds for comp in 1:ncomp
+        fill!(Cr_host, zero(eltype(Cr_host)))
+        for b in 1:B, l in 0:lmax, m in -l:l
+            z = Cc[FFS.sph_mode_index(l, m), b]
+            Cr_host[NUFSHT.FastSphericalHarmonics.sph_mode(l, m), b] = comp == 1 ? real(z) : imag(z)
+        end
+        copyto!(Cd, Cr_host)                                   # host → device
+        NUFSHT.nusht_type2!(fd, Cd, plan)
+        copyto!(f_host, fd)                                    # device → host
+        for b in 1:B, j in 1:N
+            O[j, b] += comp == 1 ? ET(f_host[j, b]) : ET(im * f_host[j, b])
+        end
+    end
+    return out
 end
 
 end # module FlowFieldSpectraNUFSHTKernelAbstractionsExt

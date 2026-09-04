@@ -40,7 +40,8 @@ function run_horizontal_spectra_4d_example()
 
     # Build the plan ONCE for the fixed points; transform the whole (z, t) batch in one exec.
     plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
-    coeffs = zeros(ComplexF64, ms..., nz, nt)         # (N, N, nz, nt)
+    pms = FFS.Packing.packed_size(ms, Val(true))      # real field ⇒ axis 1 halved to k₁ ≥ 0
+    coeffs = zeros(ComplexF64, pms..., nz, nt)        # (N÷2+1, N, nz, nt)
     ks = FFS.calculate_spectrum!(coeffs, plan, f)
 
     # ONE reduction → E(k, z, t), batch dims preserved. Average over time → E(k, z).

@@ -13,6 +13,7 @@ _a_iso!(Ek, kb, ks, c, nb) = @allocated FFS.isotropic_spectrum!(Ek, kb, ks, c; n
 _a_sph!(El, C, l) = @allocated FFS.spherical_energy_spectrum!(El, C; lmax = l)
 _a_tr!(Er, ks, c, dims) = @allocated FFS.transect_spectrum!(Er, ks, c, dims)
 _a_planexec(out, plan, f) = @allocated FFS.calculate_spectrum!(out, plan, f)
+_a_synth!(out, plan, c, ks) = @allocated FFS.synthesize!(out, plan, c; ks = ks)
 _a_dsum!(out, g, f, ms, exec) =
     @allocated FFS.calculate_spectrum!(out, g, f, ms; transform = SB.DirectSumSpectralBackend(), execution = exec)
 _a_div!(o, ks, c) = @allocated FFS.spectral_divergence!(o, ks, c)
@@ -102,14 +103,29 @@ function _zero_profile(N::Int)
     _a_lomb!(Pl, tl, yl, fl)
     lomb = _a_lomb!(Pl, tl, yl, fl)
 
-    return (; iso, sph, tr, fftexec, nuexec, dsum, dsum_tensor, divg, vort, welch, lomb, coh)
+    # The inverse's counterpart: a synthesis plan holds its backward transform and every buffer, so a
+    # reused inversion writes into the caller's array and allocates nothing.
+    sfft = FFS.plan_synthesis(ug, Float64, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
+    offt = FFS.allocate_field(sfft)
+    _a_synth!(offt, sfft, cf, ks)
+    synth_fft = _a_synth!(offt, sfft, cf, ks)
+
+    cds2, ksd2 = FFS.calculate_spectrum(ng, u, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    sds = FFS.plan_synthesis(ng, Float64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    ods = FFS.allocate_field(sds)
+    _a_synth!(ods, sds, cds2, ksd2)
+    synth_dsum = _a_synth!(ods, sds, cds2, ksd2)
+
+    return (; iso, sph, tr, fftexec, nuexec, dsum, dsum_tensor, synth_fft, synth_dsum,
+        divg, vort, welch, lomb, coh)
 end
 
 Test.@testset "Allocations" begin
     p16 = _zero_profile(16)
     p32 = _zero_profile(32)
     Test.@testset "in-place / prebuilt-plan paths allocate zero (grid-independent)" begin
-        for k in (:iso, :sph, :tr, :fftexec, :nuexec, :dsum, :dsum_tensor, :divg, :vort, :welch, :lomb)
+        for k in (:iso, :sph, :tr, :fftexec, :nuexec, :dsum, :dsum_tensor, :synth_fft, :synth_dsum,
+                  :divg, :vort, :welch, :lomb)
             Test.@test getfield(p16, k) == 0
             Test.@test getfield(p32, k) == 0
         end

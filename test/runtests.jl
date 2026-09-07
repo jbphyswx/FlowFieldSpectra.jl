@@ -706,6 +706,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
     include("test_real_spherical.jl")
     include("test_reference_parity.jl")
     include("test_directsum_plan.jl")
+    include("test_plan_interface.jl")
+    include("test_synthesis_plan.jl")
     include("test_device_genericity.jl")
     include("test_allocs.jl")
     include("test_gpu.jl")

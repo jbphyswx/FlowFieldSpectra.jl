@@ -111,6 +111,73 @@ end
 # coefficient array is evaluated one real component at a time, which the transform's linearity permits.
 # =============================================================================
 
+# Reusable synthesis: the grid permutations `_ft_perms` validates once, and the slab `sph_evaluate!`
+# transforms in place.
+struct FSHTSynthesisPlan{FT, R, NB, PR, PC} <: FFS.AbstractSynthesisPlan
+    rowperm::PR
+    colperm::PC
+    slab::Matrix{FT}
+    lmax::Int
+    Nθ::Int
+    Nφ::Int
+    batch::NTuple{NB, Int}
+    B::Int
+end
+
+Base.show(io::IO, p::FSHTSynthesisPlan{FT, R}) where {FT, R} =
+    print(io, "FSHTSynthesisPlan{", FT, "}(lmax=", p.lmax, ", ", R ? "real" : "complex", ")")
+
+FFS.Plans.field_size(p::FSHTSynthesisPlan) = (p.Nφ, p.Nθ, p.batch...)
+FFS.Plans.field_type(::FSHTSynthesisPlan{FT, R}) where {FT, R} = R ? FT : Complex{FT}
+
+function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFSHTSpectralBackend,
+        ::ComputationalBackends.AbstractExecutionBackend,
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+        ::Type{T}, ms::NTuple{2, Int}; batch::Tuple = (), kwargs...) where {T}
+    FT = real(float(T))
+    lmax = ms[1] - 1
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+    ss = size(g)
+    ss == (Nφ, Nθ) || throw(ArgumentError(
+        "FSHTSpectralBackend requires a structured (nlon, nlat) = ($Nφ, $Nθ) grid matching ms; got size = $ss"))
+    rowperm, colperm = _ft_perms(FT, g, Nθ, Nφ)
+    bt = NTuple{length(batch), Int}(batch)
+    return FSHTSynthesisPlan{FT, T <: Real, length(bt), typeof(rowperm), typeof(colperm)}(
+        rowperm, colperm, Matrix{FT}(undef, Nθ, Nφ), lmax, Nθ, Nφ, bt, prod(bt; init = 1))
+end
+
+# `sph_evaluate!` is real→real, so a complex coefficient array is evaluated one component at a time and
+# recombined — the identity the forward uses in reverse.
+function FFS.Plans.synthesize!(out::AbstractArray, plan::FSHTSynthesisPlan{FT, R},
+        coeffs::AbstractArray; ks = nothing) where {FT, R}
+    size(out) == FFS.Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(plan))"))
+    size(coeffs)[1:2] == (plan.Nθ, plan.Nφ) || throw(DimensionMismatch(
+        "spherical coefficients must be (Nθ, Nφ) = ($(plan.Nθ), $(plan.Nφ)) on the spectral dims; " *
+        "got $(size(coeffs)[1:2])"))
+    lmax = plan.lmax
+    slab = plan.slab
+    C = reshape(coeffs, plan.Nθ, plan.Nφ, plan.B)
+    O = reshape(out, plan.Nφ, plan.Nθ, plan.B)
+    ET = R ? FT : Complex{FT}
+    fill!(O, zero(ET))
+    ncomp = R ? 1 : 2
+    @inbounds for b in 1:plan.B, comp in 1:ncomp
+        fill!(slab, zero(FT))
+        for l in 0:lmax, m in -l:l
+            z = C[FFS.sph_mode_index(l, m), b]
+            slab[FSH.sph_mode(l, m)] = comp == 1 ? real(z) : imag(z)
+        end
+        FSH.sph_evaluate!(slab)
+        for (ic, jc) in enumerate(plan.colperm), (ir, jr) in enumerate(plan.rowperm)
+            v = slab[ir, ic]
+            O[jc, jr, b] += comp == 1 ? ET(v) : ET(im * v)
+        end
+    end
+    return out
+end
+
 function FFS._synthesize(::SpectralBackends.AbstractFSHTSpectralBackend,
         ::ComputationalBackends.AbstractExecutionBackend,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},

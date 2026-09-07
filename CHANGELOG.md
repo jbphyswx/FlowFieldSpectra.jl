@@ -16,6 +16,16 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
 - Typed preprocessing (`Hann`/`Hamming`/`Blackman`/`Tukey`/`NoWindow`, `Demean`/`LinearDetrend`/
   `NoDetrend`) and normalization conventions (`OneSided`/`TwoSided`, `DensityScaling`/`PowerScaling`)
   — all dispatched on types rather than symbols.
+- **A plan answers for its own output**, so it is sufficient to preallocate against:
+  `coefficient_size`, `coefficient_type`, `wavenumbers` and `allocate_coefficients` on every
+  `AbstractSpectralPlan`. The element type is not implied by the size — a Cartesian plan's coefficients
+  are complex while a spherical plan's follow the field and are real for a real one — so both accessors
+  are needed to allocate, and `allocate_coefficients(plan)` does it.
+- **A reusable inverse**: `plan_synthesis` and `synthesize!(out, plan, coeffs; ks)`, with `field_size`,
+  `field_type` and `allocate_field` mirroring the forward's accessors. Every host backend and the device
+  FFT/NUFSHT hold their backward transform and buffers, so a snapshot series inverts without rebuilding
+  either. `synthesize!` takes `ks` because a plan holds what the grid fixes, and the Nyquist twin a
+  packed inverse needs on a nonuniformly-sampled grid is a functional of the coefficients.
 - Reusable spectral plans (`plan_spectrum`) for every transform — FFTW, the FFT/NUFFT hybrid composite,
   both NUFFT providers, NUFSHT, and the direct sum on Cartesian and spherical grids alike — with a
   trailing `batch=` shape: build once, reuse across a z/t/component loop with allocation-free steady-state
@@ -56,6 +66,10 @@ All notable changes to FlowFieldSpectra.jl are documented here. The format follo
   `docs/generate_assets/generate_assets.jl`.
 
 ### Fixed
+- **The packed inverse boxed its wavenumber tuple once per mode per point.** `_neg_row_value` indexed
+  `ks[d]` at a runtime `d` on the mixed `RFFTAxis`/`FFTAxis` tuple, so `synthesize` on a real field
+  allocated in proportion to the mode count times the point count. `Val`-unrolling the index takes it
+  to zero.
 - **`transect_spectrum` under-reported when it KEPT the halved axis.** A real field's spectrum stores
   axis 1 as the Hermitian half, so the `−k₁` energy lives nowhere else; keeping that axis counted each
   stored mode once and left it out, so `Σ E / ∏dk` fell short of the field's folded Parseval total while

@@ -19,7 +19,8 @@ using FlowGeometries: FlowGeometries
 # transform, so `ms == size(grid)`.
 # =============================================================================
 
-struct GPUFFTRealPlan{RT, D, P, IN, HB, KS} <: FFS.AbstractSpectralPlan
+struct GPUFFTRealPlan{RT, D, NB, P, IN, HB, KS} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     fwd::P                        # device rfft plan over dims 1:D of a real (N…, batch…)
     inbuf::IN                     # device real (N…, batch…) input buffer
     half::HB                      # device complex packed half (N_1÷2+1, N_2…, batch…)
@@ -29,7 +30,8 @@ struct GPUFFTRealPlan{RT, D, P, IN, HB, KS} <: FFS.AbstractSpectralPlan
     ks_phys::KS
 end
 
-struct GPUFFTComplexPlan{RT, D, P, CB, KS} <: FFS.AbstractSpectralPlan
+struct GPUFFTComplexPlan{RT, D, NB, P, CB, KS} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     fwd::P                        # device fft/bfft plan over dims 1:D of a complex (N…, batch…)
     inbuf::CB                     # device complex input buffer
     outbuf::CB                    # device complex output buffer
@@ -47,8 +49,9 @@ function _gpu_fft_plan(dev, ::Type{T}, g, ns::NTuple{D, Int}, batch::Tuple, ifla
     fwd = AbstractFFTs.plan_rfft(inbuf, 1:D)
     half = KA.allocate(dev, Complex{RT}, ns[1] ÷ 2 + 1, ns[2:D]..., batch...)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(true))
-    return GPUFFTRealPlan{RT, D, typeof(fwd), typeof(inbuf), typeof(half), typeof(ks)}(
-        fwd, inbuf, half, ns, one(RT) / prod(ns), iflag < 0, ks)
+    bt = NTuple{length(batch), Int}(batch)
+    return GPUFFTRealPlan{RT, D, length(bt), typeof(fwd), typeof(inbuf), typeof(half), typeof(ks)}(
+        bt, fwd, inbuf, half, ns, one(RT) / prod(ns), iflag < 0, ks)
 end
 
 # Complex field: device c2c, full native order.
@@ -58,9 +61,19 @@ function _gpu_fft_plan(dev, ::Type{Complex{RT}}, g, ns::NTuple{D, Int}, batch::T
     outbuf = similar(inbuf)
     fwd = iflag == 1 ? AbstractFFTs.plan_fft(inbuf, 1:D) : AbstractFFTs.plan_bfft(inbuf, 1:D)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(false))
-    return GPUFFTComplexPlan{RT, D, typeof(fwd), typeof(inbuf), typeof(ks)}(
-        fwd, inbuf, outbuf, ns, one(RT) / prod(ns), ks)
+    bt = NTuple{length(batch), Int}(batch)
+    return GPUFFTComplexPlan{RT, D, length(bt), typeof(fwd), typeof(inbuf), typeof(ks)}(
+        bt, fwd, inbuf, outbuf, ns, one(RT) / prod(ns), ks)
 end
+
+FFS.Plans.coefficient_size(p::GPUFFTRealPlan) =
+    (FFS.Packing.packed_size(p.ns, Val(true))..., p.batch...)
+FFS.Plans.coefficient_type(::GPUFFTRealPlan{RT}) where {RT} = Complex{RT}
+FFS.Plans.wavenumbers(p::GPUFFTRealPlan) = p.ks_phys
+
+FFS.Plans.coefficient_size(p::GPUFFTComplexPlan) = (p.ns..., p.batch...)
+FFS.Plans.coefficient_type(::GPUFFTComplexPlan{RT}) where {RT} = Complex{RT}
+FFS.Plans.wavenumbers(p::GPUFFTComplexPlan) = p.ks_phys
 
 """
     calculate_spectrum!(coeffs, plan, field) -> ks_phys
@@ -150,6 +163,62 @@ end
 # buffer and `coeffs` is left intact. This method is reached for a GPU execution backend, ahead of the
 # host FFTW method, which accepts any execution backend.
 # =============================================================================
+# Reusable device synthesis: the backward plan and both device buffers, built once. `plan_brfft` and
+# `plan_bfft` dispatch on the device array type, so this is device-generic.
+struct GPUFFTSynthesisPlan{RT, D, NB, R, P, SC, OB} <: FFS.AbstractSynthesisPlan
+    bwd::P
+    scratch::SC                   # the coefficients staged on device; the c2r consumes them
+    outd::OB                      # the device field the transform writes
+    ns::NTuple{D, Int}
+    batch::NTuple{NB, Int}
+    neg::Bool
+end
+
+Base.show(io::IO, ::GPUFFTSynthesisPlan{RT, D, NB, R}) where {RT, D, NB, R} =
+    print(io, "GPUFFTSynthesisPlan{$RT, $D}(", R ? "real" : "complex", ")")
+
+FFS.Plans.field_size(p::GPUFFTSynthesisPlan) = (p.ns..., p.batch...)
+FFS.Plans.field_type(::GPUFFTSynthesisPlan{RT, D, NB, R}) where {RT, D, NB, R} = R ? RT : Complex{RT}
+
+function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
+        exec::ComputationalBackends.AbstractGPUBackend,
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, kwargs...) where {T, D}
+    FlowGeometries.Grids.isuniform(g) || throw(ArgumentError(
+        "FFTSpectralBackend needs a uniform axis in every direction; got a stretched axis."))
+    ns = size(g)
+    Tuple(ms) == ns || throw(ArgumentError(
+        "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform."))
+    dev = exec.backend
+    RT = real(float(T))
+    R = T <: Real
+    bt = NTuple{length(batch), Int}(batch)
+    if R
+        scratch = KA.allocate(dev, Complex{RT}, FFS.Packing.packed_size(ns, Val(true))..., bt...)
+        outd = KA.allocate(dev, RT, ns..., bt...)
+        bwd = AbstractFFTs.plan_brfft(scratch, ns[1], 1:D)
+    else
+        scratch = KA.allocate(dev, Complex{RT}, ns..., bt...)
+        outd = KA.allocate(dev, Complex{RT}, ns..., bt...)
+        bwd = iflag == 1 ? AbstractFFTs.plan_bfft(scratch, 1:D) : AbstractFFTs.plan_fft(scratch, 1:D)
+    end
+    return GPUFFTSynthesisPlan{RT, D, length(bt), R, typeof(bwd), typeof(scratch), typeof(outd)}(
+        bwd, scratch, outd, ns, bt, iflag < 0)
+end
+
+function FFS.Plans.synthesize!(out::AbstractArray, plan::GPUFFTSynthesisPlan{RT, D, NB, R},
+        coeffs::AbstractArray; ks = nothing) where {RT, D, NB, R}
+    size(out) == FFS.Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(plan))"))
+    size(coeffs) == size(plan.scratch) || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this plan was built for $(size(plan.scratch))"))
+    copyto!(plan.scratch, coeffs)
+    R && plan.neg && (plan.scratch .= conj.(plan.scratch))   # a real field's iflag=-1 half is conjugated
+    LA.mul!(plan.outd, plan.bwd, plan.scratch)
+    copyto!(out, plan.outd)
+    return out
+end
+
 function FFS._synthesize(::SpectralBackends.AbstractFFTSpectralBackend,
         exec::ComputationalBackends.AbstractGPUBackend,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},

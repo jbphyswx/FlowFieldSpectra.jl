@@ -23,7 +23,9 @@ using .Grids: Grids, physical_wavenumbers
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 using .Problem: Problem, TransformProblem, batch_shape, stack_fields
-using .Plans: Plans, AbstractSpectralPlan, plan_spectrum
+using .Plans: Plans, AbstractSpectralPlan, plan_spectrum,
+    coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
+    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field
 using .DirectSum: DirectSum, sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 using .Operators: spectral_divergence, spectral_divergence!, spectral_vorticity, spectral_vorticity!,
@@ -38,6 +40,8 @@ export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
 export TransformProblem
 export AbstractSpectralPlan, plan_spectrum, preprocess_field
+export coefficient_size, coefficient_type, wavenumbers, allocate_coefficients
+export AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field
 # APIs
 export calculate_spectrum, calculate_spectrum!, synthesize, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index, sph_coeff_type
 export unpacked, unpacked!
@@ -599,7 +603,7 @@ buffers), and the `D - length(sdims) + 1` working arrays the passes write throug
 `R` marks a real field, so the publish branch folds at compile time. Execute with
 `calculate_spectrum!(coeffs, plan, field)`.
 """
-struct HybridPlan{T, D, R, FP, AP, W, QB, PH, KS, TW, QW} <: Plans.AbstractSpectralPlan
+struct HybridPlan{T, D, R, NB, FP, AP, W, QB, PH, KS, TW, QW} <: Plans.AbstractSpectralPlan
     region::FP                       # the uniform-axis FFT, planned
     axes::AP                         # one axis plan per stretched dim, in `sdims` order
     sdims::Vector{Int}
@@ -608,6 +612,7 @@ struct HybridPlan{T, D, R, FP, AP, W, QB, PH, KS, TW, QW} <: Plans.AbstractSpect
     ms::NTuple{D, Int}
     nsx::NTuple{D, Int}              # spectrum extents entering the publish
     pms::NTuple{D, Int}
+    batch::NTuple{NB, Int}
     ntrans::Int
     npts::Int
     neg::Bool
@@ -619,6 +624,12 @@ end
 
 Base.show(io::IO, ::HybridPlan{T, D, R}) where {T, D, R} =
     print(io, "HybridPlan{$T, $D}(", R ? "real" : "complex", ")")
+
+# A real field publishes the packed half; a complex one keeps every native mode.
+Plans.coefficient_size(p::HybridPlan{T, D, R}) where {T, D, R} =
+    (R ? p.pms : p.ms)..., p.batch...
+Plans.coefficient_type(::HybridPlan{T}) where {T} = Complex{T}
+Plans.wavenumbers(p::HybridPlan) = p.ks_phys
 
 """
     _hybrid_plan(nufft, exec, grid, ::Type{T}, ms, umask; batch, iflag, eps, kwargs...)
@@ -658,9 +669,10 @@ function _hybrid_plan(nufft::SpectralBackends.AbstractSpectralBackend,
     # The quadrature scaling writes into a held buffer, so a reused execution copies the field once into
     # memory the plan owns and never allocates for it.
     qbuf = qw === nothing ? nothing : Array{R ? Tr : Complex{Tr}}(undef, insize...)
-    return HybridPlan{Tr, D, R, typeof(region), typeof(apt), typeof(wt), typeof(qbuf), typeof(h.phase),
-            typeof(h.ks), typeof(h.twins), typeof(qw)}(
-        region, apt, collect(h.sdims), wt, qbuf, ms, h.nsx, h.pms, ntrans, h.npts, h.neg,
+    bt = NTuple{length(batch), Int}(batch)
+    return HybridPlan{Tr, D, R, length(bt), typeof(region), typeof(apt), typeof(wt), typeof(qbuf),
+            typeof(h.phase), typeof(h.ks), typeof(h.twins), typeof(qw)}(
+        region, apt, collect(h.sdims), wt, qbuf, ms, h.nsx, h.pms, bt, ntrans, h.npts, h.neg,
         h.phase, h.ks, h.twins, qw)
 end
 
@@ -813,6 +825,88 @@ function _synthesize(::SpectralBackends.AbstractDirectSumSpectralBackend,
     return real_output ? real.(out) : out
 end
 
+"""
+    DirectSumSynthesisPlan{FT}
+
+Reusable direct-sum inverse: the grid, resolution, sign and batch shape the inverse is fixed by, so
+`synthesize!` writes into the caller's array and allocates nothing of its own.
+
+The Cartesian inverse reads the grid's axes per call, and the spherical one its nodes and Legendre
+tables; a Nyquist twin arrives with the coefficients on `ks`, never held here.
+"""
+struct DirectSumSynthesisPlan{FT, R, G, E, S, NB, ND} <: Plans.AbstractSynthesisPlan
+    grid::G
+    exec::E
+    setup::S                      # the spherical node/Legendre setup; `nothing` on a Cartesian grid
+    ms::NTuple{ND, Int}
+    batch::NTuple{NB, Int}
+    iflag::Int
+end
+
+Base.show(io::IO, p::DirectSumSynthesisPlan{FT, R}) where {FT, R} =
+    print(io, "DirectSumSynthesisPlan{", FT, "}(", R ? "real" : "complex", ", ms=", p.ms, ")")
+
+Plans.field_size(p::DirectSumSynthesisPlan) = (size(p.grid)..., p.batch...)
+Plans.field_type(::DirectSumSynthesisPlan{FT, R}) where {FT, R} = R ? FT : Complex{FT}
+
+function Plans.plan_synthesis(::SpectralBackends.AbstractDirectSumSpectralBackend,
+        exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
+        g::FlowGeometries.Grids.AbstractGrid, ::Type{T}, ms::NTuple{ND, Int};
+        batch::Tuple = (), iflag::Int = 1, kwargs...) where {T, ND}
+    FT = real(float(eltype(g)))
+    bt = NTuple{length(batch), Int}(batch)
+    OT = T <: Real ? FT : Complex{FT}
+    s = _synth_setup(g, OT, ms)
+    return DirectSumSynthesisPlan{FT, T <: Real, typeof(g), typeof(exec), typeof(s), length(bt), ND}(
+        g, exec, s, ms, bt, iflag)
+end
+
+# The spherical inverse reads nodes and Legendre tables; the Cartesian one reads the grid's axes per
+# call and holds nothing.
+_synth_setup(g::FlowGeometries.Grids.AbstractGrid, ::Type{OT}, ms::Tuple) where {OT} = nothing
+_synth_setup(g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ::Type{OT},
+    ms::Tuple) where {OT} = DirectSum.sph_synth_setup(g, real(float(OT)), ms[1] - 1)
+
+"""
+    synthesize!(out, plan::DirectSumSynthesisPlan, coeffs; ks=nothing) -> out
+
+Evaluate the direct-sum inverse of `coeffs` into `out`. Pass the `ks` the forward returned whenever the
+grid is nonuniformly sampled, so the packed inverse can read the Nyquist twin riding its halved axis.
+"""
+function Plans.synthesize!(out::AbstractArray, plan::DirectSumSynthesisPlan{FT, R},
+        coeffs::AbstractArray; ks = nothing) where {FT, R}
+    size(out) == Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(Plans.field_size(plan))"))
+    return _synthesize_into!(out, plan, coeffs, ks)
+end
+
+# Cartesian: the packed half for a real field, the full native cube for a complex one.
+function _synthesize_into!(out::AbstractArray, plan::DirectSumSynthesisPlan{FT, R, G},
+        coeffs::AbstractArray, ks) where {FT, R, G <: FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}}
+    g = plan.grid
+    ms = plan.ms
+    D = length(ms)
+    if R
+        pms = Packing.packed_size(ms, Val(true))
+        size(coeffs)[1:D] == pms || throw(DimensionMismatch(
+            "a real-field plan expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D])"))
+        _synthesize_packed!(plan.exec, out, g, coeffs, ms, plan.iflag, _twin_for_inverse(g, ms, ks))
+    else
+        size(coeffs)[1:D] == ms || throw(DimensionMismatch(
+            "a complex-field plan expects the full native spectrum $(ms) on the spectral dims; got $(size(coeffs)[1:D])"))
+        _synthesize_cartesian!(plan.exec, out, g, coeffs, ms, plan.iflag)
+    end
+    return out
+end
+
+# Spherical: the held nodes and Legendre tables, so a reused execution rebuilds neither. A real
+# coefficient array evaluates to a real field with no complex intermediate.
+function _synthesize_into!(out::AbstractArray, plan::DirectSumSynthesisPlan{FT, R, G},
+        coeffs::AbstractArray, ks) where {FT, R, G <: FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}}
+    DirectSum.sph_synth_run!(out, plan.setup, coeffs, plan.ms[1] - 1)
+    return out
+end
+
 function _synthesize(t::SpectralBackends.AbstractSpectralBackend, e::ComputationalBackends.AbstractExecutionBackend, g::FlowGeometries.Grids.AbstractGrid,
         coeffs::AbstractArray, ms::Tuple; kwargs...)
     throw(ArgumentError(
@@ -888,6 +982,32 @@ function Plans.plan_spectrum(grid::FlowGeometries.Grids.AbstractGrid, ::Type{T},
 end
 
 """
+    plan_synthesis(grid, ::Type{T}, ms; transform=AutoSpectralBackend(), execution=AutoBackend(),
+                   batch=(), real_output=true, kwargs...)
+
+Reusable [`AbstractSynthesisPlan`](@ref) inverting an `ms`-resolution spectrum on `grid` back to a field
+with trailing batch shape `batch` of element type `T`. Reuse via `synthesize!(out, plan, coeffs)`.
+"""
+function Plans.plan_synthesis(grid::FlowGeometries.Grids.AbstractGrid, ::Type{T}, ms::Tuple;
+        transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+        execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+        batch::Tuple = (), kwargs...) where {T}
+    e = _resolve_execution(execution)
+    return Plans.plan_synthesis(_resolve_transform(transform, grid, ms, e), e, grid, T, ms;
+        batch = batch, kwargs...)
+end
+
+# Least-specific catch-all: a clear error for any (transform, execution, grid) with no synthesis plan.
+function Plans.plan_synthesis(t::SpectralBackends.AbstractSpectralBackend,
+        e::ComputationalBackends.AbstractExecutionBackend, grid::FlowGeometries.Grids.AbstractGrid,
+        ::Type{T}, ms::Tuple; kwargs...) where {T}
+    throw(ArgumentError(
+        "$(nameof(typeof(t))) has no reusable synthesis plan for a $(nameof(typeof(grid))) over " *
+        "$(nameof(typeof(FlowGeometries.Grids.grid_geometry(grid)))) on $(nameof(typeof(e))). " *
+        "`synthesize(grid, coeffs, ms; …)` inverts without one."))
+end
+
+"""
     DirectSumSphericalPlan{FT}
 
 Reusable spherical direct-sum plan: the grid's materialized nodes (or its ring table, or its longitude
@@ -901,7 +1021,7 @@ latitude quadrature is a Gauss–Legendre root solve, and `materialize` is docum
 allocating call), so reuse across a time loop removes most of the heap traffic. Execute with
 `calculate_spectrum!(coeffs, plan, field)`.
 """
-struct DirectSumSphericalPlan{FT, L, S, NB, KS} <: Plans.AbstractSpectralPlan
+struct DirectSumSphericalPlan{FT, CT, L, S, NB, KS} <: Plans.AbstractSpectralPlan
     layout::L                     # TensorSphere / RingSphere / ScatteredSphere
     setup::S                      # that layout's precomputation, from `DirectSum.sph_setup`
     lmax::Int
@@ -914,6 +1034,10 @@ Base.show(io::IO, p::DirectSumSphericalPlan{FT}) where {FT} =
     print(io, "DirectSumSphericalPlan{", FT, "}(", nameof(typeof(p.layout)), ", lmax=", p.lmax,
         ", B=", p.B, ")")
 
+Plans.coefficient_size(p::DirectSumSphericalPlan) = (p.lmax + 1, 2 * p.lmax + 1, p.batch...)
+Plans.coefficient_type(::DirectSumSphericalPlan{FT, CT}) where {FT, CT} = CT
+Plans.wavenumbers(p::DirectSumSphericalPlan) = p.ks
+
 function Plans.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
         ::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
@@ -925,10 +1049,10 @@ function Plans.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
     layout = Grids._sph_layout(g)
-    s = DirectSum.sph_setup(layout, g, sph_coeff_type(T, FT), lmax, B; sampling = sampling,
-        weights = weights)
+    CT = sph_coeff_type(T, FT)
+    s = DirectSum.sph_setup(layout, g, CT, lmax, B; sampling = sampling, weights = weights)
     ks = (0:lmax, -lmax:lmax)
-    return DirectSumSphericalPlan{FT, typeof(layout), typeof(s), length(bt), typeof(ks)}(
+    return DirectSumSphericalPlan{FT, CT, typeof(layout), typeof(s), length(bt), typeof(ks)}(
         layout, s, lmax, bt, B, ks)
 end
 
@@ -971,6 +1095,12 @@ end
 
 Base.show(io::IO, p::DirectSumCartesianPlan{FT}) where {FT} =
     print(io, "DirectSumCartesianPlan{", FT, "}(", nameof(typeof(p.layout)), ", B=", p.B, ")")
+
+# `setup.pms` is the packed size built for the field's realness, so it is already the full native size
+# for a complex field.
+Plans.coefficient_size(p::DirectSumCartesianPlan) = (p.setup.pms..., p.batch...)
+Plans.coefficient_type(::DirectSumCartesianPlan{FT}) where {FT} = Complex{FT}
+Plans.wavenumbers(p::DirectSumCartesianPlan) = p.ks
 
 function Plans.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
         ::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},

@@ -161,7 +161,8 @@ end
 
 # ---- device plans (buffers + tables live on the execution backend) ----
 
-struct NUFFTNonuniformComplexGPUPlan{T, D, P, CJ, FK, OB, HB, PH, KS, QW} <: FFS.AbstractSpectralPlan
+struct NUFFTNonuniformComplexGPUPlan{T, D, NB, P, CJ, FK, OB, HB, PH, KS, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     plan::P
     cj::CJ                           # C × device (M,) complex strengths
     fk::FK                           # C × device (ms…) full native spectra
@@ -176,7 +177,12 @@ struct NUFFTNonuniformComplexGPUPlan{T, D, P, CJ, FK, OB, HB, PH, KS, QW} <: FFS
     qw::QW                           # device (M,) grid quadrature factor, or `nothing`
 end
 
-struct NUFFTNonuniformRealGPUPlan{T, D, P, CJ, FK, OB, HB, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+FFS.Plans.coefficient_size(p::NUFFTNonuniformComplexGPUPlan) = (p.ms..., p.batch...)
+FFS.Plans.coefficient_type(::NUFFTNonuniformComplexGPUPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::NUFFTNonuniformComplexGPUPlan) = p.ks_phys
+
+struct NUFFTNonuniformRealGPUPlan{T, D, NB, P, CJ, FK, OB, HB, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     plan::P                          # device PlanNUFFT{T<:Real}, packed half
     cj::CJ                           # C × device (M,) REAL strengths
     fk_half::FK                      # C × device (N₁÷2+1, N₂…) packed half-spectra
@@ -209,8 +215,9 @@ function _nu_gpu_plan(::Type{Complex{Tr}}, backend, coords::Tuple, ms::NTuple{D,
     out = KA.allocate(backend, Complex{Tr}, ms...)
     out_host = Array{Complex{Tr}, D}(undef, ms...)
     phase = _to_dev(backend, Complex{Tr}, phase_h)
-    return NUFFTNonuniformComplexGPUPlan{Tr, D, typeof(plan), typeof(cj), typeof(fk), typeof(out), typeof(out_host), typeof(phase), typeof(ks_phys), typeof(qw)}(
-        plan, cj, fk, out, out_host, ms, M, B, iflag, phase, ks_phys, qw)
+    bt = NTuple{length(batch), Int}(batch)
+    return NUFFTNonuniformComplexGPUPlan{Tr, D, length(bt), typeof(plan), typeof(cj), typeof(fk), typeof(out), typeof(out_host), typeof(phase), typeof(ks_phys), typeof(qw)}(
+        bt, plan, cj, fk, out, out_host, ms, M, B, iflag, phase, ks_phys, qw)
 end
 
 function _nu_gpu_plan(::Type{Tr}, backend, coords::Tuple, ms::NTuple{D, Int}, Ls::NTuple{D},
@@ -229,9 +236,15 @@ function _nu_gpu_plan(::Type{Tr}, backend, coords::Tuple, ms::NTuple{D, Int}, Ls
     out_host = Array{Complex{Tr}, D}(undef, pms...)
     phase = _to_dev(backend, Complex{Tr}, phase_h)
     ks_twin, twins = _with_twins_gpu(Tr, backend, ks_phys, plan, ms, offsets, ranges, M, batch)
-    return NUFFTNonuniformRealGPUPlan{Tr, D, typeof(plan), typeof(cj), typeof(fk_half), typeof(out), typeof(out_host), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
-        plan, cj, fk_half, out, out_host, ms, M, B, iflag, phase, ks_twin, twins, qw)
+    bt = NTuple{length(batch), Int}(batch)
+    return NUFFTNonuniformRealGPUPlan{Tr, D, length(bt), typeof(plan), typeof(cj), typeof(fk_half), typeof(out), typeof(out_host), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
+        bt, plan, cj, fk_half, out, out_host, ms, M, B, iflag, phase, ks_twin, twins, qw)
 end
+
+FFS.Plans.coefficient_size(p::NUFFTNonuniformRealGPUPlan) =
+    (FFS.Packing.packed_size(p.ms, Val(true))..., p.batch...)
+FFS.Plans.coefficient_type(::NUFFTNonuniformRealGPUPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::NUFFTNonuniformRealGPUPlan) = p.ks_phys
 
 # ---- complex path: full native spectrum ----
 

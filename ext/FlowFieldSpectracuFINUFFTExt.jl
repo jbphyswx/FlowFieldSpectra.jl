@@ -119,7 +119,8 @@ end
 
 # ---- device plans (buffers + tables live on the CUDA device) ----
 
-struct cuFINUFFTRealPlan{T, D, G, CJ, FK, OB, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+struct cuFINUFFTRealPlan{T, D, NB, G, CJ, FK, OB, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     guru::G                              # cuFINUFFT guru plan (C resource; self-finalizing, see _guru).
     cj::CJ                               # device (M, ntrans) strengths buffer
     fk::FK                               # device (ns…, ntrans) requested-size native spectrum
@@ -136,7 +137,12 @@ struct cuFINUFFTRealPlan{T, D, G, CJ, FK, OB, PH, KS, TW, QW} <: FFS.AbstractSpe
     qw::QW                               # device (M,) grid quadrature factor, or `nothing`
 end
 
-struct cuFINUFFTComplexPlan{T, D, G, CJ, FK, PH, KS, QW} <: FFS.AbstractSpectralPlan
+FFS.Plans.coefficient_size(p::cuFINUFFTRealPlan) = (p.pms..., p.batch...)
+FFS.Plans.coefficient_type(::cuFINUFFTRealPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::cuFINUFFTRealPlan) = p.ks_phys
+
+struct cuFINUFFTComplexPlan{T, D, NB, G, CJ, FK, PH, KS, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     guru::G
     cj::CJ                               # device (M, ntrans) strengths buffer
     fk::FK                               # device (ms…, ntrans) full native spectrum
@@ -165,8 +171,9 @@ function _gpu_real_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTuple
     fk = CUDA.zeros(Complex{T}, ns..., ntrans)
     out = CUDA.zeros(Complex{T}, pms..., ntrans)
     qw = qw_h === nothing ? nothing : CUDA.CuArray(Complex{T}.(qw_h))
-    return cuFINUFFTRealPlan{T, D, typeof(guru), typeof(cj), typeof(fk), typeof(out), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
-        guru, cj, fk, out, ms, ns, pms, ntrans, M, iflag < 0, phase, ks_twin, twins, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return cuFINUFFTRealPlan{T, D, length(bt), typeof(guru), typeof(cj), typeof(fk), typeof(out), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
+        bt, guru, cj, fk, out, ms, ns, pms, ntrans, M, iflag < 0, phase, ks_twin, twins, qw,
     )
 end
 
@@ -180,8 +187,9 @@ function _gpu_complex_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTu
     cj = CUDA.zeros(Complex{T}, M, ntrans)
     fk = CUDA.zeros(Complex{T}, ms..., ntrans)
     qw = qw_h === nothing ? nothing : CUDA.CuArray(Complex{T}.(qw_h))
-    return cuFINUFFTComplexPlan{T, D, typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys), typeof(qw)}(
-        guru, cj, fk, ms, ntrans, M, phase, ks_phys, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return cuFINUFFTComplexPlan{T, D, length(bt), typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys), typeof(qw)}(
+        bt, guru, cj, fk, ms, ntrans, M, phase, ks_phys, qw,
     )
 end
 
@@ -365,7 +373,12 @@ end
 
 # Device counterpart of the host `FINUFFTSeparablePlan`. `R` marks a real field, so the publish branch
 # folds. An axis pass carries every line of the axis in a single execution.
-struct cuFINUFFTSeparablePlan{T, D, R, G, PI, PF, W, OB, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+FFS.Plans.coefficient_size(p::cuFINUFFTComplexPlan) = (p.ms..., p.batch...)
+FFS.Plans.coefficient_type(::cuFINUFFTComplexPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::cuFINUFFTComplexPlan) = p.ks_phys
+
+struct cuFINUFFTSeparablePlan{T, D, R, NB, G, PI, PF, W, OB, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     gurus::G                         # D × 1-D type-1 guru plan (C resource; self-finalizing)
     pins::PI                         # D × permuted input staging
     pfks::PF                         # D × permuted spectrum staging
@@ -428,11 +441,16 @@ function FFS.plan_spectrum(::FFS.FINUFFTBackend, ::ComputationalBackends.GPUBack
     out = R ? CUDA.zeros(Complex{Tr}, pms..., ntrans) : CUDA.zeros(Complex{Tr}, 1)
     qwh = FFS.Grids.quadrature_scale(g, Tr, npts)
     qw = qwh === nothing ? nothing : CUDA.CuArray(Complex{Tr}.(qwh))
-    return cuFINUFFTSeparablePlan{Tr, D, R, typeof(gurus), typeof(pins), typeof(pfks), typeof(work),
-            typeof(out), typeof(phase), typeof(ks_out), typeof(twins), typeof(qw)}(
-        gurus, pins, pfks, work, out, ms, ns, pms, ntrans, npts, iflag < 0, phase, ks_out, twins, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return cuFINUFFTSeparablePlan{Tr, D, R, length(bt), typeof(gurus), typeof(pins), typeof(pfks),
+            typeof(work), typeof(out), typeof(phase), typeof(ks_out), typeof(twins), typeof(qw)}(
+        bt, gurus, pins, pfks, work, out, ms, ns, pms, ntrans, npts, iflag < 0, phase, ks_out, twins, qw,
     )
 end
+
+FFS.Plans.coefficient_size(p::cuFINUFFTSeparablePlan) = (p.pms..., p.batch...)
+FFS.Plans.coefficient_type(::cuFINUFFTSeparablePlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::cuFINUFFTSeparablePlan) = p.ks_phys
 
 """
     calculate_spectrum!(coeffs, plan::cuFINUFFTSeparablePlan, field) -> ks_phys

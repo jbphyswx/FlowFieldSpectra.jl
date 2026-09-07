@@ -153,7 +153,8 @@ const DEFAULT_BATCH_CHUNK = 4
 @inline _nbatch(batch::Tuple) = prod(batch; init = 1)
 @inline _chunk(B::Int, batch_chunk::Int) = batch_chunk <= 0 ? max(B, 1) : clamp(batch_chunk, 1, max(B, 1))
 
-struct NUFFTNonuniformComplexPlan{T, D, P, CJ, FK, PH, KS, QW} <: FFS.AbstractSpectralPlan
+struct NUFFTNonuniformComplexPlan{T, D, NB, P, CJ, FK, PH, KS, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     plan::P
     cj::CJ                           # C × (M,) reused strengths
     fk::FK                           # C × (ms…) reused full native spectra
@@ -166,7 +167,8 @@ struct NUFFTNonuniformComplexPlan{T, D, P, CJ, FK, PH, KS, QW} <: FFS.AbstractSp
     qw::QW                           # (M,) grid quadrature factor, or `nothing` for a constant measure
 end
 
-struct NUFFTNonuniformRealPlan{T, D, P, CJ, FK, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+struct NUFFTNonuniformRealPlan{T, D, NB, P, CJ, FK, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     plan::P                          # NonuniformFFTs.PlanNUFFT{T<:Real}, packed half
     cj::CJ                           # C × (M,) reused real strengths (no widen)
     fk_half::FK                      # C × (N₁÷2+1, N₂…) reused packed half-spectra
@@ -193,8 +195,9 @@ function _nu_plan(::Type{Complex{Tr}}, coords::Tuple, ms::NTuple{D, Int}, Ls::NT
     NonuniformFFTs.set_points!(plan, scaled)
     cj = ntuple(_ -> Vector{Complex{Tr}}(undef, M), C)
     fk = ntuple(_ -> Array{Complex{Tr}, D}(undef, ms...), C)
-    return NUFFTNonuniformComplexPlan{Tr, D, typeof(plan), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys), typeof(qw)}(
-        plan, cj, fk, ms, M, B, iflag, phase, ks_phys, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return NUFFTNonuniformComplexPlan{Tr, D, length(bt), typeof(plan), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys), typeof(qw)}(
+        bt, plan, cj, fk, ms, M, B, iflag, phase, ks_phys, qw,
     )
 end
 
@@ -209,8 +212,9 @@ function _nu_plan(::Type{Tr}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTuple{D},
     cj = ntuple(_ -> Vector{Tr}(undef, M), C)
     fk_half = ntuple(_ -> Array{Complex{Tr}, D}(undef, size(plan)...), C)
     ks_twin, twins = _with_twins(Tr, ks_phys, plan, ms, offsets, ranges, M, batch)
-    return NUFFTNonuniformRealPlan{Tr, D, typeof(plan), typeof(cj), typeof(fk_half), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
-        plan, cj, fk_half, ms, M, B, iflag, phase, ks_twin, twins, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return NUFFTNonuniformRealPlan{Tr, D, length(bt), typeof(plan), typeof(cj), typeof(fk_half), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
+        bt, plan, cj, fk_half, ms, M, B, iflag, phase, ks_twin, twins, qw,
     )
 end
 
@@ -499,7 +503,17 @@ end
 
 # `R` marks a real field, so the publish branch folds. Every working array shares rank and element type,
 # so indexing them at a runtime axis stays type-stable.
-struct NUFFTSeparablePlan{T, D, R, AP, W, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+FFS.Plans.coefficient_size(p::NUFFTNonuniformComplexPlan) = (p.ms..., p.batch...)
+FFS.Plans.coefficient_type(::NUFFTNonuniformComplexPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::NUFFTNonuniformComplexPlan) = p.ks_phys
+
+FFS.Plans.coefficient_size(p::NUFFTNonuniformRealPlan) =
+    (FFS.Packing.packed_size(p.ms, Val(true))..., p.batch...)
+FFS.Plans.coefficient_type(::NUFFTNonuniformRealPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::NUFFTNonuniformRealPlan) = p.ks_phys
+
+struct NUFFTSeparablePlan{T, D, R, NB, AP, W, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     axes::AP                         # D × AxisPlan, one per grid axis
     work::W                          # D+1 × working arrays; `work[1]` takes the widened field
     ms::NTuple{D, Int}
@@ -516,6 +530,11 @@ end
 
 Base.show(io::IO, ::NUFFTSeparablePlan{T, D, R}) where {T, D, R} =
     print(io, "NUFFTSeparablePlan{$T, $D}(NonuniformFFTs, ", R ? "real" : "complex", ")")
+
+# `pms` is the packed mode count for the field's realness, already the full native size when complex.
+FFS.Plans.coefficient_size(p::NUFFTSeparablePlan) = (p.pms..., p.batch...)
+FFS.Plans.coefficient_type(::NUFFTSeparablePlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::NUFFTSeparablePlan) = p.ks_phys
 
 function FFS.plan_spectrum(::FFS.NonuniformFFTsBackend, ::ComputationalBackends.AbstractExecutionBackend,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
@@ -543,9 +562,10 @@ function FFS.plan_spectrum(::FFS.NonuniformFFTsBackend, ::ComputationalBackends.
     ks_out, twins = R ?
         FFS.Packing.conj_twins(Tr, ks_phys, ms, ns, offsets, ranges, npts, batch) : (ks_phys, ())
     qw = FFS.Grids.quadrature_scale(g, Tr, npts)
-    return NUFFTSeparablePlan{Tr, D, R, typeof(axes), typeof(work), typeof(phase), typeof(ks_out),
-            typeof(twins), typeof(qw)}(
-        axes, work, ms, ns, pms, ntrans, npts, iflag < 0, phase, ks_out, twins, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return NUFFTSeparablePlan{Tr, D, R, length(bt), typeof(axes), typeof(work), typeof(phase),
+            typeof(ks_out), typeof(twins), typeof(qw)}(
+        bt, axes, work, ms, ns, pms, ntrans, npts, iflag < 0, phase, ks_out, twins, qw,
     )
 end
 
@@ -605,6 +625,76 @@ end
 # both `±N₁/2` while the native set holds only `−N₁/2`. On a nonuniformly sampled grid those are
 # different functions of `x`, so no rescaling of the half reconciles them.
 # =============================================================================
+
+# Reusable synthesis: the type-2 plan with its point sorting, the per-chunk spectrum and strength
+# buffers, the offset phase, and the native cube a packed half expands into — all built once.
+struct NUFFTSynthesisPlan{T, D, R, NB, P, FK, CJ, PH, FB, SP} <: FFS.AbstractSynthesisPlan
+    plan::P
+    fks::FK                          # `C` native-cube buffers the type-2 reads
+    cjs::CJ                          # `C` strength vectors it writes
+    phase::PH
+    full::FB                         # the native cube the packed half expands into
+    ms::NTuple{D, Int}
+    spatial::SP
+    batch::NTuple{NB, Int}
+    ntrans::Int
+    M::Int
+    C::Int
+    neg::Bool
+end
+
+Base.show(io::IO, ::NUFFTSynthesisPlan{T, D, R}) where {T, D, R} =
+    print(io, "NUFFTSynthesisPlan{$T, $D}(NonuniformFFTs, ", R ? "real" : "complex", ")")
+
+FFS.Plans.field_size(p::NUFFTSynthesisPlan) = (p.spatial..., p.batch...)
+FFS.Plans.field_type(::NUFFTSynthesisPlan{T, D, R}) where {T, D, R} = R ? T : Complex{T}
+
+function FFS.Plans.plan_synthesis(::FFS.NonuniformFFTsBackend,
+        exec::ComputationalBackends.AbstractExecutionBackend,
+        g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+                 FFS.Grids.PointwiseCartesian},
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1,
+        eps::Union{Nothing, Real} = nothing, batch_chunk::Int = DEFAULT_BATCH_CHUNK,
+        kwargs...) where {T, D}
+    Tr = real(float(T))
+    R = T <: Real
+    coords, spatial = FFS.Grids.point_coordinates(Tr, g, D)
+    Ls = ntuple(d -> FFS.Grids.axis_range(Tr, g, d), D)
+    epsv = eps === nothing ? _default_eps(Tr) : eps
+    bt = NTuple{length(batch), Int}(batch)
+    ntrans = prod(bt; init = 1)
+    scaled, offsets, ranges, M = _scaled_points(Tr, coords, Ls)
+    phase = FFS.Packing.offset_phase(Tr, ms, offsets, ranges, M, Val(false), iflag) .* M
+    hs, σ = _plan_accuracy(epsv, ms)
+    C = _chunk(ntrans, batch_chunk)
+    plan = NonuniformFFTs.PlanNUFFT(Complex{Tr}, ms; ntransforms = Val(C), fftshift = false, m = hs, σ = σ)
+    NonuniformFFTs.set_points!(plan, scaled)
+    fks = ntuple(_ -> Array{Complex{Tr}, D}(undef, ms...), C)
+    cjs = ntuple(_ -> Vector{Complex{Tr}}(undef, M), C)
+    full = Array{Complex{Tr}}(undef, ms..., ntrans)
+    return NUFFTSynthesisPlan{Tr, D, R, length(bt), typeof(plan), typeof(fks), typeof(cjs),
+            typeof(phase), typeof(full), typeof(spatial)}(
+        plan, fks, cjs, phase, full, ms, spatial, bt, ntrans, M, C, iflag < 0)
+end
+
+function FFS.Plans.synthesize!(out::AbstractArray, plan::NUFFTSynthesisPlan{T, D, R},
+        coeffs::AbstractArray; ks = nothing) where {T, D, R}
+    size(out) == FFS.Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(plan))"))
+    sz = FFS.Packing.packed_size(plan.ms, Val(R))
+    size(coeffs)[1:D] == sz || throw(DimensionMismatch(
+        "this plan expects $(sz) on the spectral dims; got $(size(coeffs)[1:D])"))
+    # A packed half expands into the held native cube; a full spectrum is already one.
+    full = if R
+        FFS.Packing.unpacked!(plan.full, reshape(coeffs, sz..., plan.ntrans), plan.ms, ks)
+        plan.full
+    else
+        reshape(coeffs, plan.ms..., plan.ntrans)
+    end
+    _synth_type2!(out, full, plan.phase, plan.plan, plan.fks, plan.cjs, plan.ms, plan.M,
+        plan.ntrans, plan.C, plan.neg)
+    return out
+end
 
 function FFS._synthesize(::FFS.NonuniformFFTsBackend, exec::ComputationalBackends.AbstractExecutionBackend,
         g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},

@@ -364,11 +364,13 @@ end
         pms::NTuple{D, Int}, b::Int) where {D}
     q = twin === nothing ? 0 : Packing.nyquist_mask(ks, I)
     q != 0 && return conj(Packing.twin_at(twin, q, I, b))
+    # Val-unrolled so each `ks[d]` is a compile-time index: a runtime `d` on the mixed
+    # `RFFTAxis`/`FFTAxis` tuple boxes, once per mode per point.
+    idx = ntuple(d -> d == 1 ? I[1] : Packing.neg_index(ks[d], I[d]), Val(D))
     lin = 1
     stride = 1
     @inbounds for d in 1:D
-        idx = d == 1 ? I[1] : Packing.neg_index(ks[d], I[d])
-        lin += (idx - 1) * stride
+        lin += (idx[d] - 1) * stride
         stride *= pms[d]
     end
     return conj(coeffs[lin + off])
@@ -806,25 +808,38 @@ function _sph_direct!(layout, coeffs::AbstractArray{C}, g, field::AbstractArray,
     return sph_run!(coeffs, layout, s, field, lmax, B)
 end
 
-function _synthesize_spherical_direct!(
-    out::AbstractArray{OT},
-    g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
-    coeffs::AbstractArray,
-    lmax::Int,
-) where {OT <: Number}
-    FT = real(float(OT))
-    θraw, φraw = Grids._sph_points(g)     # synthesis reads nodes only; it carries no quadrature
-    θpt = FT.(θraw)
-    φpt = FT.(φraw)
-    N = length(θpt)
+"""
+    sph_synth_setup(grid, ::Type{FT}, lmax) -> NamedTuple
+
+Everything the spherical inverse reads from `grid`: its nodes, the Legendre recurrence tables and the
+per-node `Plm` scratch. Synthesis carries no quadrature, so this is the node list only.
+
+Run it against coefficients with [`sph_synth_run!`](@ref); `DirectSumSynthesisPlan` holds it.
+"""
+function sph_synth_setup(g, ::Type{FT}, lmax::Int) where {FT}
+    θraw, φraw = Grids._sph_points(g)      # synthesis reads nodes only; it carries no quadrature
+    return (; θpt = FT.(θraw), φpt = FT.(φraw), N = length(θraw),
+        tables = SphericalKernels.legendre_tables(FT, lmax),
+        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1))
+end
+
+"""
+    sph_synth_run!(out, setup, coeffs, lmax) -> out
+
+Evaluate the spherical harmonic sum at the setup's nodes, writing `out` `(N, batch…)`.
+"""
+function sph_synth_run!(out::AbstractArray{OT}, s, coeffs::AbstractArray, lmax::Int) where {OT <: Number}
+    θpt = s.θpt
+    φpt = s.φpt
+    N = s.N
+    tables = s.tables
+    Plm = s.Plm
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1
     B = length(out) ÷ N
     O = reshape(out, N, B)
     C = reshape(coeffs, Nθc, Nφc, B)
     fill!(O, zero(OT))
-    tables = SphericalKernels.legendre_tables(FT, lmax)
-    Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
     @inbounds for p in 1:N
         xj = cos(θpt[p])
         sj = sin(θpt[p])
@@ -842,5 +857,13 @@ function _synthesize_spherical_direct!(
     end
     return out
 end
+
+# One-shot: set up against this grid, then run.
+_synthesize_spherical_direct!(
+    out::AbstractArray{OT},
+    g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
+    coeffs::AbstractArray, lmax::Int,
+) where {OT <: Number} =
+    sph_synth_run!(out, sph_synth_setup(g, real(float(OT)), lmax), coeffs, lmax)
 
 end # module DirectSum

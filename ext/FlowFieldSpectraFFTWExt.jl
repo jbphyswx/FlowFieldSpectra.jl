@@ -23,21 +23,32 @@ using FlowGeometries: FlowGeometries
 # Real-input plan: rfft over dims 1:D, writing the packed half directly into the caller buffer. `rfft`
 # computes the `iflag = +1` sign (`Σ f e^{-ikx}`); a real field's `iflag = -1` transform is its
 # conjugate, so `neg` applies that in place.
-struct RFFTPlan{RT, D, P, KS} <: FFS.AbstractSpectralPlan
+struct RFFTPlan{RT, D, NB, P, KS} <: FFS.AbstractSpectralPlan
     fwd::P                        # rfft plan over dims 1:D of a real (N…, batch…) array
     ns::NTuple{D, Int}
+    batch::NTuple{NB, Int}
     norm::RT                      # 1/prod(ns)
     neg::Bool
     ks_phys::KS
 end
 
 # Complex-input plan: C2C fft (or bfft) over dims 1:D, writing the full native spectrum.
-struct CFFTPlan{RT, D, P, KS} <: FFS.AbstractSpectralPlan
+struct CFFTPlan{RT, D, NB, P, KS} <: FFS.AbstractSpectralPlan
     fwd::P                        # fft/bfft plan over dims 1:D of a complex (N…, batch…) array
     ns::NTuple{D, Int}
+    batch::NTuple{NB, Int}
     norm::RT
     ks_phys::KS
 end
+
+FFS.Plans.coefficient_size(p::RFFTPlan{RT, D}) where {RT, D} =
+    (FFS.Packing.packed_size(p.ns, Val(true))..., p.batch...)
+FFS.Plans.coefficient_type(::RFFTPlan{RT}) where {RT} = Complex{RT}
+FFS.Plans.wavenumbers(p::RFFTPlan) = p.ks_phys
+
+FFS.Plans.coefficient_size(p::CFFTPlan) = (p.ns..., p.batch...)
+FFS.Plans.coefficient_type(::CFFTPlan{RT}) where {RT} = Complex{RT}
+FFS.Plans.wavenumbers(p::CFFTPlan) = p.ks_phys
 
 # Plan builders (dispatch on real vs complex element type). `a` is the array to plan on — a fresh sample
 # for a reusable plan (`MEASURE` clobbers it during planning), or the field itself for a one-shot
@@ -47,15 +58,21 @@ function _fftw_plan(::Type{T}, g, ns::NTuple{D, Int}, a::AbstractArray, nthreads
     FFTW.set_num_threads(nthreads)
     fwd = FFTW.plan_rfft(a, 1:D; flags = flags)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(true))
-    return RFFTPlan{T, D, typeof(fwd), typeof(ks)}(fwd, ns, one(T) / prod(ns), iflag < 0, ks)
+    bt = _batch_of(a, Val(D))
+    return RFFTPlan{T, D, length(bt), typeof(fwd), typeof(ks)}(
+        fwd, ns, bt, one(T) / prod(ns), iflag < 0, ks)
 end
+
+# The batch shape the plan was built over: whatever trails the `D` spatial dims of the planning array.
+_batch_of(a::AbstractArray, ::Val{D}) where {D} = ntuple(i -> size(a, D + i), max(ndims(a) - D, 0))
 
 function _fftw_plan(::Type{Complex{RT}}, g, ns::NTuple{D, Int}, a::AbstractArray, nthreads::Int, flags;
         iflag::Int = 1) where {RT<:Real, D}
     FFTW.set_num_threads(nthreads)
     fwd = iflag == 1 ? FFTW.plan_fft(a, 1:D; flags = flags) : FFTW.plan_bfft(a, 1:D; flags = flags)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(false))
-    return CFFTPlan{RT, D, typeof(fwd), typeof(ks)}(fwd, ns, one(RT) / prod(ns), ks)
+    bt = _batch_of(a, Val(D))
+    return CFFTPlan{RT, D, length(bt), typeof(fwd), typeof(ks)}(fwd, ns, bt, one(RT) / prod(ns), ks)
 end
 
 """
@@ -203,6 +220,72 @@ function FFS._region_fft_exec!(out::AbstractArray, r::RegionFFT, field::Abstract
     copyto!(r.scratch, field)
     r.conj_in && !r.halve && (r.scratch .= conj.(r.scratch))
     LA.mul!(out, r.fwd, r.scratch)
+    return out
+end
+
+# =============================================================================
+# Reusable synthesis: the backward FFTW plan and the buffer its c2r consumes, built once.
+#
+# FFTW's multi-dimensional c2r has no `PRESERVE_INPUT`, so the real path transforms a COPY and the
+# caller's `coeffs` survives. `brfft` is unnormalized and the forward carried `1/∏N`, so neither
+# direction rescales.
+# =============================================================================
+
+struct FFTWSynthesisPlan{RT, D, NB, R, P, SC} <: FFS.AbstractSynthesisPlan
+    bwd::P
+    scratch::SC                   # the c2r's input copy; the complex path reads `coeffs` directly
+    ns::NTuple{D, Int}
+    batch::NTuple{NB, Int}
+    neg::Bool
+end
+
+Base.show(io::IO, ::FFTWSynthesisPlan{RT, D, NB, R}) where {RT, D, NB, R} =
+    print(io, "FFTWSynthesisPlan{$RT, $D}(", R ? "real" : "complex", ")")
+
+FFS.Plans.field_size(p::FFTWSynthesisPlan) = (p.ns..., p.batch...)
+FFS.Plans.field_type(::FFTWSynthesisPlan{RT, D, NB, R}) where {RT, D, NB, R} = R ? RT : Complex{RT}
+
+function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
+        exec::ComputationalBackends.AbstractExecutionBackend,
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, kwargs...) where {T, D}
+    FlowGeometries.Grids.isuniform(g) || throw(ArgumentError(
+        "FFTSpectralBackend needs a uniform axis in every direction; got a stretched axis."))
+    ns = size(g)
+    Tuple(ms) == ns || throw(ArgumentError(
+        "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform."))
+    FFTW.set_num_threads(FFS._backend_nthreads(exec))
+    RT = real(float(T))
+    R = T <: Real
+    bt = NTuple{length(batch), Int}(batch)
+    if R
+        scratch = Array{Complex{RT}}(undef, FFS.Packing.packed_size(ns, Val(true))..., bt...)
+        bwd = FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.MEASURE)
+    else
+        scratch = Array{Complex{RT}}(undef, ns..., bt...)
+        bwd = iflag == 1 ? FFTW.plan_bfft(scratch, 1:D; flags = FFTW.MEASURE) :
+                           FFTW.plan_fft(scratch, 1:D; flags = FFTW.MEASURE)
+    end
+    return FFTWSynthesisPlan{RT, D, length(bt), R, typeof(bwd), typeof(scratch)}(
+        bwd, scratch, ns, bt, iflag < 0)
+end
+
+# A uniform grid's twins equal their negated-index partners, and FFT requires a uniform grid, so `ks`
+# carries nothing this inverse needs.
+function FFS.Plans.synthesize!(out::AbstractArray, plan::FFTWSynthesisPlan{RT, D, NB, R},
+        coeffs::AbstractArray; ks = nothing) where {RT, D, NB, R}
+    size(coeffs) == size(plan.scratch) || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this plan was built for $(size(plan.scratch)) — pass the matching " *
+        "`batch=` and element type to plan_synthesis"))
+    size(out) == FFS.Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(plan))"))
+    # A real field's `iflag = -1` half is the conjugate of its `+1` half.
+    if R
+        plan.neg ? (plan.scratch .= conj.(coeffs)) : copyto!(plan.scratch, coeffs)
+        LA.mul!(out, plan.bwd, plan.scratch)
+    else
+        LA.mul!(out, plan.bwd, coeffs)
+    end
     return out
 end
 

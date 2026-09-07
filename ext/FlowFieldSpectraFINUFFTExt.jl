@@ -42,7 +42,8 @@ function _fill_strengths!(cj::AbstractMatrix, field, qw)
 end
 
 # A real field's plan carries the packed gather table + twins; a complex field's carries the native-order phase.
-struct FINUFFTRealPlan{T, D, G, CJ, FK, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+struct FINUFFTRealPlan{T, D, NB, G, CJ, FK, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     guru::G                          # guru plan (C resource; self-finalizing, see _guru).
     cj::CJ                           # (M, ntrans) complex strengths buffer
     fk::FK                           # (ns…, ntrans) requested-size native spectrum buffer
@@ -58,7 +59,8 @@ struct FINUFFTRealPlan{T, D, G, CJ, FK, PH, KS, TW, QW} <: FFS.AbstractSpectralP
     qw::QW                           # grid quadrature factor, or `nothing` for a constant measure
 end
 
-struct FINUFFTComplexPlan{T, D, G, CJ, FK, PH, KS, QW} <: FFS.AbstractSpectralPlan
+struct FINUFFTComplexPlan{T, D, NB, G, CJ, FK, PH, KS, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     guru::G
     cj::CJ                           # (M, ntrans) complex strengths buffer
     fk::FK                           # (ms…, ntrans) full native spectrum buffer
@@ -72,6 +74,14 @@ end
 
 Base.show(io::IO, ::FINUFFTRealPlan{T, D}) where {T, D} = print(io, "FINUFFTRealPlan{$T, $D}(FINUFFT)")
 Base.show(io::IO, ::FINUFFTComplexPlan{T, D}) where {T, D} = print(io, "FINUFFTComplexPlan{$T, $D}(FINUFFT)")
+
+FFS.Plans.coefficient_size(p::FINUFFTRealPlan) = (p.pms..., p.batch...)
+FFS.Plans.coefficient_type(::FINUFFTRealPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::FINUFFTRealPlan) = p.ks_phys
+
+FFS.Plans.coefficient_size(p::FINUFFTComplexPlan) = (p.ms..., p.batch...)
+FFS.Plans.coefficient_type(::FINUFFTComplexPlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::FINUFFTComplexPlan) = p.ks_phys
 
 # Point scaling shared by both paths: points folded to [0, 2π) plus the per-axis offset and period.
 function _scaled_points(::Type{T}, coords::Tuple, Ls::NTuple{D}) where {T, D}
@@ -118,8 +128,9 @@ function _nufft_real_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, Ls::NTup
     ks_twin, twins = FFS.Packing.conj_twins(T, ks_phys, ms, ns, offsets, ranges, M, batch)
     cj = Matrix{Complex{T}}(undef, M, ntrans)
     fk = Array{Complex{T}, D + 1}(undef, ns..., ntrans)
-    return FINUFFTRealPlan{T, D, typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
-        guru, cj, fk, ms, ns, pms, ntrans, M, iflag < 0, phase, ks_twin, twins, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return FINUFFTRealPlan{T, D, length(bt), typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_twin), typeof(twins), typeof(qw)}(
+        bt, guru, cj, fk, ms, ns, pms, ntrans, M, iflag < 0, phase, ks_twin, twins, qw,
     )
 end
 
@@ -132,8 +143,9 @@ function _nufft_complex_plan(::Type{T}, coords::Tuple, ms::NTuple{D, Int}, Ls::N
     ks_phys = FFS.Grids.physical_wavenumbers(ranges, ms, Val(false))
     cj = Matrix{Complex{T}}(undef, M, ntrans)
     fk = Array{Complex{T}, D + 1}(undef, ms..., ntrans)
-    return FINUFFTComplexPlan{T, D, typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys), typeof(qw)}(
-        guru, cj, fk, ms, ntrans, M, phase, ks_phys, qw,
+    bt = NTuple{length(batch), Int}(batch)
+    return FINUFFTComplexPlan{T, D, length(bt), typeof(guru), typeof(cj), typeof(fk), typeof(phase), typeof(ks_phys), typeof(qw)}(
+        bt, guru, cj, fk, ms, ntrans, M, phase, ks_phys, qw,
     )
 end
 
@@ -397,7 +409,8 @@ FFS._axis_nufft_exec!(out::AbstractArray, a::AxisGuru, A::AbstractArray, d::Int)
 
 # `R` marks a real field, so the publish branch folds. Every working array shares rank and element type,
 # and so does every per-axis buffer, so indexing them at a runtime axis stays type-stable.
-struct FINUFFTSeparablePlan{T, D, R, G, CJ, FK, W, IX, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+struct FINUFFTSeparablePlan{T, D, R, NB, G, CJ, FK, W, IX, PH, KS, TW, QW} <: FFS.AbstractSpectralPlan
+    batch::NTuple{NB, Int}
     gurus::G                         # D × 1-D type-1 guru plan (C resource; self-finalizing)
     cjs::CJ                          # D × (N_d, C_d) strengths
     fks::FK                          # D × (ns_d, C_d) spectra
@@ -418,6 +431,10 @@ end
 
 Base.show(io::IO, ::FINUFFTSeparablePlan{T, D, R}) where {T, D, R} =
     print(io, "FINUFFTSeparablePlan{$T, $D}(FINUFFT, ", R ? "real" : "complex", ")")
+
+FFS.Plans.coefficient_size(p::FINUFFTSeparablePlan) = (p.pms..., p.batch...)
+FFS.Plans.coefficient_type(::FINUFFTSeparablePlan{T}) where {T} = Complex{T}
+FFS.Plans.wavenumbers(p::FINUFFTSeparablePlan) = p.ks_phys
 
 function FFS.plan_spectrum(::FFS.FINUFFTBackend, exec::ComputationalBackends.AbstractExecutionBackend,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
@@ -460,9 +477,10 @@ function FFS.plan_spectrum(::FFS.FINUFFTBackend, exec::ComputationalBackends.Abs
     qw = FFS.Grids.quadrature_scale(g, Tr, npts)
     inoff = Vector{Int}(undef, Cmax)
     outoff = Vector{Int}(undef, Cmax)
-    return FINUFFTSeparablePlan{Tr, D, R, typeof(gurus), typeof(cjs), typeof(fks), typeof(work),
+    bt = NTuple{length(batch), Int}(batch)
+    return FINUFFTSeparablePlan{Tr, D, R, length(bt), typeof(gurus), typeof(cjs), typeof(fks), typeof(work),
             typeof(inoff), typeof(phase), typeof(ks_out), typeof(twins), typeof(qw)}(
-        gurus, cjs, fks, work, inoff, outoff,
+        bt, gurus, cjs, fks, work, inoff, outoff,
         ms, ns, pms, ntrans, npts, iflag < 0, phase, ks_out, twins, qw,
     )
 end
@@ -568,6 +586,77 @@ function FFS._synthesize(::FFS.FINUFFTBackend, exec::ComputationalBackends.Abstr
         return out
     end
     return reshape(copy(cj), spatial..., batch...)
+end
+
+# =============================================================================
+# Reusable synthesis: the type-2 guru plan with its points preset, the phase, and every buffer the
+# execution walks — the native cube a packed half expands into, the phased spectrum the guru reads, and
+# the strengths it writes.
+# =============================================================================
+
+struct FINUFFTSynthesisPlan{T, D, R, NB, G, FK, CJ, PH, FB, SP} <: FFS.AbstractSynthesisPlan
+    guru::G
+    fk::FK
+    cj::CJ
+    phase::PH
+    full::FB
+    ms::NTuple{D, Int}
+    spatial::SP
+    batch::NTuple{NB, Int}
+    ntrans::Int
+    M::Int
+end
+
+# A default show of a struct holding FINUFFT plans can segfault.
+Base.show(io::IO, ::FINUFFTSynthesisPlan{T, D, R}) where {T, D, R} =
+    print(io, "FINUFFTSynthesisPlan{$T, $D}(FINUFFT, ", R ? "real" : "complex", ")")
+
+FFS.Plans.field_size(p::FINUFFTSynthesisPlan) = (p.spatial..., p.batch...)
+FFS.Plans.field_type(::FINUFFTSynthesisPlan{T, D, R}) where {T, D, R} = R ? T : Complex{T}
+
+function FFS.Plans.plan_synthesis(::FFS.FINUFFTBackend, exec::ComputationalBackends.AbstractExecutionBackend,
+        g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+                 FFS.Grids.PointwiseCartesian},
+        ::Type{TT}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1,
+        eps::Union{Nothing, Real} = nothing, kwargs...) where {TT, D}
+    T = real(float(TT))
+    R = TT <: Real
+    coords, spatial = FFS.Grids.point_coordinates(T, g, D)
+    Ls = ntuple(d -> FFS.Grids.axis_range(T, g, d), D)
+    scaled, offsets, ranges, M = _scaled_points(T, coords, Ls)
+    epsv = eps === nothing ? _default_eps(T) : eps
+    bt = NTuple{length(batch), Int}(batch)
+    ntrans = prod(bt; init = 1)
+    guru = _guru2(T, scaled, ms, ntrans, iflag, epsv, FFS._backend_nthreads(exec))
+    phase = FFS.Packing.offset_phase(T, ms, offsets, ranges, M, Val(false), iflag) .* M
+    return FINUFFTSynthesisPlan{T, D, R, length(bt), typeof(guru), Array{Complex{T}, D + 1},
+            Matrix{Complex{T}}, typeof(phase), Array{Complex{T}, D + 1}, typeof(spatial)}(
+        guru, Array{Complex{T}}(undef, ms..., ntrans), Matrix{Complex{T}}(undef, M, ntrans),
+        phase, Array{Complex{T}}(undef, ms..., ntrans), ms, spatial, bt, ntrans, M)
+end
+
+function FFS.Plans.synthesize!(out::AbstractArray, plan::FINUFFTSynthesisPlan{T, D, R},
+        coeffs::AbstractArray; ks = nothing) where {T, D, R}
+    size(out) == FFS.Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(plan))"))
+    sz = FFS.Packing.packed_size(plan.ms, Val(R))
+    size(coeffs)[1:D] == sz || throw(DimensionMismatch(
+        "this plan expects $(sz) on the spectral dims; got $(size(coeffs)[1:D])"))
+    full = if R
+        FFS.Packing.unpacked!(plan.full, reshape(coeffs, sz..., plan.ntrans), plan.ms, ks)
+        plan.full
+    else
+        reshape(coeffs, plan.ms..., plan.ntrans)
+    end
+    Pm = prod(plan.ms)
+    @inbounds for t in 1:plan.ntrans, i in 1:Pm
+        plan.fk[i + (t - 1) * Pm] = full[i + (t - 1) * Pm] * conj(plan.phase[i])
+    end
+    FINUFFT.finufft_exec!(plan.guru, plan.fk, plan.cj)
+    @inbounds for i in eachindex(plan.cj)
+        out[i] = R ? real(plan.cj[i]) : plan.cj[i]
+    end
+    return out
 end
 
 end # module FlowFieldSpectraFINUFFTExt

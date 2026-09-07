@@ -22,6 +22,7 @@ FlowFieldSpectra._to_host
 ```@docs
 FlowFieldSpectra.DirectSumCartesianPlan
 FlowFieldSpectra.DirectSumSphericalPlan
+FlowFieldSpectra.DirectSumSynthesisPlan
 FlowFieldSpectra.HybridPlan
 FlowFieldSpectra._hybrid_plan
 FlowFieldSpectra._hybrid_derive
@@ -40,6 +41,8 @@ FlowFieldSpectra.DirectSum.cart_run!
 FlowFieldSpectra.DirectSum.AxisPass
 FlowFieldSpectra.DirectSum.sph_setup
 FlowFieldSpectra.DirectSum.sph_run!
+FlowFieldSpectra.DirectSum.sph_synth_setup
+FlowFieldSpectra.DirectSum.sph_synth_run!
 ```
 
 ## Grids

@@ -33,7 +33,7 @@ Reusable scattered-spherical NUFSHT plan: the fixed-node NUFSHT plan (point pres
 the reused real-coefficient buffer, and — for `solve=true` — the LSMR solve workspace, all built once for a
 fixed point set and batch shape. Reuse across many fields via `calculate_spectrum!`.
 """
-struct NUSHTSphericalPlan{T, NB, P, CR, WS, QW, FW, KS} <: FFS.AbstractSpectralPlan
+struct NUSHTSphericalPlan{T, CT, NB, P, CR, WS, QW, FW, KS} <: FFS.AbstractSpectralPlan
     plan::P                       # NUFSHT.NUSHTplan (fixed nodes + FINUFFT setup), ntrans = C
     C_real::CR                    # (Nθ, Nφ, C) real NUFSHT coeff buffer (FSH sph_mode layout), reused
     ws::WS                        # LSMRWorkspace for solve=true (built once); nothing otherwise
@@ -64,6 +64,10 @@ _chunk(B::Int, bc::Int) = bc <= 0 ? max(B, 1) : clamp(bc, 1, max(B, 1))
 # Custom show: the wrapped NUFSHT plan holds FINUFFT plans, whose default printing can segfault.
 Base.show(io::IO, p::NUSHTSphericalPlan{T}) where {T} =
     print(io, "NUSHTSphericalPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, p.solve ? ", solve" : "", ")")
+
+FFS.Plans.coefficient_size(p::NUSHTSphericalPlan) = (p.Nθ, p.Nφ, p.batch...)
+FFS.Plans.coefficient_type(::NUSHTSphericalPlan{T, CT}) where {T, CT} = CT
+FFS.Plans.wavenumbers(p::NUSHTSphericalPlan) = p.ks
 
 # `fw[j, b] = w[j] · part(field[j, lo+b-1])` for the `nvalid` slices of one chunk, the strengths whose
 # adjoint is the quadrature projection; the chunk's unused slices are zero-filled, so a partial final
@@ -107,9 +111,9 @@ function _solve_field!(fw::AbstractMatrix{FT}, field, part, lo::Int, nvalid::Int
     return fw
 end
 
-function _nusht_plan(::Type{FT}, g, ms::Tuple, batch::NTuple{NB, Int}, exec;
+function _nusht_plan(::Type{CT}, ::Type{FT}, g, ms::Tuple, batch::NTuple{NB, Int}, exec;
         tol::Real, solve::Bool, maxiter::Int, rtol::Real, nufft, batch_chunk::Int,
-        sampling = nothing, weights = nothing) where {FT, NB}
+        sampling = nothing, weights = nothing) where {CT, FT, NB}
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
@@ -122,7 +126,7 @@ function _nusht_plan(::Type{FT}, g, ms::Tuple, batch::NTuple{NB, Int}, exec;
     ws = solve ? NUFSHT.LSMRWorkspace(plan) : nothing
     fw = zeros(FT, N, C)
     ks = (0:lmax, -lmax:lmax)
-    return NUSHTSphericalPlan{FT, NB, typeof(plan), typeof(C_real), typeof(ws), typeof(w), typeof(fw), typeof(ks)}(
+    return NUSHTSphericalPlan{FT, CT, NB, typeof(plan), typeof(C_real), typeof(ws), typeof(w), typeof(fw), typeof(ks)}(
         plan, C_real, ws, w, fw, lmax, Nθ, Nφ, batch, B, C, solve, maxiter, FT(rtol), ks)
 end
 
@@ -148,7 +152,7 @@ function FFS.plan_spectrum(::SB.AbstractNUFSHTSpectralBackend,
         batch_chunk::Int = DEFAULT_BATCH_CHUNK,
         sampling = nothing, weights = nothing, kwargs...) where {T}
     FT = real(float(T))
-    return _nusht_plan(FT, g, ms, NTuple{length(batch), Int}(batch), exec;
+    return _nusht_plan(FFS.sph_coeff_type(T, FT), FT, g, ms, NTuple{length(batch), Int}(batch), exec;
         tol = tol, solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft,
         batch_chunk = batch_chunk, sampling = sampling, weights = weights)
 end
@@ -207,9 +211,10 @@ function FFS._calculate_spectrum_nufsht(exec::Union{ComputationalBackends.Abstra
         sampling = nothing, weights = nothing, kwargs...)
     FT = real(float(eltype(field)))
     batch = FFS.Grids.field_batch_shape(g, field)
-    plan = _nusht_plan(FT, g, ms, batch, exec; tol = tol, solve = solve, maxiter = maxiter, rtol = rtol,
-        nufft = nufft, batch_chunk = batch_chunk, sampling = sampling, weights = weights)
-    coeffs = zeros(FFS.sph_coeff_type(eltype(field), FT), plan.Nθ, plan.Nφ, batch...)
+    plan = _nusht_plan(FFS.sph_coeff_type(eltype(field), FT), FT, g, ms, batch, exec; tol = tol,
+        solve = solve, maxiter = maxiter, rtol = rtol, nufft = nufft, batch_chunk = batch_chunk,
+        sampling = sampling, weights = weights)
+    coeffs = FFS.allocate_coefficients(plan)
     FFS.calculate_spectrum!(coeffs, plan, field)
     return coeffs, plan.ks
 end
@@ -220,6 +225,77 @@ end
 # `sph_mode` real buffer. NUFSHT's coefficients are real, so a complex coefficient array is evaluated
 # one real component at a time, which the transform's linearity permits.
 # =============================================================================
+
+# Reusable synthesis: the fixed-node NUFSHT plan (points preset once) plus the real coefficient buffer
+# its type-2 reads and the field buffer it writes.
+struct NUSHTSynthesisPlan{FT, R, NB, P, CR, FB, SP} <: FFS.AbstractSynthesisPlan
+    plan::P
+    Cr::CR
+    f::FB
+    lmax::Int
+    Nθ::Int
+    Nφ::Int
+    N::Int
+    spatial::SP
+    batch::NTuple{NB, Int}
+    B::Int
+end
+
+# A default show of a struct holding FINUFFT plans can segfault.
+Base.show(io::IO, p::NUSHTSynthesisPlan{FT, R}) where {FT, R} =
+    print(io, "NUSHTSynthesisPlan{", FT, "}(lmax=", p.lmax, ", ", R ? "real" : "complex", ")")
+
+FFS.Plans.field_size(p::NUSHTSynthesisPlan) = (p.spatial..., p.batch...)
+FFS.Plans.field_type(::NUSHTSynthesisPlan{FT, R}) where {FT, R} = R ? FT : Complex{FT}
+
+function FFS.Plans.plan_synthesis(::SB.AbstractNUFSHTSpectralBackend,
+        exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
+        ::Type{T}, ms::NTuple{2, Int}; batch::Tuple = (), tol::Real = 1.0e-8,
+        nufft::SB.AbstractSpectralBackend = SB.AutoSpectralBackend(), kwargs...) where {T}
+    FT = real(float(T))
+    lmax = ms[1] - 1
+    Nθ = lmax + 1
+    Nφ = 2 * lmax + 1
+    θ, φ = FFS.Grids._sph_points(g)
+    N = length(θ)
+    bt = NTuple{length(batch), Int}(batch)
+    B = prod(bt; init = 1)
+    plan = NUFSHT.make_plan(FT, θ, φ, lmax; tol = tol, ntrans = B,
+        nthreads = FFS._backend_nthreads(exec), nufft = nufft)
+    sp = size(g)
+    return NUSHTSynthesisPlan{FT, T <: Real, length(bt), typeof(plan), Array{FT, 3}, Matrix{FT}, typeof(sp)}(
+        plan, zeros(FT, Nθ, Nφ, B), zeros(FT, N, B), lmax, Nθ, Nφ, N, sp, bt, B)
+end
+
+# NUFSHT's coefficients are real, so a complex array is evaluated one component at a time and
+# recombined, which the transform's linearity permits.
+function FFS.Plans.synthesize!(out::AbstractArray, plan::NUSHTSynthesisPlan{FT, R},
+        coeffs::AbstractArray; ks = nothing) where {FT, R}
+    size(out) == FFS.Plans.field_size(plan) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(plan))"))
+    size(coeffs)[1:2] == (plan.Nθ, plan.Nφ) || throw(DimensionMismatch(
+        "spherical coefficients must be (Nθ, Nφ) = ($(plan.Nθ), $(plan.Nφ)) on the spectral dims; " *
+        "got $(size(coeffs)[1:2])"))
+    lmax = plan.lmax
+    B = plan.B
+    Cc = reshape(coeffs, plan.Nθ, plan.Nφ, B)
+    O = reshape(out, plan.N, B)
+    ET = R ? FT : Complex{FT}
+    fill!(O, zero(ET))
+    ncomp = R ? 1 : 2
+    @inbounds for comp in 1:ncomp
+        for b in 1:B, l in 0:lmax, m in -l:l
+            z = Cc[FFS.sph_mode_index(l, m), b]
+            plan.Cr[NUFSHT.FastSphericalHarmonics.sph_mode(l, m), b] = comp == 1 ? real(z) : imag(z)
+        end
+        NUFSHT.nusht_type2!(plan.f, plan.Cr, plan.plan)
+        for b in 1:B, j in 1:plan.N
+            O[j, b] += comp == 1 ? ET(plan.f[j, b]) : ET(im * plan.f[j, b])
+        end
+    end
+    return out
+end
 
 function FFS._synthesize(::SB.AbstractNUFSHTSpectralBackend,
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},

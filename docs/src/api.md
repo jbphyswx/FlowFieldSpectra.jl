@@ -17,6 +17,53 @@ FFTW's plan, a NUFFT's point sorting, the direct sum's per-axis DFT matrices and
 spherical grid's nodes and quadrature — so `calculate_spectrum!(coeffs, plan, field)` in a time loop
 allocates nothing.
 
+A plan answers for its own output, so it is sufficient to preallocate against:
+
+```@docs
+coefficient_size
+coefficient_type
+wavenumbers
+allocate_coefficients
+```
+
+```julia
+p = plan_spectrum(grid, Float64, ms; transform = FFTSpectralBackend(), batch = (nz,))
+coeffs = allocate_coefficients(p)          # right shape and element type, from the plan alone
+for t in times
+    ks = calculate_spectrum!(coeffs, p, field_at(t))
+end
+```
+
+The element type is not implied by the size: a Cartesian plan's coefficients are complex, while a
+spherical plan's follow the field and are real for a real one.
+
+The inverse has the same pair, so a round trip on one grid reuses both directions:
+
+```@docs
+AbstractSynthesisPlan
+plan_synthesis
+synthesize!
+field_size
+field_type
+allocate_field
+```
+
+```julia
+fwd = plan_spectrum(grid, Float64, ms; transform = FFTSpectralBackend(), batch = (nz,))
+inv = plan_synthesis(grid, Float64, ms; transform = FFTSpectralBackend(), batch = (nz,))
+coeffs = allocate_coefficients(fwd)
+field  = allocate_field(inv)
+for t in times
+    ks = calculate_spectrum!(coeffs, fwd, snapshot(t))
+    filter!(coeffs)
+    synthesize!(field, inv, coeffs; ks = ks)
+end
+```
+
+`synthesize!` takes `ks` because a plan holds what the *grid* fixes, while the Nyquist twin a packed
+inverse needs on a nonuniformly-sampled grid is a functional of the coefficients and arrives with them.
+A uniform grid needs none.
+
 ### The packed layout
 
 A real Cartesian field transforms to the rfft-packed half `(m_1÷2+1, m_2…, batch…)`, the complete

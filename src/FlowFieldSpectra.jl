@@ -1,5 +1,8 @@
 module FlowFieldSpectra
 
+# First, so its `__init__` selects the OpenMP runtime's thread-local mode before FastTransforms loads
+# that runtime; see `FlowTransformBindings.with_fasttransforms_threads`.
+using FlowTransformBindings: FlowTransformBindings
 using PrecompileTools: PrecompileTools
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends

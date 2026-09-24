@@ -74,7 +74,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
     Test.@testset "Explicit imports (no implicit / no stale)" begin
         Test.@test (EI.check_no_implicit_imports(FFS); true)
-        Test.@test (EI.check_no_stale_explicit_imports(FFS); true)
+        # The core imports FlowTransformBindings only so its `__init__` runs before FastTransforms loads.
+        Test.@test (EI.check_no_stale_explicit_imports(FFS; ignore = (:FlowTransformBindings,)); true)
         for extname in (
             :FlowFieldSpectraFFTWExt, :FlowFieldSpectraFINUFFTExt,
             :FlowFieldSpectraFastSphericalHarmonicsExt, :FlowFieldSpectraNonuniformFFTsExt, :FlowFieldSpectraNUFSHTExt,

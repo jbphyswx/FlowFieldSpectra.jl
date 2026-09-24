@@ -5,6 +5,7 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # =============================================================================
 # DistributedBackend execution, tensor-native. Point-partitionable transforms (DirectSum / NUFFT /
@@ -22,6 +23,10 @@ _is_scattered(::FlowGeometries.Grids.AbstractUnstructuredGrid) = true
 _is_scattered(::FlowGeometries.Grids.AbstractCurvilinearGrid) = true
 _is_scattered(::FlowGeometries.Grids.AbstractGrid) = false
 
+# A chunk on a worker runs FastTransforms on one OpenMP thread there, the processes carrying the
+# parallelism. The scope is set inside the `pmap` body because a scoped value does not cross processes.
+_serial_ft(f) = Base.ScopedValues.with(f, FTB.FASTTRANSFORMS_THREADS => 1)
+
 # Round-robin point chunks (balanced across the domain); contiguous batch chunks.
 _index_chunks(N::Integer, nw::Integer) = [collect(w:max(1, nw):N) for w in 1:max(1, nw)]
 _batch_chunks(B::Integer, nw::Integer) = [(((w - 1) * B) ÷ nw + 1):((w * B) ÷ nw) for w in 1:nw]
@@ -38,7 +43,7 @@ function _distributed_pointsum(inner, transform, g::FlowGeometries.Grids.Abstrac
     partials = Distributed.pmap(chunks) do idx
         sg = FFS._subgrid(g, idx)
         sf = collect(selectdim(fieldP, 1, idx))
-        cw, kw = FFS.calculate_spectrum(transform, inner, sg, sf, ms; kwargs...)
+        cw, kw = _serial_ft(() -> FFS.calculate_spectrum(transform, inner, sg, sf, ms; kwargs...))
         (Array(cw), FFS._ks_twin(kw), length(idx))
     end
     FT = real(eltype(partials[1][1]))
@@ -66,7 +71,7 @@ function _distributed_batch(inner, transform, g::FlowGeometries.Grids.AbstractGr
     spatial_out = FFS._coeff_spatial(g, ms, R)
     parts = Distributed.pmap(chunks) do bc
         fslice = collect(selectdim(fieldB, ns + 1, bc))
-        cw, kw = FFS.calculate_spectrum(transform, inner, g, fslice, ms; kwargs...)
+        cw, kw = _serial_ft(() -> FFS.calculate_spectrum(transform, inner, g, fslice, ms; kwargs...))
         (Array(cw), FFS._ks_twin(kw), collect(bc))
     end
     coeffsB = Array{eltype(parts[1][1])}(undef, spatial_out..., B)

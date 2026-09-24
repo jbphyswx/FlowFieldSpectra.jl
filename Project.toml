@@ -11,6 +11,7 @@ projects = ["test", "docs", "examples", "gpu", "benchmark"]
 [deps]
 ComputationalBackends = "5c6e2104-4040-447f-8fc0-66ec2223b019"
 FlowGeometries = "0ccd6995-f618-4175-b01e-f437d0cb4974"
+FlowTransformBindings = "73c6b5d6-1010-4337-8b9e-d550f02c124c"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 SpectralBackends = "289ded02-b044-41b2-8b2d-71f2a47755d1"
@@ -63,6 +64,7 @@ FFTW = "1"
 FINUFFT = "3"
 FastSphericalHarmonics = "1"
 FlowGeometries = "0.1"
+FlowTransformBindings = "0.1"
 KernelAbstractions = "0.9"
 LinearAlgebra = "1.10"
 MPI = "0.20"
@@ -79,5 +81,6 @@ julia = "1.11"
 [sources]
 ComputationalBackends = { url = "https://github.com/jbphyswx/ComputationalBackends.jl" }
 FlowGeometries = { url = "https://github.com/jbphyswx/FlowGeometries.jl" }
+FlowTransformBindings = { url = "https://github.com/jbphyswx/FlowTransformBindings.jl.git" }
 NUFSHT = { url = "https://github.com/jbphyswx/NUFSHT.jl" }
 SpectralBackends = { url = "https://github.com/jbphyswx/SpectralBackends.jl" }

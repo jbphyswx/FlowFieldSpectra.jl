@@ -5,6 +5,12 @@ using FlowFieldSpectra: FlowFieldSpectra as FFS
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
+using FlowTransformBindings: FlowTransformBindings as FTB
+
+# Each transform runs through `FTB.with_fasttransforms_threads`, which sets FastTransforms' OpenMP count
+# on the calling OS thread and restores it after.
+_transform!(slab) = FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(slab))
+_evaluate!(slab) = FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(slab))
 
 # =============================================================================
 # Structured Spherical Harmonic Transform via FastSphericalHarmonics (FastTransforms). `sph_transform!`
@@ -43,11 +49,11 @@ function FFS._calculate_spectrum_sht(g::FlowGeometries.Grids.AbstractStructuredG
     slab = Matrix{FT}(undef, Nθ, Nφ)
     @inbounds for b in 1:B
         _ft_stage!(slab, Fr, rowperm, colperm, b, FT, real)
-        FSH.sph_transform!(slab)                               # exact analysis, in place
+        _transform!(slab)                                      # exact analysis, in place
         _ft_gather!(coeffs, slab, lmax, b, one(FT))
         if !(eltype(field) <: Real)
             _ft_stage!(slab, Fr, rowperm, colperm, b, FT, imag)
-            FSH.sph_transform!(slab)
+            _transform!(slab)
             _ft_gather!(coeffs, slab, lmax, b, im)
         end
     end
@@ -169,7 +175,7 @@ function FFS.Plans.synthesize!(out::AbstractArray, plan::FSHTSynthesisPlan{FT, R
             z = C[FFS.sph_mode_index(l, m), b]
             slab[FSH.sph_mode(l, m)] = comp == 1 ? real(z) : imag(z)
         end
-        FSH.sph_evaluate!(slab)
+        _evaluate!(slab)
         for (ic, jc) in enumerate(plan.colperm), (ir, jr) in enumerate(plan.rowperm)
             v = slab[ir, ic]
             O[jc, jr, b] += comp == 1 ? ET(v) : ET(im * v)
@@ -207,7 +213,7 @@ function FFS._synthesize(::SpectralBackends.AbstractFSHTSpectralBackend,
             z = C[FFS.sph_mode_index(l, m), b]
             slab[FSH.sph_mode(l, m)] = comp == 1 ? real(z) : imag(z)
         end
-        FSH.sph_evaluate!(slab)                                # exact synthesis, in place
+        _evaluate!(slab)                                       # exact synthesis, in place
         for (ic, jc) in enumerate(colperm), (ir, jr) in enumerate(rowperm)
             v = slab[ir, ic]                                   # FastTransforms (θ ir, φ ic) → (nlon jc, nlat jr)
             O[jc, jr, b] += comp == 1 ? ET(v) : ET(im * v)

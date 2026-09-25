@@ -15,6 +15,7 @@ using FastSphericalHarmonics: FastSphericalHarmonics
 using NUFSHT: NUFSHT
 using KernelAbstractions: KernelAbstractions as KA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -72,13 +73,13 @@ Test.@testset "A Cartesian plan answers for its own coefficients" begin
             ("hybrid real", gh, randn(N, N), (), (; transform = SB.FFTSpectralBackend())),
             ("hybrid batched", gh, randn(N, N, 2), (2,), (; transform = SB.FFTSpectralBackend())),
             ("hybrid complex", gh, randn(ComplexF64, N, N), (), (; transform = SB.FFTSpectralBackend())),
-            ("nufft cloud", gc, randn(M), (), (; transform = FFS.NonuniformFFTsBackend())),
-            ("nufft cloud batched", gc, randn(M, 3), (3,), (; transform = FFS.NonuniformFFTsBackend())),
-            ("nufft cloud complex", gc, randn(ComplexF64, M), (), (; transform = FFS.NonuniformFFTsBackend())),
-            ("nufft separable", gs, randn(N, N), (), (; transform = FFS.NonuniformFFTsBackend())),
-            ("finufft cloud", gc, randn(M), (), (; transform = FFS.FINUFFTBackend())),
-            ("finufft separable", gs, randn(N, N), (), (; transform = FFS.FINUFFTBackend())),
-            ("finufft complex", gc, randn(ComplexF64, M), (), (; transform = FFS.FINUFFTBackend())),
+            ("nufft cloud", gc, randn(M), (), (; transform = FTB.NonuniformFFTsBackend())),
+            ("nufft cloud batched", gc, randn(M, 3), (3,), (; transform = FTB.NonuniformFFTsBackend())),
+            ("nufft cloud complex", gc, randn(ComplexF64, M), (), (; transform = FTB.NonuniformFFTsBackend())),
+            ("nufft separable", gs, randn(N, N), (), (; transform = FTB.NonuniformFFTsBackend())),
+            ("finufft cloud", gc, randn(M), (), (; transform = FTB.FINUFFTBackend())),
+            ("finufft separable", gs, randn(N, N), (), (; transform = FTB.FINUFFTBackend())),
+            ("finufft complex", gc, randn(ComplexF64, M), (), (; transform = FTB.FINUFFTBackend())),
             ("directsum tensor", gs, randn(N, N), (), (; transform = SB.DirectSumSpectralBackend(), execution = PI_SER)),
             ("directsum cloud", gc, randn(M), (), (; transform = SB.DirectSumSpectralBackend(), execution = PI_SER)),
             ("directsum batched", gs, randn(N, N, 2), (2,), (; transform = SB.DirectSumSpectralBackend(), execution = PI_SER)),
@@ -144,8 +145,8 @@ Test.@testset "A device plan answers the same way" begin
     for (nm, g, f, batch, kw) in (
             ("gpu fft real", gu, randn(N, N), (), (; transform = SB.FFTSpectralBackend(), execution = dev)),
             ("gpu fft complex", gu, randn(ComplexF64, N, N), (), (; transform = SB.FFTSpectralBackend(), execution = dev)),
-            ("gpu nufft real", gc, randn(M), (), (; transform = FFS.NonuniformFFTsBackend(), execution = dev)),
-            ("gpu nufft complex", gc, randn(ComplexF64, M), (), (; transform = FFS.NonuniformFFTsBackend(), execution = dev)),
+            ("gpu nufft real", gc, randn(M), (), (; transform = FTB.NonuniformFFTsBackend(), execution = dev)),
+            ("gpu nufft complex", gc, randn(ComplexF64, M), (), (; transform = FTB.NonuniformFFTsBackend(), execution = dev)),
             ("gpu nufsht real", gsc, randn(Ns), (), (; transform = SB.NUFSHTSpectralBackend(), execution = dev)),
             ("gpu nufsht complex", gsc, randn(ComplexF64, Ns), (), (; transform = SB.NUFSHTSpectralBackend(), execution = dev)))
         Test.@testset "$nm" begin

@@ -1,5 +1,6 @@
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FINUFFT: FINUFFT     # activates the NUFFT extension
+using FlowTransformBindings: FlowTransformBindings as FTB
+using FINUFFT: FINUFFT     # activates FlowTransformBindings' FINUFFT binding
 using CairoMakie: CairoMakie as Mke
 using Random: Random
 using SpectralBackends: SpectralBackends as SB
@@ -39,7 +40,7 @@ function run_horizontal_spectra_4d_example()
     end
 
     # Build the plan ONCE for the fixed points; transform the whole (z, t) batch in one exec.
-    plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
+    plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FTB.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
     pms = FFS.Packing.packed_size(ms, Val(true))      # real field ⇒ axis 1 halved to k₁ ≥ 0
     coeffs = zeros(ComplexF64, pms..., nz, nt)        # (N÷2+1, N, nz, nt)
     ks = FFS.calculate_spectrum!(coeffs, plan, f)

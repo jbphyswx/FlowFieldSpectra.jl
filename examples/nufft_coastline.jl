@@ -1,5 +1,6 @@
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FINUFFT: FINUFFT     # activates the NUFFT extension
+using FlowTransformBindings: FlowTransformBindings as FTB
+using FINUFFT: FINUFFT     # activates FlowTransformBindings' FINUFFT binding
 using FFTW: FFTW           # activates the FFT extension
 using CairoMakie: CairoMakie as Mke
 using Random: Random
@@ -44,7 +45,7 @@ function run_nufft_coastline_example()
 
     ocean_grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xo, yo), ones(length(xo));
         periodic = (true, true), period = (L, L))
-    c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-9)
+    c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-9)
     k_nu2, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 24)
 
     fig = Mke.Figure(size = (1200, 500))

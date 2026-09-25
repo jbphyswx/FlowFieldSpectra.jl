@@ -9,9 +9,8 @@ CUDA-only) — can only be validated numerically on an actual NVIDIA CUDA device
 
 - **CI (`test/`)** — the entire two-axis backend, all CPU execution (Serial / Threaded), Distributed
   and MPI execution, and the **device-generic GPU paths exercised on `GPUBackend(KA.CPU())`**: the
-  KernelAbstractions direct-sum kernels *and* the `AbstractFFTs`-based GPU FFT (which uses FFTW on the
-  `KA.CPU()` host array, exactly as it would use CUFFT on a `CuArray`). CI also asserts that GPU
-  NUFFT on a non-CUDA device raises a clear error (cuFINUFFT is CUDA-only — no silent fallback).
+  KernelAbstractions direct-sum kernels, the `AbstractFFTs`-based GPU FFT (FFTW on a `KA.CPU()` array,
+  CUFFT on a `CuArray`), and both NUFFT libraries through FlowTransformBindings on `KA.CPU()` arrays.
 - **Here (`gpu/`)** — the CUDA-specific realizations: CUFFT on `CuArray`, cuFINUFFT, and the KA
   kernels on a real CUDA device, each checked against its CPU reference.
 

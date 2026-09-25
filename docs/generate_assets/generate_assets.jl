@@ -6,8 +6,9 @@ Run from the root directory:
 """
 
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW                                       # activates the FFT extension
-using FINUFFT: FINUFFT                                 # activates the NUFFT extension
+using FINUFFT: FINUFFT                                 # activates FlowTransformBindings' FINUFFT binding
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using KernelAbstractions: KernelAbstractions as KA     # activates GPUBackend (+ device-generic GPU FFT)
 using OhMyThreads: OhMyThreads                         # activates ThreadedBackend
@@ -227,7 +228,7 @@ function generate_nufft_coastline_figure()
     fo = interp.(xo, yo)
 
     sgrid = scg((xo, yo); L = L)
-    c_nu, k_nu = FFS.calculate_spectrum(sgrid, fo, (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-9)
+    c_nu, k_nu = FFS.calculate_spectrum(sgrid, fo, (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-9)
     knu, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 28)
 
     rng = 2:findlast(<=(0.6 * maximum(kr)), kr)

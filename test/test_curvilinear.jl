@@ -14,6 +14,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -67,7 +68,7 @@ Test.@testset "Curvilinear Cartesian transforms as a point cloud" begin
     end
 
     # Both NUFFT providers reach it as a point cloud, so a curvilinear grid gets a fast path.
-    for tr in (FFS.NonuniformFFTsBackend(), FFS.FINUFFTBackend())
+    for tr in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
         cn, _ = FFS.calculate_spectrum(g, f, ms; transform = tr, eps = 1e-12)
         Test.@test size(cn) == size(c)
         Test.@test cv_rel(cn, c) < 1e-11

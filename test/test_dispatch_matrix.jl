@@ -9,6 +9,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -111,8 +112,8 @@ const DM_TRANSFORMS = (
     ("auto", SB.AutoSpectralBackend()),
     ("directsum", SB.DirectSumSpectralBackend()),
     ("fft", SB.FFTSpectralBackend()),
-    ("nonuniformffts", FFS.NonuniformFFTsBackend()),
-    ("finufft", FFS.FINUFFTBackend()),
+    ("nonuniformffts", FTB.NonuniformFFTsBackend()),
+    ("finufft", FTB.FINUFFTBackend()),
     ("fsht", SB.FSHTSpectralBackend()),
     ("nufsht", SB.NUFSHTSpectralBackend()),
 )

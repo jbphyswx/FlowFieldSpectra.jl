@@ -6,6 +6,7 @@ using Aqua: Aqua as Aqua
 using ExplicitImports: ExplicitImports as EI
 
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
@@ -74,11 +75,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
 
     Test.@testset "Explicit imports (no implicit / no stale)" begin
         Test.@test (EI.check_no_implicit_imports(FFS); true)
-        # The core imports FlowTransformBindings only so its `__init__` runs before FastTransforms loads.
-        Test.@test (EI.check_no_stale_explicit_imports(FFS; ignore = (:FlowTransformBindings,)); true)
+        Test.@test (EI.check_no_stale_explicit_imports(FFS); true)
         for extname in (
-            :FlowFieldSpectraFFTWExt, :FlowFieldSpectraFINUFFTExt,
-            :FlowFieldSpectraFastSphericalHarmonicsExt, :FlowFieldSpectraNonuniformFFTsExt, :FlowFieldSpectraNUFSHTExt,
+            :FlowFieldSpectraFFTWExt, :FlowFieldSpectraFastSphericalHarmonicsExt, :FlowFieldSpectraNUFSHTExt,
             :FlowFieldSpectraOhMyThreadsExt, :FlowFieldSpectraKernelAbstractionsExt,
             :FlowFieldSpectraGPUFFTExt, :FlowFieldSpectraNUFSHTKernelAbstractionsExt,
         )
@@ -149,7 +148,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         v = @. sin(kx * xv + ky * yv)
         g = scg((xv, yv), (L, L))
         c_direct, k_direct = FFS.calculate_spectrum(g, (u, v), ms; transform = SB.DirectSumSpectralBackend())
-        c_nufft, k_nufft = FFS.calculate_spectrum(g, (u, v), ms; transform = FFS.FINUFFTBackend(), eps = 1e-12)
+        c_nufft, k_nufft = FFS.calculate_spectrum(g, (u, v), ms; transform = FTB.FINUFFTBackend(), eps = 1e-12)
         Test.@test size(c_nufft) == (pks(ms)..., 2)
         Test.@test isapprox(c_direct, c_nufft, atol = 1e-10)
         Test.@test all(isapprox(k_direct[d], k_nufft[d], rtol = 1e-12) for d in 1:2)
@@ -163,14 +162,14 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         ms = (8, 7)
         f = [cos(2x) + 0.5sin(3y) + 0.3cos(x + 2y) for x in xax, y in yax]
         c_d, k_d = FFS.calculate_spectrum(g, f, ms; transform = SB.DirectSumSpectralBackend())
-        c_n, k_n = FFS.calculate_spectrum(g, f, ms; transform = FFS.FINUFFTBackend(), eps = 1e-13)
+        c_n, k_n = FFS.calculate_spectrum(g, f, ms; transform = FTB.FINUFFTBackend(), eps = 1e-13)
         Test.@test size(c_n) == pks(ms)
         Test.@test isapprox(c_d, c_n, atol = 1e-10)
         Test.@test all(isapprox(k_d[d], k_n[d], rtol = 1e-12) for d in 1:2)
 
         fb = cat(cat(f, 2f, -0.5f; dims = 3), 0.7 .* cat(f, 2f, -0.5f; dims = 3); dims = 4)  # (13,11,3,2)
         cb_d, _ = FFS.calculate_spectrum(g, fb, ms; transform = SB.DirectSumSpectralBackend())
-        cb_n, _ = FFS.calculate_spectrum(g, fb, ms; transform = FFS.FINUFFTBackend(), eps = 1e-13)
+        cb_n, _ = FFS.calculate_spectrum(g, fb, ms; transform = FTB.FINUFFTBackend(), eps = 1e-13)
         Test.@test size(cb_n) == (pks(ms)..., 3, 2)
         Test.@test isapprox(cb_d, cb_n, atol = 1e-10)
 
@@ -179,7 +178,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         ms3 = (5, 4, 3)
         f3 = [cos(x) + sin(2y) + 0.4cos(z) for x in xax, y in yax, z in zax]
         c3_d, _ = FFS.calculate_spectrum(g3, f3, ms3; transform = SB.DirectSumSpectralBackend())
-        c3_n, _ = FFS.calculate_spectrum(g3, f3, ms3; transform = FFS.FINUFFTBackend(), eps = 1e-13)
+        c3_n, _ = FFS.calculate_spectrum(g3, f3, ms3; transform = FTB.FINUFFTBackend(), eps = 1e-13)
         Test.@test isapprox(c3_d, c3_n, atol = 1e-9)
     end
 
@@ -250,13 +249,13 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         psolve = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), solve = true, rtol = 1e-10, maxiter = 2000)
         cs = zeros(ComplexF64, Nθ, Nφ); FFS.calculate_spectrum!(cs, psolve, fv)
         Test.@test isapprox(cs, cs_ref; atol = 1e-9)
-        # `nufft=` selects NUFSHT's internal NUFFT engine: the real-data NonuniformFFTs engine yields the
-        # same SHT coefficients as the default (FINUFFT) engine, via both the one-shot and a reusable plan.
+        # `nufft=` selects the NUFFT library inside NUFSHT; both give the same SHT coefficients, through
+        # the one-shot and a reusable plan.
         fn = randn(N)
-        c_fin, _ = FFS.calculate_spectrum(g, fn, ms; transform = SB.NUFSHTSpectralBackend())
-        c_nff, _ = FFS.calculate_spectrum(g, fn, ms; transform = SB.NUFSHTSpectralBackend(), nufft = NUFSHT.NonuniformFFTsBackend())
+        c_fin, _ = FFS.calculate_spectrum(g, fn, ms; transform = SB.NUFSHTSpectralBackend(), nufft = FTB.FINUFFTBackend())
+        c_nff, _ = FFS.calculate_spectrum(g, fn, ms; transform = SB.NUFSHTSpectralBackend(), nufft = FTB.NonuniformFFTsBackend())
         Test.@test isapprox(c_nff, c_fin; atol = 1e-7)
-        planN = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), nufft = NUFSHT.NonuniformFFTsBackend())
+        planN = FFS.plan_spectrum(g, Float64, ms; transform = SB.NUFSHTSpectralBackend(), nufft = FTB.NonuniformFFTsBackend())
         cN = zeros(ComplexF64, Nθ, Nφ); FFS.calculate_spectrum!(cN, planN, fn)
         Test.@test isapprox(cN, c_fin; atol = 1e-7)
     end
@@ -353,9 +352,11 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(cf_s, cd; atol = 1e-12)
         Test.@test isapprox(cf_s, cf_gpu; atol = 1e-12)
 
-        cn_s, _ = FFS.calculate_spectrum(sc, uv_scat, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
-        cn_t, _ = FFS.calculate_spectrum(sc, uv_scat, ms; transform = FFS.FINUFFTBackend(), execution = CB.ThreadedBackend(), eps = 1e-12)
+        cn_s, _ = FFS.calculate_spectrum(sc, uv_scat, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
+        cn_t, _ = FFS.calculate_spectrum(sc, uv_scat, ms; transform = FTB.FINUFFTBackend(), execution = CB.ThreadedBackend(), eps = 1e-12)
+        cn_g, _ = FFS.calculate_spectrum(sc, uv_scat, ms; transform = FTB.FINUFFTBackend(), execution = gpu, eps = 1e-12)
         Test.@test isapprox(cn_s, cn_t; atol = 1e-10)
+        Test.@test isapprox(cn_s, cn_g; atol = 1e-10)
 
         c_ip_s = zeros(ComplexF64, pks(ms)...); c_ip_t = zeros(ComplexF64, pks(ms)...)
         FFS.calculate_spectrum!(c_ip_s, sc, uv_scat, ms; execution = CB.SerialBackend())
@@ -387,8 +388,6 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             execution = CB.ThreadedBackend(), ks = kcoef)
         Test.@test isapprox(rs, rt; atol = 1e-12)
         Test.@test isapprox(rs, u; atol = 1e-10)
-
-        Test.@test_throws ArgumentError FFS.calculate_spectrum(sc, uv_scat, ms; transform = FFS.FINUFFTBackend(), execution = gpu)
     end
 
     Test.@testset "Derived-quantity spectra (vorticity / divergence / compensated)" begin
@@ -506,7 +505,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         xs32 = rand(Float32, 80) .* L; ys32 = rand(Float32, 80) .* L
         fs = @. cos(xs32) + sin(2ys32)
         sg = scg(Float32, (xs32, ys32), (L, L))
-        c32, _ = FFS.calculate_spectrum(sg, fs, (N, N); transform = FFS.FINUFFTBackend())
+        c32, _ = FFS.calculate_spectrum(sg, fs, (N, N); transform = FTB.FINUFFTBackend())
         Test.@test eltype(c32) === ComplexF32
     end
 
@@ -530,11 +529,11 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         for b in 1:nb
             fstack[:, b] .= cos.(b .* xv) .+ sin.(b .* yv)
         end
-        bplan = FFS.plan_spectrum(sg, Float64, (N, N); transform = FFS.FINUFFTBackend(), batch = (nb,), eps = 1e-10)
+        bplan = FFS.plan_spectrum(sg, Float64, (N, N); transform = FTB.FINUFFTBackend(), batch = (nb,), eps = 1e-10)
         C = zeros(ComplexF64, pks((N, N))..., nb)
         FFS.calculate_spectrum!(C, bplan, fstack)
         for b in (1, nb)
-            cb, _ = FFS.calculate_spectrum(sg, fstack[:, b], (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-10)
+            cb, _ = FFS.calculate_spectrum(sg, fstack[:, b], (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-10)
             Test.@test C[:, :, b] ≈ cb
         end
     end
@@ -642,11 +641,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
     end
 
     Test.@testset "NonuniformFFTs NUFFT provider (vs DirectSum)" begin
-        # Distinct backend from FINUFFT — both are loaded here, no collision. Fail loud if the ext
-        # didn't load (rather than silently skipping).
-        Test.@test Base.get_extension(FFS, :FlowFieldSpectraNonuniformFFTsExt) !== nothing
+        Test.@test FTB.is_available(FTB.NonuniformFFTsBackend())
         Random.seed!(11); L = 2π; M = 1500
-        nu(g, f, ms; kw...) = FFS.calculate_spectrum(g, f, ms; transform = FFS.NonuniformFFTsBackend(), execution = CB.SerialBackend(), eps = 1.0e-10, kw...)[1]
+        nu(g, f, ms; kw...) = FFS.calculate_spectrum(g, f, ms; transform = FTB.NonuniformFFTsBackend(), execution = CB.SerialBackend(), eps = 1.0e-10, kw...)[1]
         ds(g, f, ms; kw...) = FFS.calculate_spectrum(g, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend(), kw...)[1]
         # Real scattered fields, EVEN and ODD ms (the Nyquist edge), D = 1, 2, 3.
         for (ms, _name) in [((12,), "1D even"), ((11,), "1D odd"), ((12, 10), "2D even"),
@@ -666,19 +663,17 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(nu(g, fr, (12, 12); iflag = -1), ds(g, fr, (12, 12); iflag = -1); atol = 1.0e-7)
         c32 = (rand(Float32, M) .* Float32(L), rand(Float32, M) .* Float32(L))   # Float32 end-to-end
         f32 = Float32.(cos.(2 .* c32[1])); g32 = scg(Float32, c32, (L, L))
-        cn32 = FFS.calculate_spectrum(g32, f32, (10, 10); transform = FFS.NonuniformFFTsBackend(), execution = CB.SerialBackend(), eps = 1.0f-5)[1]
+        cn32 = FFS.calculate_spectrum(g32, f32, (10, 10); transform = FTB.NonuniformFFTsBackend(), execution = CB.SerialBackend(), eps = 1.0f-5)[1]
         Test.@test eltype(cn32) == ComplexF32
         cd32 = FFS.calculate_spectrum(g32, f32, (10, 10); transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())[1]
         Test.@test isapprox(cn32, cd32; atol = 1.0f-3)
         # NUFFTSpectralBackend selects no provider — it errors, directing to a concrete one.
         Test.@test_throws ArgumentError FFS.calculate_spectrum(g, coords[1], (12, 12); transform = SB.NUFFTSpectralBackend())
 
-        # Device-generic path (GPUBackend): the KA ext threads the backend into PlanNUFFT and
-        # reconstructs with broadcasts / a KA kernel. Exercised on KA.CPU (device path on host arrays);
-        # it must equal the CPU path bit-for-bit-close (same plan + math, scalar loop vs kernel).
-        Test.@test Base.get_extension(FFS, :FlowFieldSpectraNonuniformFFTsKernelAbstractionsExt) !== nothing
+        # The device path on KA.CPU: device buffers and KernelAbstractions gathers on host arrays, equal to
+        # the host path.
         gpu = CB.GPUBackend(KA.CPU())
-        nug(gg, ff, mss; kw...) = FFS.calculate_spectrum(gg, ff, mss; transform = FFS.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10, kw...)[1]
+        nug(gg, ff, mss; kw...) = FFS.calculate_spectrum(gg, ff, mss; transform = FTB.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10, kw...)[1]
         for ms in [(12, 10), (11, 9)]                                            # 2D even (Nyquist kernel) + odd (mirror)
             cd = (rand(M) .* L, rand(M) .* L); gd = scg(cd, (L, L))
             fd = @. cos(2 * cd[1]) + 0.5 * sin(3 * cd[2])
@@ -691,7 +686,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(nug(gdev, fbd, (12, 12)), nu(gdev, fbd, (12, 12)); atol = 1.0e-10)
         frd = cos.(2 .* cdev[1])
         Test.@test isapprox(nug(gdev, frd, (12, 12); iflag = -1), nu(gdev, frd, (12, 12); iflag = -1); atol = 1.0e-10)
-        plang = FFS.plan_spectrum(gdev, Float64, (12, 12); transform = FFS.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10)  # reusable device plan
+        plang = FFS.plan_spectrum(gdev, Float64, (12, 12); transform = FTB.NonuniformFFTsBackend(), execution = gpu, eps = 1.0e-10)  # reusable device plan
         cpg = zeros(ComplexF64, pks((12, 12))...); FFS.calculate_spectrum!(cpg, plang, frd)
         Test.@test isapprox(cpg, nug(gdev, frd, (12, 12)); atol = 1.0e-10)
     end

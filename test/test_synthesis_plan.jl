@@ -17,6 +17,7 @@ using FastSphericalHarmonics: FastSphericalHarmonics
 using NUFSHT: NUFSHT
 using KernelAbstractions: KernelAbstractions as KA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -84,7 +85,7 @@ Test.@testset "Cartesian synthesis plans" begin
     Test.@testset "FINUFFT" begin
         for (f, batch, T) in ((randn(M), (), Float64), (randn(M, 2), (2,), Float64),
                               (randn(ComplexF64, M), (), ComplexF64))
-            sp_agrees(gc, f, (N, N), T; batch = batch, transform = FFS.FINUFFTBackend())
+            sp_agrees(gc, f, (N, N), T; batch = batch, transform = FTB.FINUFFTBackend())
         end
     end
 
@@ -93,7 +94,7 @@ Test.@testset "Cartesian synthesis plans" begin
         for (g, f, batch, T) in ((gc, randn(M), (), Float64), (gc, randn(M, 3), (3,), Float64),
                                  (gs, randn(N, N), (), Float64),
                                  (gc, randn(ComplexF64, M), (), ComplexF64))
-            sp_agrees(g, f, (N, N), T; batch = batch, transform = FFS.NonuniformFFTsBackend())
+            sp_agrees(g, f, (N, N), T; batch = batch, transform = FTB.NonuniformFFTsBackend())
         end
     end
 end

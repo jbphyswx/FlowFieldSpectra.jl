@@ -6,6 +6,7 @@
 using MPI: MPI
 MPI.Init()
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using Random: Random
@@ -32,12 +33,12 @@ u = [cos(2x) + 0.5 * sin(3y) for x in xs, y in ys]
 ub = cat(u, 2 .* u, 3 .* u, 4 .* u; dims = 3)
 
 cd, _ = FFS.calculate_spectrum(sc, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.MPIBackend())
-cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.FINUFFTBackend(), execution = CB.MPIBackend(), eps = 1e-12)
+cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FTB.FINUFFTBackend(), execution = CB.MPIBackend(), eps = 1e-12)
 cf, _ = FFS.calculate_spectrum(ug, ub, ms; transform = SB.FFTSpectralBackend(), execution = CB.MPIBackend())
 
 if rank == 0
     dref, _ = FFS.calculate_spectrum(sc, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
-    nref, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
+    nref, _ = FFS.calculate_spectrum(sc, f, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
     fref, _ = FFS.calculate_spectrum(ug, ub, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
     ok = isapprox(cd, dref; rtol = 1e-10, atol = 1e-12) &&
          isapprox(cn, nref; rtol = 1e-9, atol = 1e-10) &&

@@ -8,7 +8,8 @@ per-level / per-time spectra of large geophysical datasets.
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
-using FINUFFT: FINUFFT                    # activates the NUFFT extension
+using FlowTransformBindings: FlowTransformBindings as FTB
+using FINUFFT: FINUFFT                    # activates FlowTransformBindings' FINUFFT binding
 using Random: Random
 using SpectralBackends: SpectralBackends as SB
 using FlowGeometries: FlowGeometries as FG
@@ -35,8 +36,8 @@ for (it, t) in enumerate(ts), (iz, k0) in enumerate(kz)
 end
 
 # ONE plan build for the fixed points; transform the whole (z, t) batch in a single exec.
-plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FFS.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
-coeffs = zeros(ComplexF64, ms..., nz, nt)     # (N, N, nz, nt)
+plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FTB.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
+coeffs = FFS.allocate_coefficients(plan)      # the packed half (N÷2+1, N, nz, nt)
 ks = FFS.calculate_spectrum!(coeffs, plan, f)
 
 # ONE batch-preserving reduction → E(k, z, t); average over time → E(k, z).

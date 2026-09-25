@@ -43,6 +43,32 @@ function _dev_field(backend::KA.Backend, field, Npts::Int, B::Int, ::Type{FT}) w
     return d
 end
 
+# =============================================================================
+# The device side of `NUFFT.jl`: a plan's arrays on the execution backend, and its index gathers.
+# =============================================================================
+
+FFS._alloc(exec::ComputationalBackends.GPUBackend{<:KA.Backend}, ::Type{T}, dims::Integer...) where {T} =
+    KA.allocate(exec.backend, T, dims...)
+
+KA.@kernel function _gather_scaled_kernel!(dst, doff::Int, @Const(src), soff::Int, @Const(idx), @Const(w),
+        csrc::Bool, neg::Bool)
+    i = @index(Global)
+    @inbounds begin
+        s = src[soff + idx[i]]
+        v = (csrc ? conj(s) : s) * w[i]
+        dst[doff + i] = neg ? conj(v) : v
+    end
+end
+
+function FFS._gather_scaled!(dst::AbstractArray, doff::Int, src::AbstractArray, soff::Int,
+        idx::AbstractArray{Int}, w::AbstractArray, n::Int, csrc::Bool, neg::Bool)
+    n == 0 && return dst
+    backend = KA.get_backend(src)
+    _gather_scaled_kernel!(backend)(dst, doff, src, soff, idx, w, csrc, neg; ndrange = n)
+    KA.synchronize(backend)
+    return dst
+end
+
 # Column-major decode of a 1-based linear index `p` into a size-`s` grid (pure ⇒ GPU-safe).
 @inline function _ka_decode(p::Int, s::NTuple{D, Int}) where {D}
     idx = p - 1

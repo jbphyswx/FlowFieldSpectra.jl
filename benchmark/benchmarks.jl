@@ -1,5 +1,6 @@
 using BenchmarkTools: BenchmarkTools, BenchmarkGroup, @benchmarkable, tune!, run
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
@@ -46,7 +47,7 @@ for N in [1000, 10000, 100000]
     f = @. cos(kx * xv + ky * yv)
     g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), ones(N); periodic = (true, true), period = (L, L))
     SUITE["cartesian_scattered"]["N=$N"]["finufft"] =
-        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = FFS.FINUFFTBackend(), eps = 1e-9)
+        @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = FTB.FINUFFTBackend(), eps = 1e-9)
     N <= 10000 && (SUITE["cartesian_scattered"]["N=$N"]["direct_sum"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend()))
 end
@@ -180,10 +181,10 @@ for M in [10_000, 100_000]
     g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(L^2 / M, M);
         periodic = (true, true), period = (L, L))
     f = randn(M)
-    p = FFS.plan_spectrum(g, Float64, ms; transform = FFS.NonuniformFFTsBackend(), eps = 1e-9)
+    p = FFS.plan_spectrum(g, Float64, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
     buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
     SUITE["plans"]["nufft_M=$M"]["one_shot"] = @benchmarkable FFS.calculate_spectrum($g, $f, $ms;
-        transform = FFS.NonuniformFFTsBackend(), eps = 1e-9)
+        transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
     SUITE["plans"]["nufft_M=$M"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
 end
 

@@ -9,10 +9,10 @@ using FlowGeometries: FlowGeometries
 
 # =============================================================================
 # GPU NUFSHT (scattered sphere): place the nodes + field on the execution backend (`KA.allocate`), then
-# run NUFSHT's device-generic transform. NUFSHT.make_plan builds a device-RESIDENT plan from device
-# nodes — cuFINUFFT on CUDA, FFTW/FINUFFT on KA.CPU() — so this is verifiable on KA.CPU and fast on a
-# real GPU. Real coefficients map into FFS's complex `(Nθ, Nφ, batch…)` (FSH sph_mode layout). The
-# small, M-independent FastTransforms sph2fourier step is a host bounce inside NUFSHT (its ceiling).
+# run NUFSHT's device-generic transform. NUFSHT.make_plan builds a device-resident plan from device
+# nodes, its NUFFT through FlowTransformBindings on the nodes' device, so this is verifiable on KA.CPU
+# and fast on a real GPU. Real coefficients map into FFS's complex `(Nθ, Nφ, batch…)` (FSH sph_mode
+# layout). The small, M-independent FastTransforms sph2fourier step is a host bounce inside NUFSHT (its ceiling).
 # The reusable plan holds the device plan + device field/coeff buffers + host staging, so a fixed
 # point set pays the (device) planning cost once. Points `(θ, φ)` come from the FG convention bridge.
 # =============================================================================
@@ -21,7 +21,7 @@ using FlowGeometries: FlowGeometries
     NUSHTSphericalGPUPlan{T}
 
 Device-resident reusable NUFSHT plan (GPU execution): the device NUFSHT plan, the device field/coeff
-buffers, the host staging buffer for the layout remap, and — for `solve=true` — the device CG
+buffers, the host staging buffer for the layout remap, and — for `solve=true` — the device LSMR
 workspace. Built once for a fixed point set + batch shape; reuse via `calculate_spectrum!`.
 """
 struct NUSHTSphericalGPUPlan{T, CT, NB, P, FD, FH, CD, HB, WS, QW, KS} <: FFS.AbstractSpectralPlan
@@ -43,7 +43,7 @@ struct NUSHTSphericalGPUPlan{T, CT, NB, P, FD, FH, CD, HB, WS, QW, KS} <: FFS.Ab
     ks::KS
 end
 
-# Custom show: the wrapped NUFSHT plan holds FINUFFT plans, whose default printing can segfault.
+# Custom show: the wrapped NUFSHT plan holds a NUFFT library plan, whose default printing can segfault.
 Base.show(io::IO, p::NUSHTSphericalGPUPlan{T}) where {T} =
     print(io, "NUSHTSphericalGPUPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, p.solve ? ", solve" : "", ")")
 
@@ -188,7 +188,7 @@ struct NUSHTSynthesisGPUPlan{FT, R, NB, P, CD, FD, HB, FH, SP} <: FFS.AbstractSy
     B::Int
 end
 
-# A default show of a struct holding FINUFFT plans can segfault.
+# A default show of a struct holding a NUFFT library plan can segfault.
 Base.show(io::IO, p::NUSHTSynthesisGPUPlan{FT, R}) where {FT, R} =
     print(io, "NUSHTSynthesisGPUPlan{", FT, "}(lmax=", p.lmax, ", ", R ? "real" : "complex", ")")
 

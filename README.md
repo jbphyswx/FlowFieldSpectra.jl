@@ -70,7 +70,7 @@ By default, the package runs slow-path direct sums (DFT/SHT, ``O(N \cdot M)`` co
 | Grid Type | Coordinate System | Required Library | Backend Type | Description |
 |---|---|---|---|---|
 | **Structured** | Cartesian (ND) | `using FFTW` | `FFTSpectralBackend()` | Fast Fourier Transform via FFTW |
-| **Scattered** | Cartesian (ND) | `using FINUFFT` | `FINUFFTBackend()` | Non-uniform Fast Fourier Transform |
+| **Scattered / stretched** | Cartesian (ND) | `using NonuniformFFTs` or `using FINUFFT` | `FlowTransformBindings.NonuniformFFTsBackend()` / `FlowTransformBindings.FINUFFTBackend()` | Non-uniform Fast Fourier Transform through [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl) |
 | **Structured** | Spherical (2D) | `using FastSphericalHarmonics` | `FSHTSpectralBackend()` | Fast SHT on Clenshaw-Curtis grids |
 | **Scattered** | Spherical (2D) | `using NUFSHT` | `NUFSHTSpectralBackend()` | Non-uniform Fast SHT |
 | **Any** | Visualization | `using CairoMakie` | (Plotting Functions) | Enclosing plotting extension |

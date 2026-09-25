@@ -29,12 +29,12 @@ using FlowGeometries: FlowGeometries
 """
     NUSHTSphericalPlan{T}
 
-Reusable scattered-spherical NUFSHT plan: the fixed-node NUFSHT plan (point preset + FINUFFT setup),
+Reusable scattered-spherical NUFSHT plan: the fixed-node NUFSHT plan (point preset + NUFFT setup),
 the reused real-coefficient buffer, and — for `solve=true` — the LSMR solve workspace, all built once for a
 fixed point set and batch shape. Reuse across many fields via `calculate_spectrum!`.
 """
 struct NUSHTSphericalPlan{T, CT, NB, P, CR, WS, QW, FW, KS} <: FFS.AbstractSpectralPlan
-    plan::P                       # NUFSHT.NUSHTplan (fixed nodes + FINUFFT setup), ntrans = C
+    plan::P                       # NUFSHT.NUSHTplan (fixed nodes + NUFFT setup), ntrans = C
     C_real::CR                    # (Nθ, Nφ, C) real NUFSHT coeff buffer (FSH sph_mode layout), reused
     ws::WS                        # LSMRWorkspace for solve=true (built once); nothing otherwise
     qw::QW                        # (N,) per-node quadrature weights, Σw = 4π
@@ -61,7 +61,7 @@ end
 const DEFAULT_BATCH_CHUNK = 0
 _chunk(B::Int, bc::Int) = bc <= 0 ? max(B, 1) : clamp(bc, 1, max(B, 1))
 
-# Custom show: the wrapped NUFSHT plan holds FINUFFT plans, whose default printing can segfault.
+# Custom show: the wrapped NUFSHT plan holds a NUFFT library plan, whose default printing can segfault.
 Base.show(io::IO, p::NUSHTSphericalPlan{T}) where {T} =
     print(io, "NUSHTSphericalPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, p.solve ? ", solve" : "", ")")
 
@@ -134,10 +134,10 @@ end
     plan_spectrum(NUFSHTSpectralBackend(), execution, grid, T, ms; batch=(), tol, solve, maxiter, rtol, nufft)
 
 Reusable [`FFS.AbstractSpectralPlan`](@ref) for the scattered-spherical NUFSHT on a fixed point set.
-Presets the points / NUFSHT plan / CG setup once; execute across many fields with
-`calculate_spectrum!(coeffs, plan, field)`. `nufft` selects NUFSHT's internal NUFFT engine (a
-`SpectralBackends` marker; default `AutoSpectralBackend()`, which NUFSHT resolves to FINUFFT, then
-NonuniformFFTs, then its own direct summation).
+Presets the points / NUFSHT plan / LSMR workspace once; execute across many fields with
+`calculate_spectrum!(coeffs, plan, field)`. `nufft` selects NUFSHT's internal NUFFT library (a
+FlowTransformBindings tag; default `AutoSpectralBackend()`, which NUFSHT resolves to NonuniformFFTs, then
+FINUFFT, then its own direct summation).
 
 `batch_chunk` is how many `batch` slices one NUFSHT execution carries, and it sizes the plan's buffers;
 the default runs the whole batch in one. A smaller chunk shrinks the inner NUFFT's per-transform working
@@ -241,7 +241,7 @@ struct NUSHTSynthesisPlan{FT, R, NB, P, CR, FB, SP} <: FFS.AbstractSynthesisPlan
     B::Int
 end
 
-# A default show of a struct holding FINUFFT plans can segfault.
+# A default show of a struct holding a NUFFT library plan can segfault.
 Base.show(io::IO, p::NUSHTSynthesisPlan{FT, R}) where {FT, R} =
     print(io, "NUSHTSynthesisPlan{", FT, "}(lmax=", p.lmax, ", ", R ? "real" : "complex", ")")
 
@@ -336,9 +336,8 @@ function FFS._synthesize(::SB.AbstractNUFSHTSpectralBackend,
     return out
 end
 
-# GPU NUFSHT (device-resident NUFSHT plan via cuFINUFFT) is provided by the NUFSHT × KernelAbstractions
-# extension, which allocates the node/field arrays on the execution backend so NUFSHT.make_plan builds a
-# device plan. This less-specific stub fires only when KernelAbstractions is not loaded.
+# GPU NUFSHT is provided by the NUFSHT × KernelAbstractions extension, which allocates the node/field
+# arrays on the execution backend so NUFSHT.make_plan builds a device plan. This less-specific stub fires only when KernelAbstractions is not loaded.
 function FFS._calculate_spectrum_nufsht(::ComputationalBackends.AbstractGPUBackend,
         g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
         field::AbstractArray, ms::Tuple; kwargs...)

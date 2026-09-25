@@ -5,6 +5,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using OhMyThreads: OhMyThreads
@@ -61,7 +62,7 @@ function _zero_profile(N::Int)
     _a_planexec(cf, fplan, u)
     fftexec = _a_planexec(cf, fplan, u)
 
-    nplan = FFS.plan_spectrum(sg, Float64, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend())
+    nplan = FFS.plan_spectrum(sg, Float64, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend())
     cnu = zeros(ComplexF64, pms...)
     _a_planexec(cnu, nplan, fscat)
     nuexec = _a_planexec(cnu, nplan, fscat)

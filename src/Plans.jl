@@ -2,7 +2,7 @@ module Plans
 
 export AbstractSpectralPlan, plan_spectrum,
     coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
-    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field
+    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 
 """
     AbstractSpectralPlan
@@ -139,5 +139,13 @@ A zeroed field array of this plan's own size and element type, ready for
 `synthesize!(out, plan, coeffs)`.
 """
 allocate_field(plan::AbstractSynthesisPlan) = zeros(field_type(plan), field_size(plan)...)
+
+"""
+    close!(plan) -> nothing
+
+Release the library resources `plan` holds; idempotent. A plan over FINUFFT holds C memory that only this
+frees. A plan over a Julia-only transform holds none, and this does nothing.
+"""
+close!(::Union{AbstractSpectralPlan, AbstractSynthesisPlan}) = nothing
 
 end # module Plans

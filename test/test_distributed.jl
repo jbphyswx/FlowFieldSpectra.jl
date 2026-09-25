@@ -7,6 +7,7 @@ using Test: Test
 using Random: Random
 using Distributed: Distributed
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 Distributed.nprocs() == 1 && Distributed.addprocs(2; exeflags = "--project=$(Base.active_project())")
 Distributed.@everywhere begin
@@ -38,8 +39,8 @@ Test.@testset "Distributed spectrum parity" begin
         Test.@test isapprox(Ed, Eref; atol = 1e-12)
     end
 
-    cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
-    cnd, _ = FFS.calculate_spectrum(sc, f, ms; transform = FFS.FINUFFTBackend(), execution = CB.DistributedBackend(), eps = 1e-12)
+    cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
+    cnd, _ = FFS.calculate_spectrum(sc, f, ms; transform = FTB.FINUFFTBackend(), execution = CB.DistributedBackend(), eps = 1e-12)
     Test.@test isapprox(cnd, cn; atol = 1e-10)
 
     # FFT batch-partition (uniform tensor grid; batch split across workers, gathered).

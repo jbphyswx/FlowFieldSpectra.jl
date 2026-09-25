@@ -2,7 +2,7 @@ module FlowFieldSpectra
 
 # First, so its `__init__` selects the OpenMP runtime's thread-local mode before FastTransforms loads
 # that runtime; see `FlowTransformBindings.with_fasttransforms_threads`.
-using FlowTransformBindings: FlowTransformBindings
+using FlowTransformBindings: FlowTransformBindings as FTB
 using PrecompileTools: PrecompileTools
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
@@ -28,7 +28,7 @@ using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, De
 using .Problem: Problem, TransformProblem, batch_shape, stack_fields
 using .Plans: Plans, AbstractSpectralPlan, plan_spectrum,
     coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
-    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field
+    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 using .DirectSum: DirectSum, sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 using .Operators: spectral_divergence, spectral_divergence!, spectral_vorticity, spectral_vorticity!,
@@ -44,7 +44,7 @@ export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, P
 export TransformProblem
 export AbstractSpectralPlan, plan_spectrum, preprocess_field
 export coefficient_size, coefficient_type, wavenumbers, allocate_coefficients
-export AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field
+export AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 # APIs
 export calculate_spectrum, calculate_spectrum!, synthesize, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index, sph_coeff_type
 export unpacked, unpacked!
@@ -231,13 +231,16 @@ _auto_exec(e::ComputationalBackends.AbstractExecutionBackend) = e
 _auto_exec(e::ComputationalBackends.AbstractDistributedBackend) = ComputationalBackends.local_backend(e)
 _auto_exec(e::ComputationalBackends.AbstractMPIBackend) = ComputationalBackends.local_backend(e)
 
-# The NUFFT provider available for this execution backend, or `nothing`.
-_auto_nufft(::ComputationalBackends.AbstractExecutionBackend) =
-    _ext_loaded(:FlowFieldSpectraNonuniformFFTsExt) ? NonuniformFFTsBackend() :
-    _ext_loaded(:FlowFieldSpectraFINUFFTExt) ? FINUFFTBackend() : nothing
+# The NUFFT library available for this execution backend, or `nothing`: NonuniformFFTs, then FINUFFT. A
+# device plan's arrays come from the KernelAbstractions extension.
+function _auto_nufft(::ComputationalBackends.AbstractExecutionBackend)
+    FTB.is_available(FTB.NonuniformFFTsBackend()) && return FTB.NonuniformFFTsBackend()
+    FTB.is_available(FTB.FINUFFTBackend()) && return FTB.FINUFFTBackend()
+    return nothing
+end
 _auto_nufft(::ComputationalBackends.AbstractGPUBackend) =
-    _ext_loaded(:FlowFieldSpectraNonuniformFFTsKernelAbstractionsExt) ? NonuniformFFTsBackend() :
-    _ext_loaded(:FlowFieldSpectracuFINUFFTExt) ? FINUFFTBackend() : nothing
+    _ext_loaded(:FlowFieldSpectraKernelAbstractionsExt) ? _auto_nufft(ComputationalBackends.SerialBackend()) :
+    nothing
 
 _auto_fft(::ComputationalBackends.AbstractExecutionBackend) = _ext_loaded(:FlowFieldSpectraFFTWExt)
 _auto_fft(::ComputationalBackends.AbstractGPUBackend) = _ext_loaded(:FlowFieldSpectraGPUFFTExt)
@@ -375,24 +378,9 @@ calculate_spectrum(grid::FlowGeometries.Grids.AbstractGrid, fields::Tuple, ms::T
     calculate_spectrum(grid, stack_fields(fields), ms; kwargs...)
 
 # =============================================================================
-# Canonical two-axis dispatch: calculate_spectrum(transform, execution, grid, field, ms; …).
+# Canonical two-axis dispatch: calculate_spectrum(transform, execution, grid, field, ms; …). The NUFFT
+# libraries are FlowTransformBindings' `FINUFFTBackend()` and `NonuniformFFTsBackend()`.
 # =============================================================================
-
-"""
-    FINUFFTBackend()
-    NonuniformFFTsBackend()
-
-The concrete NUFFT providers (`<: SpectralBackends.AbstractNUFFTSpectralBackend`). A provider is a
-*library* choice, not spectral math, so these live in FlowFieldSpectra, not SpectralBackends. They are
-symmetric — neither is a default: `FINUFFTBackend()` uses FINUFFT (`using FINUFFT`; GPU via cuFINUFFT),
-`NonuniformFFTsBackend()` uses NonuniformFFTs (`using NonuniformFFTs`; real-data fast path, half memory).
-Both may be loaded at once. The abstract `SpectralBackends.NUFFTSpectralBackend()` selects no provider —
-pass one of these.
-"""
-struct FINUFFTBackend <: SpectralBackends.AbstractNUFFTSpectralBackend end
-
-"See [`FINUFFTBackend`](@ref) — the NonuniformFFTs.jl NUFFT provider."
-struct NonuniformFFTsBackend <: SpectralBackends.AbstractNUFFTSpectralBackend end
 
 # ---- Level 1: distribution wrappers unwrap to the Distributed / MPI extension hooks ----
 calculate_spectrum(t::SpectralBackends.AbstractSpectralBackend, e::ComputationalBackends.AbstractDistributedBackend, g::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...) =
@@ -456,9 +444,8 @@ function calculate_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec:
         NTuple{D, Int}(Tuple(ms)), umask; kwargs...)
 end
 
-# ---- Level 2: NUFFT (FINUFFT ext CPU; cuFINUFFT ext on CUDA). Structured (nonuniform-gridded) uses
-# the separable per-axis 1-D NUFFT; unstructured (scattered) uses the guru NUFFT. Both are
-# `_calculate_spectrum_nufft`, dispatched on the grid architecture inside the extension. ----
+# ---- Level 2: NUFFT (`NUFFT.jl`, through FlowTransformBindings). A structured (nonuniform-gridded) grid
+# takes the separable per-axis 1-D NUFFT; a point set the D-dimensional one. ----
 calculate_spectrum(t::SpectralBackends.AbstractNUFFTSpectralBackend, exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}, g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, Grids.PointwiseCartesian}, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_nufft(t, exec, g, field, ms; kwargs...)
 calculate_spectrum(t::SpectralBackends.AbstractNUFFTSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, Grids.PointwiseCartesian}, field::AbstractArray, ms::Tuple; kwargs...) =
@@ -496,16 +483,16 @@ calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::Compu
 # `NTuple{D,Bool}`, so the all-uniform and mixed branches below resolve without a runtime-length tuple.
 _uniform_mask(g, ::Val{D}) where {D} = ntuple(d -> FlowGeometries.Grids.isuniform(g, d), Val(D))
 
-# The provider that transforms the stretched axes. `AutoSpectralBackend` takes whichever NUFFT extension
-# is loaded; an explicit provider is honoured as given.
+# The library that transforms the stretched axes. `AutoSpectralBackend` takes the first loaded of
+# NonuniformFFTs and FINUFFT; an explicit one is honoured as given.
 _resolve_nufft_provider(t::SpectralBackends.AbstractNUFFTSpectralBackend) = t
 function _resolve_nufft_provider(::SpectralBackends.AbstractAutoSpectralBackend)
-    Base.get_extension(@__MODULE__, :FlowFieldSpectraNonuniformFFTsExt) === nothing || return NonuniformFFTsBackend()
-    Base.get_extension(@__MODULE__, :FlowFieldSpectraFINUFFTExt) === nothing || return FINUFFTBackend()
+    t = _auto_nufft(ComputationalBackends.SerialBackend())
+    t === nothing || return t
     throw(ArgumentError(
-        "a grid uniform in some directions and stretched in others needs a NUFFT provider for its " *
-        "stretched axes — run `using NonuniformFFTs` or `using FINUFFT`, or pass the provider as " *
-        "`nufft = NonuniformFFTsBackend()`."))
+        "a grid uniform in some directions and stretched in others needs a NUFFT library for its " *
+        "stretched axes — run `using NonuniformFFTs` or `using FINUFFT`, or pass one as " *
+        "`nufft = FlowTransformBindings.NonuniformFFTsBackend()`."))
 end
 
 """
@@ -535,7 +522,7 @@ function _hybrid_derive(g, ::Type{Tr}, ms::NTuple{D, Int}, umask::NTuple{D, Bool
     end
     udims = Tuple(d for d in 1:D if umask[d])
     sdims = Tuple(d for d in 1:D if !umask[d])
-    epsv = eps === nothing ? Tr(1.0e-8) : eps
+    epsv = _nufft_tol(Tr, eps)
     # A twin is needed where an even axis ≥2 samples nonuniformly; only then must axis 1 stay full.
     need_twin = any(d -> !umask[d] && iseven(ms[d]), 2:D)
     halve = R && !need_twin
@@ -731,8 +718,8 @@ function calculate_spectrum(t::SpectralBackends.AbstractSpectralBackend, e::Comp
         "$(nameof(typeof(t))) cannot act on a $(nameof(typeof(g))) over $(nameof(typeof(g.geometry))) with " *
         "$(nameof(typeof(e))) — wrong transform for that grid's geometry/architecture. Each grid has its " *
         "transform: uniform structured " *
-        "Cartesian → FFT; nonuniform-structured / scattered Cartesian → NUFFT (CPU; GPU NUFFT is " *
-        "cuFINUFFT/CUDA and scattered-only); structured spherical → SHT (CPU via FastSphericalHarmonics; " *
+        "Cartesian → FFT; nonuniform-structured / scattered Cartesian → NUFFT " *
+        "(FlowTransformBindings.NonuniformFFTsBackend() or FINUFFTBackend()); structured spherical → SHT (CPU via FastSphericalHarmonics; " *
         "GPU via the device-generic transform on a Gauss–Legendre spherical grid); scattered spherical → " *
         "NUFSHT (CPU, or GPU with `using KernelAbstractions`). DirectSumSpectralBackend runs on any " *
         "grid/backend but is an O(N·L²) correctness reference — slow, not a fast path.",
@@ -1181,18 +1168,20 @@ _gpu_directsum_spherical(args...; kwargs...) = throw(ArgumentError("GPUBackend i
 # Fast device-generic structured SHT (φ-DFT + θ-Legendre contraction), KernelAbstractions ext.
 _calculate_spectrum_gpu_sht(args...; kwargs...) = throw(ArgumentError("GPU SHT requires `using KernelAbstractions`."))
 
-# GPU FFT is device-generic via AbstractFFTs; GPU NUFFT is CUDA-only (cuFINUFFT).
+# GPU FFT is device-generic via AbstractFFTs; the GPU NUFFT is `NUFFT.jl` on FlowTransformBindings' tags.
 _calculate_spectrum_gpu_fft(args...; kwargs...) = throw(ArgumentError("GPU FFT requires `using KernelAbstractions` plus an AbstractFFTs provider (`FFTW` for `KA.CPU()`, `CUDA` for `CUDABackend`, …)."))
-_calculate_spectrum_gpu_nufft(::SpectralBackends.AbstractNUFFTSpectralBackend, args...; kwargs...) = throw(ArgumentError("GPU NUFFT is CUDA-only (cuFINUFFT, via FINUFFTBackend) — run `using CUDA, FINUFFT`. For a portable GPU scattered transform use transform=DirectSumSpectralBackend()."))
+_calculate_spectrum_gpu_nufft(t::SpectralBackends.AbstractNUFFTSpectralBackend, args...; kwargs...) = throw(ArgumentError(
+    "$(nameof(typeof(t))) names no NUFFT library — pass transform=FlowTransformBindings.NonuniformFFTsBackend() " *
+    "(`using NonuniformFFTs`) or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`, `using CUDA` for CuArrays)."))
 
 # Hybrid composite passes. `_region_fft` transforms the uniform axes of a field in one call (halving
 # axis 1 when asked, conjugating a complex input for `iflag < 0`); `_axis_nufft` transforms one stretched
 # axis. Both return the RAW transform — the composite applies the phase and normalization once.
 _region_fft(args...; kwargs...) = throw(ArgumentError("The hybrid FFT/NUFFT transform needs an FFT provider. Run `using FFTW`."))
 _axis_nufft(t::SpectralBackends.AbstractSpectralBackend, args...; kwargs...) = throw(ArgumentError(
-    "The hybrid FFT/NUFFT transform needs a NUFFT provider for the stretched axes (got " *
+    "The hybrid FFT/NUFFT transform needs a NUFFT library for the stretched axes (got " *
     "$(nameof(typeof(t)))) — run `using NonuniformFFTs` or `using FINUFFT` and pass " *
-    "`nufft = NonuniformFFTsBackend()` / `nufft = FINUFFTBackend()`."))
+    "`nufft = FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()`."))
 
 # The same two passes, held for reuse by `HybridPlan`. `_region_fft_plan` builds the FFTW plan over the
 # uniform axes and `_region_fft_size` reports the shape it writes; `_axis_nufft_plan` builds one axis's
@@ -1201,16 +1190,16 @@ _region_fft_plan(args...; kwargs...) = throw(ArgumentError("The hybrid FFT/NUFFT
 _region_fft_size(args...; kwargs...) = throw(ArgumentError("The hybrid FFT/NUFFT plan needs an FFT provider. Run `using FFTW`."))
 _region_fft_exec!(args...; kwargs...) = throw(ArgumentError("The hybrid FFT/NUFFT plan needs an FFT provider. Run `using FFTW`."))
 _axis_nufft_plan(t::SpectralBackends.AbstractSpectralBackend, args...; kwargs...) = throw(ArgumentError(
-    "The hybrid FFT/NUFFT plan needs a NUFFT provider for the stretched axes (got " *
+    "The hybrid FFT/NUFFT plan needs a NUFFT library for the stretched axes (got " *
     "$(nameof(typeof(t)))) — run `using NonuniformFFTs` or `using FINUFFT`."))
 _axis_nufft_exec!(args...; kwargs...) = throw(ArgumentError(
-    "The hybrid FFT/NUFFT plan needs a NUFFT provider for the stretched axes."))
+    "The hybrid FFT/NUFFT plan needs a NUFFT library for the stretched axes."))
 
-# CPU transform libraries (extensions). NUFFT: pick a provider — the abstract NUFFTSpectralBackend selects none.
+# CPU transform libraries (extensions). A NUFFT names its library: the abstract NUFFTSpectralBackend names none.
 _calculate_spectrum_fft(args...; kwargs...) = throw(ArgumentError("FFTSpectralBackend is not loaded. Run `using FFTW`."))
-_calculate_spectrum_nufft(::SpectralBackends.NUFFTSpectralBackend, args...; kwargs...) = throw(ArgumentError("NUFFTSpectralBackend selects no NUFFT provider — pass transform=FINUFFTBackend() or NonuniformFFTsBackend()."))
-_calculate_spectrum_nufft(::FINUFFTBackend, args...; kwargs...) = throw(ArgumentError("FINUFFTBackend needs FINUFFT — run `using FINUFFT`."))
-_calculate_spectrum_nufft(::NonuniformFFTsBackend, args...; kwargs...) = throw(ArgumentError("NonuniformFFTsBackend needs NonuniformFFTs — run `using NonuniformFFTs`."))
+_calculate_spectrum_nufft(t::SpectralBackends.AbstractNUFFTSpectralBackend, args...; kwargs...) = throw(ArgumentError(
+    "$(nameof(typeof(t))) names no NUFFT library — pass transform=FlowTransformBindings.NonuniformFFTsBackend() " *
+    "(`using NonuniformFFTs`) or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`)."))
 _calculate_spectrum_sht(args...; kwargs...) = throw(ArgumentError("FSHTSpectralBackend is not loaded. Run `using FastSphericalHarmonics`."))
 _calculate_spectrum_nufsht(args...; kwargs...) = throw(ArgumentError("NUFSHTSpectralBackend is not loaded. Run `using NUFSHT`."))
 
@@ -1316,6 +1305,10 @@ function _reshape_batch_twins(ks::Tuple, dst::Tuple, batch::Tuple)
     slices = map(d -> reshape(d, ntuple(i -> size(d, i), ndims(d) - 1)..., batch...), dst)
     return (Packing.with_twin(ks[1], Packing.NyquistTwin(slices)), Base.tail(ks)...)
 end
+
+include("NUFFT.jl")
+
+Plans.close!(p::HybridPlan) = (foreach(_close!, p.axes); nothing)
 
 # =============================================================================
 # Plotting stubs (CairoMakie extension).

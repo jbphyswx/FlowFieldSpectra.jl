@@ -13,6 +13,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -88,7 +89,7 @@ Test.@testset "Hybrid composite equals the direct sum" begin
         f = randn(N1, N2)
         ms = (N1, N2)
         cd, ksd = FFS.calculate_spectrum(g, f, ms; transform = RP_DS, execution = RP_SER)
-        for nu in (FFS.NonuniformFFTsBackend(), FFS.FINUFFTBackend())
+        for nu in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
             ch, ksh = FFS.calculate_spectrum(g, f, ms; transform = RP_FFT, execution = RP_SER,
                 nufft = nu, eps = 1e-12)
             Test.@test size(ch) == size(cd)
@@ -109,10 +110,10 @@ Test.@testset "Hybrid composite equals the direct sum" begin
     g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(),
         rp_uni(L, N), rp_str(L, N); periodic = (true, true), period = (L, L))
     fb = randn(N, N, 2)
-    Test.@test rp_rel(FFS.calculate_spectrum(g, fb, (N, N); transform = RP_FFT, execution = RP_SER)[1],
+    Test.@test rp_rel(FFS.calculate_spectrum(g, fb, (N, N); transform = RP_FFT, execution = RP_SER, eps = 1e-12)[1],
         FFS.calculate_spectrum(g, fb, (N, N); transform = RP_DS, execution = RP_SER)[1]) < 1e-9
     fc = randn(ComplexF64, N, N)
-    Test.@test rp_rel(FFS.calculate_spectrum(g, fc, (N, N); transform = RP_FFT, execution = RP_SER)[1],
+    Test.@test rp_rel(FFS.calculate_spectrum(g, fc, (N, N); transform = RP_FFT, execution = RP_SER, eps = 1e-12)[1],
         FFS.calculate_spectrum(g, fc, (N, N); transform = RP_DS, execution = RP_SER)[1]) < 1e-9
 end
 
@@ -172,7 +173,7 @@ Test.@testset "A NUFFT type-2 evaluates the mode sum" begin
     g = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv),
         fill(L^2 / M, M); periodic = (true, true), period = (L, L))
     f = randn(M)
-    c, ks = FFS.calculate_spectrum(g, f, ms; transform = FFS.NonuniformFFTsBackend(), eps = 1e-12)
+    c, ks = FFS.calculate_spectrum(g, f, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-12)
 
     # The full native cube the half stands for, and the physical wavenumbers of each native mode.
     full = FFS.unpacked(c, ms, ks)
@@ -185,7 +186,7 @@ Test.@testset "A NUFFT type-2 evaluates the mode sum" begin
         end
         ref[j] = real(acc)
     end
-    out = FFS.synthesize(g, c, ms; transform = FFS.NonuniformFFTsBackend(), ks = ks, eps = 1e-12)
+    out = FFS.synthesize(g, c, ms; transform = FTB.NonuniformFFTsBackend(), ks = ks, eps = 1e-12)
     Test.@test length(out) == M
     Test.@test rp_rel(out, ref) < 1e-9
 

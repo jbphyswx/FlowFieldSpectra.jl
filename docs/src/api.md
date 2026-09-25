@@ -24,6 +24,7 @@ coefficient_size
 coefficient_type
 wavenumbers
 allocate_coefficients
+close!
 ```
 
 ```julia
@@ -167,18 +168,17 @@ The two backend axes are orthogonal and compose: pass one `transform=` and one `
 
 The `transform=` keyword takes a marker tag from
 [SpectralBackends.jl](https://github.com/jbphyswx/SpectralBackends.jl):
-`DirectSumSpectralBackend` (the default), `FFTSpectralBackend`, `NUFFTSpectralBackend`,
-`FSHTSpectralBackend`, `NUFSHTSpectralBackend` (all `<: SpectralBackends.AbstractSpectralBackend`).
-Transform options such as `eps`, `tol`, `iflag`, and `solve` are `calculate_spectrum` keyword
-arguments.
+`AutoSpectralBackend` (the default), `DirectSumSpectralBackend`, `FFTSpectralBackend`,
+`NUFFTSpectralBackend`, `FSHTSpectralBackend`, `NUFSHTSpectralBackend` (all
+`<: SpectralBackends.AbstractSpectralBackend`). Transform options such as `eps`, `tol`, `iflag`, and
+`solve` are `calculate_spectrum` keyword arguments.
 
-A NUFFT *provider* is a library choice, not spectral math, so FlowFieldSpectra owns two symmetric,
-concrete NUFFT backends (neither is a default; `SpectralBackends.NUFFTSpectralBackend` selects neither):
-
-```@docs
-FlowFieldSpectra.FINUFFTBackend
-FlowFieldSpectra.NonuniformFFTsBackend
-```
+A NUFFT names its library with a tag from
+[FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl):
+`FlowTransformBindings.NonuniformFFTsBackend()` (`using NonuniformFFTs`) or
+`FlowTransformBindings.FINUFFTBackend()` (`using FINUFFT`), both
+`<: SpectralBackends.AbstractNUFFTSpectralBackend`. `SpectralBackends.NUFFTSpectralBackend` names no
+library and raises.
 
 ## Execution backends (where/how it runs)
 

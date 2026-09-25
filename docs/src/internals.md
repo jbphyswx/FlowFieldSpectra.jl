@@ -28,6 +28,21 @@ FlowFieldSpectra._hybrid_plan
 FlowFieldSpectra._hybrid_derive
 ```
 
+### NUFFT plans
+
+The NUFFT plans run FlowTransformBindings' library plans in `FFTModes` order and publish the packed
+layout from them: a point set's type 1, a nonuniform tensor grid's separable passes, and the type-2
+inverse.
+
+```@docs
+FlowFieldSpectra.NUFFTPointPlan
+FlowFieldSpectra.NUFFTSeparablePlan
+FlowFieldSpectra.NUFFTAxisPass
+FlowFieldSpectra.NUFFTSynthesisPlan
+FlowFieldSpectra.TwinGather
+FlowFieldSpectra._packed_src
+```
+
 ### The direct sum's setup / run split
 
 Both direct-sum plans are a setup the grid fixes plus a run over a field, and each one-shot composes the

@@ -2,84 +2,89 @@ module Normalization
 
 export AbstractSidedness, OneSided, TwoSided,
     AbstractScaling, DensityScaling, PowerScaling,
-    SpectralConvention, sided_factor
+    AbstractShellEstimator, ShellSum, ModeAverage,
+    SpectralConvention
 
 # =============================================================================
-# Sidedness (typed, not Symbol)
+# Sidedness
 # =============================================================================
 
 """
     AbstractSidedness
 
-Whether a spectrum keeps both signs of wavenumber (`TwoSided`) or folds negatives onto
-positives (`OneSided`). Dispatches `sided_factor`.
+Whether a spectrum keeps both signs of wavenumber (`TwoSided`) or folds negatives onto positives
+(`OneSided`).
 """
 abstract type AbstractSidedness end
 
 """`TwoSided()` — keep ± wavenumbers (no folding)."""
 struct TwoSided <: AbstractSidedness end
 
-"""`OneSided()` — fold negative wavenumbers onto positives (doubles interior bins). The usual
-convention for real fields."""
+"""`OneSided()` — fold negative wavenumbers onto positives. The usual convention for real fields."""
 struct OneSided <: AbstractSidedness end
 
-"""
-    sided_factor(s::AbstractSidedness, k, kmax) -> Real
-
-Folding multiplier. `TwoSided` → `1` everywhere. `OneSided` → `2` for interior wavenumbers,
-`1` at DC (`k≈0`) and Nyquist (`k≈kmax`) which have no negative-frequency partner.
-"""
-@inline sided_factor(::TwoSided, k::T, kmax::T) where {T} = one(T)
-@inline function sided_factor(::OneSided, k::T, kmax::T) where {T}
-    (k <= eps(T) || k >= kmax - eps(T)) && return one(T)
-    return T(2)
-end
-
 # =============================================================================
-# Scaling (density vs power; typed)
+# Scaling
 # =============================================================================
 
 """
     AbstractScaling
 
-Whether a reduced spectrum is reported as a spectral *density* (`DensityScaling`, divided by the
-bin width so `∫E dk` recovers variance) or as per-bin/per-mode `PowerScaling`.
+Whether a binned spectrum is a spectral *density* (`DensityScaling`, divided by the bin width) or the
+power in each bin (`PowerScaling`).
 """
 abstract type AbstractScaling end
 
-"""`DensityScaling()` — spectral density (per unit wavenumber); `∫E dk = Var(f)`."""
+"""`DensityScaling()` — spectral density per unit wavenumber: `Σ E·dk` is the energy the bins hold."""
 struct DensityScaling <: AbstractScaling end
 
-"""`PowerScaling()` — per-bin/per-mode power (no `dk` division)."""
+"""`PowerScaling()` — the energy in each bin (no `dk` division)."""
 struct PowerScaling <: AbstractScaling end
+
+# =============================================================================
+# Radial-bin estimator
+# =============================================================================
+
+"""
+    AbstractShellEstimator
+
+How a radial bin turns the modes it holds into a spectrum value.
+"""
+abstract type AbstractShellEstimator end
+
+"""
+`ShellSum()` — the sum of `½|C|²` over the bin's modes, so the bins add up to the energy they hold. A
+shell the mode box holds only in part (radius beyond `k_max = min_d max|k_d|`) sums fewer modes than a
+whole one.
+"""
+struct ShellSum <: AbstractShellEstimator end
+
+"""
+`ModeAverage()` — the mean of `½|C|²` over the bin's modes times the number of modes a whole shell of
+that width holds, `V_D (k₊ᴰ − k₋ᴰ) / ∏_d Δk_d` with `V_D` the unit-ball volume. For an isotropic field a
+shell the mode box holds in part then estimates the whole shell, and the scatter of the lattice's mode
+count per shell at low `k` averages out; the bins add up to the energy only approximately. A bin holding
+no mode is `NaN`.
+"""
+struct ModeAverage <: AbstractShellEstimator end
 
 # =============================================================================
 # Convention object
 # =============================================================================
 
 """
-    SpectralConvention(; sided=OneSided(), scaling=DensityScaling(), parseval_check=false)
+    SpectralConvention(; sided=OneSided(), scaling=DensityScaling(), estimator=ShellSum())
 
-Convention governing how spectral coefficients become reported spectra, so the package never
-silently guesses normalization. Fields are typed for compile-time dispatch.
-
-- `sided::AbstractSidedness`: `OneSided()` (default) or `TwoSided()`.
-- `scaling::AbstractScaling`: `DensityScaling()` (default) or `PowerScaling()`.
-- `parseval_check::Bool`: when `true`, callers assert `Σ E·Δk ≈ Var(field)` (after mean
-  removal) as a correctness self-test.
-
-The variance-preservation property — `∫ E(k) dk = Var(f)` after demeaning — is the invariant
-the test suite enforces across every backend and grid.
+How spectral coefficients become reported spectra: the sidedness, the scaling, and the radial-bin
+estimator. Fields are typed for compile-time dispatch.
 """
-struct SpectralConvention{S<:AbstractSidedness, C<:AbstractScaling}
+struct SpectralConvention{S<:AbstractSidedness, C<:AbstractScaling, E<:AbstractShellEstimator}
     sided::S
     scaling::C
-    parseval_check::Bool
+    estimator::E
 end
 
-function SpectralConvention(; sided::AbstractSidedness = OneSided(),
-        scaling::AbstractScaling = DensityScaling(), parseval_check::Bool = false)
-    return SpectralConvention(sided, scaling, parseval_check)
-end
+SpectralConvention(; sided::AbstractSidedness = OneSided(), scaling::AbstractScaling = DensityScaling(),
+        estimator::AbstractShellEstimator = ShellSum()) = SpectralConvention(sided, scaling, estimator)
 
 end # module Normalization

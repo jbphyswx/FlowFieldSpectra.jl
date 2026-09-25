@@ -61,4 +61,32 @@ Test.@testset "Distributed spectrum parity" begin
     cs, _ = FFS.calculate_spectrum(sph, fθ, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
     csd, _ = FFS.calculate_spectrum(sph, fθ, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.DistributedBackend())
     Test.@test isapprox(csd, cs; atol = 1e-10)
+
+    # The round-robin shares carry different mean measures (1 on odd points, 3 on even ones), so each
+    # share's coefficients weigh in by its measure total, and the measure changes the coefficients.
+    meas = [isodd(j) ? 1.0 : 3.0 for j in 1:N]
+    scw = FG.Grids.UnstructuredGrid(_cg(Float64), (xv, yv), meas; periodic = (true, true), period = (L, L))
+    for t in (SB.DirectSumSpectralBackend(), FTB.FINUFFTBackend())
+        kw = t isa FTB.FINUFFTBackend ? (; eps = 1e-12) : (;)
+        cw, _ = FFS.calculate_spectrum(scw, f, ms; transform = t, execution = CB.SerialBackend(), kw...)
+        cu, _ = FFS.calculate_spectrum(sc, f, ms; transform = t, execution = CB.SerialBackend(), kw...)
+        Test.@test maximum(abs, cw .- cu) > 1e-2 * maximum(abs, cu)
+        cwd, _ = FFS.calculate_spectrum(scw, f, ms; transform = t, execution = CB.DistributedBackend(), kw...)
+        Test.@test isapprox(cwd, cw; atol = 1e-10)
+    end
+
+    # A masked node carries no weight, NaN included; each share keeps its slice of the mask. Explicit
+    # `weights` are per node, so each share takes its own.
+    smask = trues(200); smask[1:3:200] .= false
+    fnan = copy(fθ); fnan[.!smask] .= NaN
+    smeas = [isodd(j) ? 1.0 : 2.0 for j in 1:200]
+    sphm = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (φ, π / 2 .- θ), smeas, smask)
+    cm, _ = FFS.calculate_spectrum(sphm, fnan, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    cmd, _ = FFS.calculate_spectrum(sphm, fnan, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.DistributedBackend())
+    Test.@test all(isfinite, cm)
+    Test.@test isapprox(cmd, cm; atol = 1e-10)
+    w = rand(200)
+    cx, _ = FFS.calculate_spectrum(sph, fθ, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend(), weights = w)
+    cxd, _ = FFS.calculate_spectrum(sph, fθ, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.DistributedBackend(), weights = w)
+    Test.@test isapprox(cxd, cx; atol = 1e-10)
 end

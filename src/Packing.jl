@@ -457,6 +457,25 @@ end
 @inline kmax(::Type{T}, ks::Tuple) where {T} = min(_axis_absmax(T, first(ks)), kmax(T, Base.tail(ks)))
 @inline kmax(::Type{T}, ::Tuple{}) where {T} = T(Inf)
 
+# The largest isotropic wavenumber among the modes, `√(Σ_d max|k_d|²)`: the corner of the mode box.
+@inline kcorner(::Type{T}, ks::Tuple) where {T} = sqrt(_kcorner_sq(T, ks))
+@inline _kcorner_sq(::Type{T}, ks::Tuple) where {T} = _axis_absmax(T, first(ks))^2 + _kcorner_sq(T, Base.tail(ks))
+@inline _kcorner_sq(::Type{T}, ::Tuple{}) where {T} = zero(T)
+
+# Full transform length of an axis: a halved axis stores `n÷2+1` of its `n` modes.
+@inline full_length(a::RFFTAxis) = a.n
+@inline full_length(a::AbstractVector) = length(a)
+
+# Default radial bin count: half the shortest axis's full mode count, the same for a real field's packed
+# half as for a complex field's full spectrum.
+@inline default_bins(ks::Tuple) = minimum(map(full_length, ks)) ÷ 2
+
+# The indices of `−k_d` on the axes `2:D` of mode `I`.
+@inline neg_rest(ks::Tuple, I::CartesianIndex) = _neg_rest(Base.tail(ks), I, 2)
+@inline _neg_rest(ks::Tuple, I::CartesianIndex, d::Int) =
+    (neg_index(first(ks), I[d]), _neg_rest(Base.tail(ks), I, d + 1)...)
+@inline _neg_rest(::Tuple{}, ::CartesianIndex, ::Int) = ()
+
 # Product of the wavenumber spacings of the axes in `dims`, folded over the heterogeneous axis tuple by
 # recursion so `ks[d]` with a runtime `d` never boxes.
 @inline dk_product(::Type{T}, ks::Tuple, dims::Tuple) where {T} = _dkp(T, ks, dims, 1)

@@ -158,6 +158,9 @@ TwoSided
 AbstractScaling
 DensityScaling
 PowerScaling
+AbstractShellEstimator
+ShellSum
+ModeAverage
 TransformProblem
 ```
 

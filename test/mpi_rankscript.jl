@@ -32,18 +32,27 @@ ug = FG.Grids.StructuredGrid(cart, xs, ys; periodic = (true, true), period = (L,
 u = [cos(2x) + 0.5 * sin(3y) for x in xs, y in ys]
 ub = cat(u, 2 .* u, 3 .* u, 4 .* u; dims = 3)
 
-cd, _ = FFS.calculate_spectrum(sc, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.MPIBackend())
-cn, _ = FFS.calculate_spectrum(sc, f, ms; transform = FTB.FINUFFTBackend(), execution = CB.MPIBackend(), eps = 1e-12)
-cf, _ = FFS.calculate_spectrum(ug, ub, ms; transform = SB.FFTSpectralBackend(), execution = CB.MPIBackend())
+# The round-robin shares carry different mean measures, and a masked sphere holds NaN at its masked
+# nodes.
+scw = FG.Grids.UnstructuredGrid(cart, (xv, yv), [isodd(j) ? 1.0 : 3.0 for j in 1:N]; periodic = (true, true),
+                                period = (L, L))
+θ = rand(N) .* π; φ = rand(N) .* 2π
+smask = trues(N); smask[1:3:N] .= false
+fs = rand(N); fs[.!smask] .= NaN
+sphm = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (φ, π / 2 .- θ),
+                                 [isodd(j) ? 1.0 : 2.0 for j in 1:N], smask)
 
-if rank == 0
-    dref, _ = FFS.calculate_spectrum(sc, f, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
-    nref, _ = FFS.calculate_spectrum(sc, f, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
-    fref, _ = FFS.calculate_spectrum(ug, ub, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
-    ok = isapprox(cd, dref; rtol = 1e-10, atol = 1e-12) &&
-         isapprox(cn, nref; rtol = 1e-9, atol = 1e-10) &&
-         isapprox(cf, fref; atol = 1e-12)
-    println(ok ? "MPI_PARITY_OK np=$(MPI.Comm_size(comm))" : "MPI_PARITY_FAIL")
-end
+serial(g, x, m, t; kw...) = FFS.calculate_spectrum(g, x, m; transform = t, execution = CB.SerialBackend(), kw...)[1]
+mpi(g, x, m, t; kw...) = FFS.calculate_spectrum(g, x, m; transform = t, execution = CB.MPIBackend(), kw...)[1]
+DS, NU, FF = SB.DirectSumSpectralBackend(), FTB.FINUFFTBackend(), SB.FFTSpectralBackend()
+checks = [
+    ("direct sum", isapprox(mpi(sc, f, ms, DS), serial(sc, f, ms, DS); rtol = 1e-10, atol = 1e-12)),
+    ("FINUFFT", isapprox(mpi(sc, f, ms, NU; eps = 1e-12), serial(sc, f, ms, NU; eps = 1e-12); rtol = 1e-9, atol = 1e-10)),
+    ("FFT batch", isapprox(mpi(ug, ub, ms, FF), serial(ug, ub, ms, FF); atol = 1e-12)),
+    ("unequal measure", isapprox(mpi(scw, f, ms, DS), serial(scw, f, ms, DS); rtol = 1e-10, atol = 1e-12)),
+    ("masked sphere", isapprox(mpi(sphm, fs, (8, 15), DS), serial(sphm, fs, (8, 15), DS); atol = 1e-10)),
+]
+failed = [name for (name, ok) in checks if !ok]
+rank == 0 && println(isempty(failed) ? "MPI_PARITY_OK np=$(MPI.Comm_size(comm))" : "MPI_PARITY_FAIL $(failed)")
 
 MPI.Finalize()

@@ -37,9 +37,10 @@ function _mpi_pointsum(b::ComputationalBackends.MPIBackend, transform, g::FlowGe
     idx = (rank + 1):nrank:Nglob                      # round-robin point share
     sg = FFS._subgrid(g, idx)
     sf = collect(selectdim(fieldP, 1, idx))
-    cw, kw = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), sg, sf, ms; kwargs...)
+    cw, kw = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), sg, sf, ms;
+                                    FFS._partition_kwargs(kwargs, idx)...)
     FT = real(eltype(cw))
-    α = FT(FFS._partition_alpha(g, length(idx), Nglob))
+    α = FT(FFS._partition_weight(g, idx, get(kwargs, :weights, nothing)))
     coeffs = Array{eltype(cw)}(undef, size(cw))        # contiguous buffer for in-place Allreduce
     coeffs .= α .* Array(cw)
     MPI.Allreduce!(coeffs, +, comm)

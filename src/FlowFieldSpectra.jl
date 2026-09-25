@@ -24,7 +24,8 @@ include("LombScargle.jl")
 using .Packing: Packing, unpacked, unpacked!
 using .Grids: Grids, physical_wavenumbers
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
-using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
+using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling,
+    AbstractShellEstimator, ShellSum, ModeAverage, SpectralConvention
 using .Problem: Problem, TransformProblem, batch_shape, stack_fields
 using .Plans: Plans, AbstractSpectralPlan, plan_spectrum,
     coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
@@ -40,7 +41,8 @@ using .LombScargle: lomb_scargle, lomb_scargle!
 # Preprocessing & Normalization (typed configuration)
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey
 export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
-export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling, SpectralConvention
+export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling,
+    AbstractShellEstimator, ShellSum, ModeAverage, SpectralConvention
 export TransformProblem
 export AbstractSpectralPlan, plan_spectrum, preprocess_field
 export coefficient_size, coefficient_type, wavenumbers, allocate_coefficients
@@ -483,8 +485,8 @@ calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::Compu
 # `NTuple{D,Bool}`, so the all-uniform and mixed branches below resolve without a runtime-length tuple.
 _uniform_mask(g, ::Val{D}) where {D} = ntuple(d -> FlowGeometries.Grids.isuniform(g, d), Val(D))
 
-# The library that transforms the stretched axes. `AutoSpectralBackend` takes the first loaded of
-# NonuniformFFTs and FINUFFT; an explicit one is honoured as given.
+# The library that transforms the stretched axes. `AutoSpectralBackend` takes NonuniformFFTs when it is
+# loaded and FINUFFT when only it is; an explicit one is honoured as given.
 _resolve_nufft_provider(t::SpectralBackends.AbstractNUFFTSpectralBackend) = t
 function _resolve_nufft_provider(::SpectralBackends.AbstractAutoSpectralBackend)
     t = _auto_nufft(ComputationalBackends.SerialBackend())
@@ -1214,8 +1216,8 @@ _calculate_spectrum_mpi(args...; kwargs...) = throw(ArgumentError("MPIBackend is
 
 # Subgrid over a subset of point indices (the point-partitionable grids: a node cloud, and a curvilinear
 # grid, whose coordinate arrays hold one value per cell and index linearly the same way), preserving the
-# geometry, periodicity, and per-node measure (sliced). A subset of a curvilinear grid's cells keeps no
-# index-space structure, so it is a node cloud either way.
+# geometry, periodicity, per-node measure and mask (sliced). A subset of a curvilinear grid's cells keeps
+# no index-space structure, so it is a node cloud either way.
 function _subgrid(g::Union{FlowGeometries.Grids.AbstractUnstructuredGrid,
             FlowGeometries.Grids.AbstractCurvilinearGrid}, idx)
     geom = FlowGeometries.Grids.grid_geometry(g)
@@ -1224,13 +1226,33 @@ function _subgrid(g::Union{FlowGeometries.Grids.AbstractUnstructuredGrid,
     meas = view(FlowGeometries.Grids.measure_array(g), idx)
     per = FlowGeometries.Grids.periodic_flags(g)
     prd = ntuple(d -> FlowGeometries.Grids.period(g, d), D)
-    return FlowGeometries.Grids.UnstructuredGrid(geom, coords, meas; periodic = per, period = prd)
+    return FlowGeometries.Grids.UnstructuredGrid(geom, coords, meas,
+        _submask(FlowGeometries.Grids.mask(g), idx); periodic = per, period = prd)
 end
 
-# Per-worker scalar so `coeff_global = Σ_w α_w · coeff_w`. Point-partition fires only on unstructured
-# grids, whose scattered subgrids use the uniform `4π/N_local` (spherical) / `1/N_local` (Cartesian)
-# weighting; `α_w = N_local/N_global` recombines them into the global `1/N_global` normalization.
-_partition_alpha(::FlowGeometries.Grids.AbstractGrid, Nw, Nglob) = Nw / Nglob
+_submask(::FlowGeometries.Grids.AllActive, idx) = FlowGeometries.Grids.AllActive((length(idx),))
+_submask(mask::AbstractArray{Bool}, idx) = vec(mask)[idx]
+
+"""
+    _partition_weight(grid, idx, weights) -> Real
+
+The weight the coefficients of the points `idx` carry in `C = Σ_w α_w C_w` over a disjoint point
+partition. A transform on those points normalizes by their own measure total `W_w` (the Cartesian
+quadrature `Σ wⱼfⱼe^{-ik·x}/Σw`, the spherical weights rescaled to `4π`), so `α_w = W_w/W`. With explicit
+per-node `weights` nothing is normalized and `α_w = 1`.
+"""
+function _partition_weight(g::FlowGeometries.Grids.AbstractGrid, idx, ::Nothing)
+    m = FlowGeometries.Grids.measure_array(g)
+    return sum(view(m, idx)) / sum(m)
+end
+_partition_weight(::FlowGeometries.Grids.AbstractGrid, idx, weights) = 1
+
+# A transform's keywords restricted to the points `idx`: explicit per-node `weights` sliced to them.
+function _partition_kwargs(kwargs, idx)
+    kw = NamedTuple(kwargs)
+    w = get(kw, :weights, nothing)
+    return w === nothing ? kw : merge(kw, (; weights = w[idx]))
+end
 
 # Transforms whose coefficients are additive over a disjoint point partition.
 _partitionable(::SpectralBackends.AbstractDirectSumSpectralBackend) = true

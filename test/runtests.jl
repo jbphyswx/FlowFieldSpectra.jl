@@ -581,7 +581,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         N = 128; K = 7
         V = FFS.dpss(N, 4.0, K)
         Test.@test size(V) == (N, K)
-        Test.@test maximum(abs.(V' * V - Matrix(LA.I(K)))) < 1e-8
+        Test.@test maximum(abs.(V' * V - N * Matrix(LA.I(K)))) < 1e-8 * N
         Test.@test_throws ArgumentError FFS.dpss(N, 4.0, N + 1)
         L = 2π
         x = ucg_axis(Float64, L, N)
@@ -691,6 +691,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test isapprox(cpg, nug(gdev, frd, (12, 12)); atol = 1.0e-10)
     end
 
+    include("test_reductions.jl")
     include("test_spherical_layouts.jl")
     include("test_spherical_parity.jl")
     include("test_curvilinear.jl")

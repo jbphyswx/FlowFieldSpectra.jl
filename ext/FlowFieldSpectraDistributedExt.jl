@@ -43,19 +43,21 @@ function _distributed_pointsum(inner, transform, g::FlowGeometries.Grids.Abstrac
     partials = Distributed.pmap(chunks) do idx
         sg = FFS._subgrid(g, idx)
         sf = collect(selectdim(fieldP, 1, idx))
-        cw, kw = _serial_ft(() -> FFS.calculate_spectrum(transform, inner, sg, sf, ms; kwargs...))
-        (Array(cw), FFS._ks_twin(kw), length(idx))
+        kwi = FFS._partition_kwargs(kwargs, idx)
+        cw, kw = _serial_ft(() -> FFS.calculate_spectrum(transform, inner, sg, sf, ms; kwi...))
+        (Array(cw), FFS._ks_twin(kw))
     end
     FT = real(eltype(partials[1][1]))
+    w = get(kwargs, :weights, nothing)
+    α = [FT(FFS._partition_weight(g, idx, w)) for idx in chunks]
     # The workers' own element type: complex for a Cartesian spectrum, real for a real field's spherical
     # coefficients.
     coeffs = zeros(eltype(partials[1][1]), size(partials[1][1]))
-    @inbounds for (cw, _, Nw) in partials
-        coeffs .+= FT(FFS._partition_alpha(g, Nw, Nglob)) .* cw
+    @inbounds for (k, (cw, _)) in enumerate(partials)
+        coeffs .+= α[k] .* cw
     end
     ks = FFS._partition_ks(g, ms, eltype(field) <: Real)
-    weights = [FT(FFS._partition_alpha(g, p[3], Nglob)) for p in partials]
-    return coeffs, FFS._combine_twins(ks, Tuple(p[2] for p in partials), weights)
+    return coeffs, FFS._combine_twins(ks, Tuple(p[2] for p in partials), α)
 end
 
 # ---- batch-partition: disjoint batch slices, gathered along the (flattened) batch axis ----

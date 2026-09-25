@@ -305,9 +305,10 @@ end
     dpss(N::Integer, NW::Real, K::Integer = floor(Int, 2NW) - 1; T = Float64) -> Matrix{T}
 
 Discrete prolate spheroidal sequences (Slepian tapers): the `K` length-`N` sequences with maximal
-spectral concentration in the half-bandwidth `W = NW/N`, returned as an `N×K` orthonormal matrix
-whose column `k` is the order-`(k-1)` taper. `NW` is the time–bandwidth product (typical `2.5`–`4`);
-`K ≈ 2·NW − 1` tapers are usefully concentrated.
+spectral concentration in the half-bandwidth `W = NW/N`, returned as an `N×K` matrix whose column `k` is
+the order-`(k-1)` taper. The columns are orthogonal with unit mean square (`V'V = N·I`), the scaling
+`axis_taper` gives a window, so a tapered copy's periodogram has the untapered level. `NW` is the
+time–bandwidth product (typical `2.5`–`4`); `K ≈ 2·NW − 1` tapers are usefully concentrated.
 
 Multitaper power spectral estimation reuses the ensemble machinery: apply each taper to the
 (demeaned) signal, transform the `K` tapered copies as a batch, and average their periodograms
@@ -330,6 +331,7 @@ function dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1);
         s = isodd(k) ? sum(v) : sum(j -> (j - (N + 1) / 2) * v[j], 1:N)
         s < 0 && (v .*= -one(T))
     end
+    V .*= sqrt(T(N))
     return V
 end
 

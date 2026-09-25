@@ -159,10 +159,11 @@ FlowFieldSpectra.Preprocessing.detrend_spatial!
 FlowFieldSpectra.Preprocessing.apply_window!
 ```
 
-## Normalization helpers
+## Radial-bin helpers
 
 ```@docs
-FlowFieldSpectra.Normalization.sided_factor
+FlowFieldSpectra.Reductions._shell_values!
+FlowFieldSpectra.Reductions._native_energy
 ```
 
 ## Spherical-harmonic kernels

@@ -1,6 +1,7 @@
 module FlowFieldSpectraFastSphericalHarmonicsExt
 
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
+using FFTW: FFTW
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
@@ -8,9 +9,24 @@ using FlowGeometries: FlowGeometries
 using FlowTransformBindings: FlowTransformBindings as FTB
 
 # Each transform runs through `FTB.with_fasttransforms_threads`, which sets FastTransforms' OpenMP count
-# on the calling OS thread and restores it after.
-_transform!(slab) = FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(slab))
-_evaluate!(slab) = FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(slab))
+# on the calling OS thread and restores it after, and reads its plans from `cache`.
+_transform!(slab, cache) = FTB.with_fasttransforms_threads(() -> FSH.sph_transform!(slab; cache = cache))
+_evaluate!(slab, cache) = FTB.with_fasttransforms_threads(() -> FSH.sph_evaluate!(slab; cache = cache))
+
+# Both transforms' plans for an `(Nθ, Nφ)` slab, built by one transform and one evaluation of a zero
+# slab. FastTransforms builds them on the libfftw3 FFTW.jl loads, whose planner is process-global, so
+# they are built under FFTW.jl's planner lock, the planner at one thread; every later slab reuses them.
+function _warmed_cache(::Type{FT}, Nθ::Int, Nφ::Int) where {FT}
+    cache = FSH.SphPlanCache{FT}()
+    slab = zeros(FT, Nθ, Nφ)
+    FFTW.set_num_threads(1) do
+        FTB.with_fasttransforms_threads() do
+            FSH.sph_transform!(slab; cache = cache)
+            FSH.sph_evaluate!(slab; cache = cache)
+        end
+    end
+    return cache
+end
 
 # =============================================================================
 # Structured Spherical Harmonic Transform via FastSphericalHarmonics (FastTransforms). `sph_transform!`
@@ -47,13 +63,14 @@ function FFS._calculate_spectrum_sht(g::FlowGeometries.Grids.AbstractStructuredG
     # recombine as `C = C(Re f) + i·C(Im f)`.
     coeffs = zeros(FFS.sph_coeff_type(eltype(field), FT), Nθ, Nφ, B)
     slab = Matrix{FT}(undef, Nθ, Nφ)
+    cache = _warmed_cache(FT, Nθ, Nφ)
     @inbounds for b in 1:B
         _ft_stage!(slab, Fr, rowperm, colperm, b, FT, real)
-        _transform!(slab)                                      # exact analysis, in place
+        _transform!(slab, cache)                               # exact analysis, in place
         _ft_gather!(coeffs, slab, lmax, b, one(FT))
         if !(eltype(field) <: Real)
             _ft_stage!(slab, Fr, rowperm, colperm, b, FT, imag)
-            _transform!(slab)
+            _transform!(slab, cache)
             _ft_gather!(coeffs, slab, lmax, b, im)
         end
     end
@@ -117,12 +134,13 @@ end
 # coefficient array is evaluated one real component at a time, which the transform's linearity permits.
 # =============================================================================
 
-# Reusable synthesis: the grid permutations `_ft_perms` validates once, and the slab `sph_evaluate!`
-# transforms in place.
-struct FSHTSynthesisPlan{FT, R, NB, PR, PC} <: FFS.AbstractSynthesisPlan
+# Reusable synthesis: the grid permutations `_ft_perms` validates once, the slab `sph_evaluate!`
+# transforms in place, and the FastTransforms plans it evaluates with, built with the plan.
+struct FSHTSynthesisPlan{FT, R, NB, PR, PC, C} <: FFS.AbstractSynthesisPlan
     rowperm::PR
     colperm::PC
     slab::Matrix{FT}
+    cache::C
     lmax::Int
     Nθ::Int
     Nφ::Int
@@ -149,8 +167,9 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFSHTSpectralBackend
         "FSHTSpectralBackend requires a structured (nlon, nlat) = ($Nφ, $Nθ) grid matching ms; got size = $ss"))
     rowperm, colperm = _ft_perms(FT, g, Nθ, Nφ)
     bt = NTuple{length(batch), Int}(batch)
-    return FSHTSynthesisPlan{FT, T <: Real, length(bt), typeof(rowperm), typeof(colperm)}(
-        rowperm, colperm, Matrix{FT}(undef, Nθ, Nφ), lmax, Nθ, Nφ, bt, prod(bt; init = 1))
+    cache = _warmed_cache(FT, Nθ, Nφ)
+    return FSHTSynthesisPlan{FT, T <: Real, length(bt), typeof(rowperm), typeof(colperm), typeof(cache)}(
+        rowperm, colperm, Matrix{FT}(undef, Nθ, Nφ), cache, lmax, Nθ, Nφ, bt, prod(bt; init = 1))
 end
 
 # `sph_evaluate!` is real→real, so a complex coefficient array is evaluated one component at a time and
@@ -175,7 +194,7 @@ function FFS.Plans.synthesize!(out::AbstractArray, plan::FSHTSynthesisPlan{FT, R
             z = C[FFS.sph_mode_index(l, m), b]
             slab[FSH.sph_mode(l, m)] = comp == 1 ? real(z) : imag(z)
         end
-        _evaluate!(slab)
+        _evaluate!(slab, plan.cache)
         for (ic, jc) in enumerate(plan.colperm), (ir, jr) in enumerate(plan.rowperm)
             v = slab[ir, ic]
             O[jc, jr, b] += comp == 1 ? ET(v) : ET(im * v)
@@ -206,6 +225,7 @@ function FFS._synthesize(::SpectralBackends.AbstractFSHTSpectralBackend,
     out = zeros(ET, Nφ, Nθ, batch...)
     O = reshape(out, Nφ, Nθ, B)
     slab = Matrix{FT}(undef, Nθ, Nφ)
+    cache = _warmed_cache(FT, Nθ, Nφ)
     ncomp = real_output ? 1 : 2
     @inbounds for b in 1:B, comp in 1:ncomp
         fill!(slab, zero(FT))
@@ -213,7 +233,7 @@ function FFS._synthesize(::SpectralBackends.AbstractFSHTSpectralBackend,
             z = C[FFS.sph_mode_index(l, m), b]
             slab[FSH.sph_mode(l, m)] = comp == 1 ? real(z) : imag(z)
         end
-        _evaluate!(slab)                                       # exact synthesis, in place
+        _evaluate!(slab, cache)                                # exact synthesis, in place
         for (ic, jc) in enumerate(colperm), (ir, jr) in enumerate(rowperm)
             v = slab[ir, ic]                                   # FastTransforms (θ ir, φ ic) → (nlon jc, nlat jr)
             O[jc, jr, b] += comp == 1 ? ET(v) : ET(im * v)

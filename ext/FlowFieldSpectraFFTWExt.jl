@@ -55,8 +55,7 @@ FFS.Plans.wavenumbers(p::CFFTPlan) = p.ks_phys
 # (`ESTIMATE` leaves it untouched). `ks_phys` follows the packed native order.
 function _fftw_plan(::Type{T}, g, ns::NTuple{D, Int}, a::AbstractArray, nthreads::Int, flags;
         iflag::Int = 1) where {T<:Real, D}
-    FFTW.set_num_threads(nthreads)
-    fwd = FFTW.plan_rfft(a, 1:D; flags = flags)
+    fwd = FFTW.plan_rfft(a, 1:D; flags = flags, num_threads = nthreads)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(true))
     bt = _batch_of(a, Val(D))
     return RFFTPlan{T, D, length(bt), typeof(fwd), typeof(ks)}(
@@ -68,8 +67,8 @@ _batch_of(a::AbstractArray, ::Val{D}) where {D} = ntuple(i -> size(a, D + i), ma
 
 function _fftw_plan(::Type{Complex{RT}}, g, ns::NTuple{D, Int}, a::AbstractArray, nthreads::Int, flags;
         iflag::Int = 1) where {RT<:Real, D}
-    FFTW.set_num_threads(nthreads)
-    fwd = iflag == 1 ? FFTW.plan_fft(a, 1:D; flags = flags) : FFTW.plan_bfft(a, 1:D; flags = flags)
+    fwd = iflag == 1 ? FFTW.plan_fft(a, 1:D; flags = flags, num_threads = nthreads) :
+                       FFTW.plan_bfft(a, 1:D; flags = flags, num_threads = nthreads)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(false))
     bt = _batch_of(a, Val(D))
     return CFFTPlan{RT, D, length(bt), typeof(fwd), typeof(ks)}(fwd, ns, bt, one(RT) / prod(ns), ks)
@@ -174,13 +173,15 @@ end
 # Raw output: the composite applies the offset phase and the `1/∏N_d` normalization once at the end.
 function FFS._region_fft(exec::ComputationalBackends.AbstractExecutionBackend, field::AbstractArray,
         dims::Tuple, halve::Bool, conj_in::Bool)
-    FFTW.set_num_threads(FFS._backend_nthreads(exec))
-    halve && return FFTW.rfft(field, dims)
+    nth = FFS._backend_nthreads(exec)
+    if halve
+        x = float(field)
+        return FFTW.plan_rfft(x, dims; num_threads = nth) * x
+    end
     A = Array{Complex{real(float(eltype(field)))}}(undef, size(field)...)
     copyto!(A, field)
     conj_in && (A .= conj.(A))
-    FFTW.fft!(A, dims)
-    return A
+    return FFTW.plan_fft!(A, dims; num_threads = nth) * A
 end
 
 # ---- the same pass, held for reuse ----
@@ -205,13 +206,13 @@ Base.show(io::IO, r::RegionFFT) = print(io, "RegionFFT(", r.halve ? "rfft" : "ff
 
 function FFS._region_fft_plan(exec::ComputationalBackends.AbstractExecutionBackend, ::Type{T},
         insize::Tuple, dims::Tuple, halve::Bool, conj_in::Bool) where {T}
-    FFTW.set_num_threads(FFS._backend_nthreads(exec))
+    nth = FFS._backend_nthreads(exec)
     RT = real(float(T))
     # `rfft` halves the FIRST transformed dim, which the composite requires to be axis 1.
     outsize = halve ? (insize[1] ÷ 2 + 1, Base.tail(insize)...) : insize
     scratch = halve ? Array{RT}(undef, insize...) : Array{Complex{RT}}(undef, insize...)
-    fwd = halve ? FFTW.plan_rfft(scratch, dims; flags = FFTW.MEASURE) :
-                  FFTW.plan_fft(scratch, dims; flags = FFTW.MEASURE)
+    fwd = halve ? FFTW.plan_rfft(scratch, dims; flags = FFTW.MEASURE, num_threads = nth) :
+                  FFTW.plan_fft(scratch, dims; flags = FFTW.MEASURE, num_threads = nth)
     return RegionFFT{typeof(fwd), typeof(scratch)}(fwd, scratch, outsize, halve, conj_in)
 end
 
@@ -256,17 +257,17 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
     ns = size(g)
     Tuple(ms) == ns || throw(ArgumentError(
         "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform."))
-    FFTW.set_num_threads(FFS._backend_nthreads(exec))
+    nth = FFS._backend_nthreads(exec)
     RT = real(float(T))
     R = T <: Real
     bt = NTuple{length(batch), Int}(batch)
     if R
         scratch = Array{Complex{RT}}(undef, FFS.Packing.packed_size(ns, Val(true))..., bt...)
-        bwd = FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.MEASURE)
+        bwd = FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.MEASURE, num_threads = nth)
     else
         scratch = Array{Complex{RT}}(undef, ns..., bt...)
-        bwd = iflag == 1 ? FFTW.plan_bfft(scratch, 1:D; flags = FFTW.MEASURE) :
-                           FFTW.plan_fft(scratch, 1:D; flags = FFTW.MEASURE)
+        bwd = iflag == 1 ? FFTW.plan_bfft(scratch, 1:D; flags = FFTW.MEASURE, num_threads = nth) :
+                           FFTW.plan_fft(scratch, 1:D; flags = FFTW.MEASURE, num_threads = nth)
     end
     return FFTWSynthesisPlan{RT, D, length(bt), R, typeof(bwd), typeof(scratch)}(
         bwd, scratch, ns, bt, iflag < 0)
@@ -301,7 +302,7 @@ function FFS._synthesize(::SpectralBackends.AbstractFFTSpectralBackend,
     ns = size(g)
     Tuple(ms) == ns || throw(ArgumentError(
         "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform."))
-    FFTW.set_num_threads(FFS._backend_nthreads(exec))
+    nth = FFS._backend_nthreads(exec)
     batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
     if real_output
         pms = FFS.Packing.packed_size(ns, Val(true))
@@ -310,14 +311,15 @@ function FFS._synthesize(::SpectralBackends.AbstractFFTSpectralBackend,
             "Pass real_output=false for a full native spectrum $(ns)."))
         scratch = iflag < 0 ? conj.(coeffs) : copy(coeffs)   # a real field's iflag=-1 half is conjugated
         out = Array{RT}(undef, ns..., batch...)
-        LA.mul!(out, FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.ESTIMATE), scratch)
+        LA.mul!(out, FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.ESTIMATE, num_threads = nth),
+                scratch)
         return out
     end
     size(coeffs)[1:D] == ns || throw(DimensionMismatch(
         "real_output=false expects the full native spectrum $(ns) on the spectral dims; got $(size(coeffs)[1:D])."))
     out = Array{Complex{RT}}(undef, ns..., batch...)
-    bwd = iflag == 1 ? FFTW.plan_bfft(coeffs, 1:D; flags = FFTW.ESTIMATE) :
-                       FFTW.plan_fft(coeffs, 1:D; flags = FFTW.ESTIMATE)
+    bwd = iflag == 1 ? FFTW.plan_bfft(coeffs, 1:D; flags = FFTW.ESTIMATE, num_threads = nth) :
+                       FFTW.plan_fft(coeffs, 1:D; flags = FFTW.ESTIMATE, num_threads = nth)
     LA.mul!(out, bwd, coeffs)
     return out
 end

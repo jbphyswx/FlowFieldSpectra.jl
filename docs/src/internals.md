@@ -51,6 +51,7 @@ dense DFT matrices, the working arrays the contraction walks through and the Nyq
 structured grid contracts axis by axis through `AxisPass`, and a point cloud sums directly.
 
 ```@docs
+FlowFieldSpectra.DirectSum.phase_geometry
 FlowFieldSpectra.DirectSum.cart_setup
 FlowFieldSpectra.DirectSum.cart_run!
 FlowFieldSpectra.DirectSum.AxisPass
@@ -76,6 +77,7 @@ FlowFieldSpectra.Grids.field_batch_shape
 FlowFieldSpectra.Grids.point_coordinates
 FlowFieldSpectra.Grids.axis_geometry
 FlowFieldSpectra.Grids.axis_range
+FlowFieldSpectra.Grids.relative_coordinates
 FlowFieldSpectra.Grids._sph_points
 FlowFieldSpectra.Grids._colatitude
 ```
@@ -118,7 +120,6 @@ walk. [`unpacked`](@ref) and [`unpacked!`](@ref) are the public entry points.
 
 ```@docs
 FlowFieldSpectra.Packing.hermitian_request_size
-FlowFieldSpectra.Packing.offset_phase
 FlowFieldSpectra.Packing.publish_packed!
 FlowFieldSpectra.Packing.packed_half_view
 FlowFieldSpectra.Packing.NyquistTwin

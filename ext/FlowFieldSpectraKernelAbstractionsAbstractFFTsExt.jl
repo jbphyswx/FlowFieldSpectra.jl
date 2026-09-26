@@ -1,4 +1,4 @@
-module FlowFieldSpectraGPUFFTExt
+module FlowFieldSpectraKernelAbstractionsAbstractFFTsExt
 
 using KernelAbstractions: KernelAbstractions as KA, @kernel, @index, @Const
 using AbstractFFTs: AbstractFFTs
@@ -83,6 +83,7 @@ transformed (`GPUFFTRealPlan` → packed half, `GPUFFTComplexPlan` → full nati
 copied into `coeffs` (device or host). No device scalar indexing.
 """
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::GPUFFTRealPlan{RT, D}, field) where {RT, D}
+    FFS.Plans._check_coefficients(coeffs, plan)
     copyto!(plan.inbuf, field)                          # host/device real input
     LA.mul!(plan.half, plan.fwd, plan.inbuf)            # device rfft → packed half
     if plan.neg
@@ -95,6 +96,7 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::GPUFF
 end
 
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::GPUFFTComplexPlan{RT, D}, field) where {RT, D}
+    FFS.Plans._check_coefficients(coeffs, plan)
     copyto!(plan.inbuf, field)
     LA.mul!(plan.outbuf, plan.fwd, plan.inbuf)          # device c2c, full native
     plan.outbuf .*= plan.norm
@@ -367,4 +369,4 @@ end
     return P_lm
 end
 
-end # module FlowFieldSpectraGPUFFTExt
+end # module FlowFieldSpectraKernelAbstractionsAbstractFFTsExt

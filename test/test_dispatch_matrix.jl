@@ -137,37 +137,56 @@ Test.@testset "Auto transforms every grid the package dispatches on" begin
     end
 end
 
-Test.@testset "A direction's Fourier length comes from its periodicity flag" begin
-    # `period`'s own contract is that it is meaningful only where `isperiodic` holds, and a node cloud or
-    # a curvilinear grid stores whatever `period` it was given even on a direction declared
-    # non-periodic. So the FLAG decides the Fourier length. A `StructuredGrid` normalizes such an entry
-    # to zero, so this shows up only on the pointwise architectures.
+Test.@testset "A direction's Fourier length is the length its cells cover" begin
+    # `period` is meaningful only where `isperiodic` holds, and a node cloud stores whatever `period` it
+    # was given even on a direction declared non-periodic, so the flag decides: a bounded direction takes
+    # the length its cells cover, `N·Δ` on a lattice.
     L = 2π
     N = 8
     xs = collect(dm_unif(L, N))
-    cloud = FG.Grids.UnstructuredGrid(DM_CART, (xs, xs), fill(1.0, N);
+    cloud = FG.Grids.UnstructuredGrid(DM_CART, (repeat(xs, N), repeat(xs; inner = N)), fill(1.0, N^2);
         periodic = (true, false), period = (L, 5.0))
     Test.@test FG.Grids.period(cloud, 2) == 5.0        # the grid carries it
     Test.@test !FG.Grids.isperiodic(cloud, 2)          # and declares the direction non-periodic
     offs, ranges = FFS.Grids.axis_geometry(Float64, cloud, 2)
     Test.@test ranges[1] ≈ L                           # the periodic axis uses its wrap length
-    Test.@test ranges[2] == 1.0                        # the non-periodic one is raw per-sample
-
-    # The wavenumber scaling follows the same flag: `2π/L` on the periodic axis, `2π` on the other.
+    Test.@test ranges[2] ≈ L                           # the bounded one the length its lattice covers
     ks = FFS.Grids.physical_wavenumbers(cloud, (N, N), Val(true))
     Test.@test isapprox(ks[1][2] - ks[1][1], 2π / L; rtol = 1e-12)
-    Test.@test isapprox(ks[2][2] - ks[2][1], 2π; rtol = 1e-12)
+    Test.@test isapprox(ks[2][2] - ks[2][1], 2π / L; rtol = 1e-12)
 
     # `offsets` is each direction's smallest coordinate, read through `bounds`.
     Test.@test offs[1] ≈ minimum(xs)
     Test.@test offs[2] ≈ minimum(xs)
 
-    # A structured grid zeroes the entry, so both readings agree there.
+    # A structured grid zeroes the entry, and its bounded direction covers the same `N·Δ`.
     gs = FG.Grids.StructuredGrid(DM_CART, dm_unif(L, N), dm_unif(L, N);
         periodic = (true, false), period = (L, 5.0))
     Test.@test FG.Grids.period(gs, 2) == 0.0
     _, rs = FFS.Grids.axis_geometry(Float64, gs, 2)
-    Test.@test rs[2] == 1.0
+    Test.@test rs[2] ≈ L
+
+    # On a bounded lattice of spacing `Δ` starting off the origin, the measure-weighted sums measured from
+    # the first sample are the DFT of the samples, so every transform and the shuffled node cloud equal the
+    # FFT, at wavenumbers `2π/(N·Δ)`.
+    Δ = 0.3
+    ax = range(1.7; step = Δ, length = N)
+    gb = FG.Grids.StructuredGrid(DM_CART, ax, ax)
+    f = randn(N, N)
+    cf, kf = FFS.calculate_spectrum(gb, f, (N, N); transform = SB.FFTSpectralBackend(),
+        execution = CB.SerialBackend())
+    Test.@test isapprox(kf[2][2] - kf[2][1], 2π / (N * Δ); rtol = 1e-12)
+    for (t, kw) in ((SB.DirectSumSpectralBackend(), (;)), (FTB.FINUFFTBackend(), (; eps = 1e-13)),
+                    (FTB.NonuniformFFTsBackend(), (; eps = 1e-13)))
+        c, _ = FFS.calculate_spectrum(gb, f, (N, N); transform = t, execution = CB.SerialBackend(), kw...)
+        Test.@test isapprox(c, cf; rtol = 1e-10, atol = 1e-12)
+    end
+    perm = Random.randperm(N^2)
+    nc = FG.Grids.UnstructuredGrid(DM_CART, (repeat(collect(ax), N)[perm], repeat(collect(ax); inner = N)[perm]),
+        fill(Δ^2, N^2))
+    cn, _ = FFS.calculate_spectrum(nc, vec(f)[perm], (N, N); transform = SB.DirectSumSpectralBackend(),
+        execution = CB.SerialBackend())
+    Test.@test isapprox(cn, cf; rtol = 1e-10, atol = 1e-12)
 
     # `bounds` orders a direction's extremes, so a descending axis still reports its smallest coordinate.
     gd = FG.Grids.StructuredGrid(DM_CART, range(L, 0.0; length = N), dm_unif(L, N);

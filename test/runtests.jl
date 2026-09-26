@@ -79,7 +79,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         for extname in (
             :FlowFieldSpectraFFTWExt, :FlowFieldSpectraFastSphericalHarmonicsExt, :FlowFieldSpectraNUFSHTExt,
             :FlowFieldSpectraOhMyThreadsExt, :FlowFieldSpectraKernelAbstractionsExt,
-            :FlowFieldSpectraGPUFFTExt, :FlowFieldSpectraNUFSHTKernelAbstractionsExt,
+            :FlowFieldSpectraKernelAbstractionsAbstractFFTsExt, :FlowFieldSpectraNUFSHTKernelAbstractionsExt,
         )
             ext = Base.get_extension(FFS, extname)
             ext === nothing && continue

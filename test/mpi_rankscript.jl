@@ -41,6 +41,8 @@ smask = trues(N); smask[1:3:N] .= false
 fs = rand(N); fs[.!smask] .= NaN
 sphm = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (φ, π / 2 .- θ),
                                  [isodd(j) ? 1.0 : 2.0 for j in 1:N], smask)
+# A bounded cloud, whose shares' own origins and Fourier lengths differ from the whole grid's.
+scb = FG.Grids.UnstructuredGrid(cart, (xv, yv), ones(N))
 
 serial(g, x, m, t; kw...) = FFS.calculate_spectrum(g, x, m; transform = t, execution = CB.SerialBackend(), kw...)[1]
 mpi(g, x, m, t; kw...) = FFS.calculate_spectrum(g, x, m; transform = t, execution = CB.MPIBackend(), kw...)[1]
@@ -51,6 +53,9 @@ checks = [
     ("FFT batch", isapprox(mpi(ug, ub, ms, FF), serial(ug, ub, ms, FF); atol = 1e-12)),
     ("unequal measure", isapprox(mpi(scw, f, ms, DS), serial(scw, f, ms, DS); rtol = 1e-10, atol = 1e-12)),
     ("masked sphere", isapprox(mpi(sphm, fs, (8, 15), DS), serial(sphm, fs, (8, 15), DS); atol = 1e-10)),
+    ("bounded cloud", isapprox(mpi(scb, f, ms, DS), serial(scb, f, ms, DS); rtol = 1e-10, atol = 1e-12)),
+    ("bounded cloud FINUFFT", isapprox(mpi(scb, f, ms, NU; eps = 1e-12), serial(scb, f, ms, NU; eps = 1e-12);
+                                       rtol = 1e-9, atol = 1e-10)),
 ]
 failed = [name for (name, ok) in checks if !ok]
 rank == 0 && println(isempty(failed) ? "MPI_PARITY_OK np=$(MPI.Comm_size(comm))" : "MPI_PARITY_FAIL $(failed)")

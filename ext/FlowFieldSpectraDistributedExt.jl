@@ -43,7 +43,7 @@ function _distributed_pointsum(inner, transform, g::FlowGeometries.Grids.Abstrac
     partials = Distributed.pmap(chunks) do idx
         sg = FFS._subgrid(g, idx)
         sf = collect(selectdim(fieldP, 1, idx))
-        kwi = FFS._partition_kwargs(kwargs, idx)
+        kwi = FFS._partition_kwargs(kwargs, g, idx)
         cw, kw = _serial_ft(() -> FFS.calculate_spectrum(transform, inner, sg, sf, ms; kwi...))
         (Array(cw), FFS._ks_twin(kw))
     end

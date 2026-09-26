@@ -160,9 +160,10 @@ Test.@testset "Inverses that use no direct sum" begin
 end
 
 Test.@testset "A NUFFT type-2 evaluates the mode sum" begin
-    # `synthesize` through a NUFFT is the type-2, `f_j = Σ_κ C_κ exp(+i κ·x_j)` over the native modes.
-    # Composing it with the type-1 gives `AᴴA` on nonuniform nodes, so the mode sum written out here is
-    # the invariant, and it shares no code with the provider.
+    # `synthesize` through a NUFFT is the type-2, `f_j = Σ_κ C_κ exp(+i κ·(x_j - x₀))` over the native
+    # modes, `x₀` each direction's smallest coordinate. Composing it with the type-1 gives `AᴴA` on
+    # nonuniform nodes, so the mode sum written out here is the invariant, and it shares no code with the
+    # provider.
     Random.seed!(34)
     L = 2π
     M = 40
@@ -178,11 +179,12 @@ Test.@testset "A NUFFT type-2 evaluates the mode sum" begin
     # The full native cube the half stands for, and the physical wavenumbers of each native mode.
     full = FFS.unpacked(c, ms, ks)
     kf = FFS.Grids.physical_wavenumbers(g, ms, Val(false))
+    x0, y0 = minimum(xv), minimum(yv)
     ref = zeros(Float64, M)
     for j in 1:M
         acc = zero(ComplexF64)
         for I in CartesianIndices(ms)
-            acc += full[I] * cis(kf[1][I[1]] * xv[j] + kf[2][I[2]] * yv[j])
+            acc += full[I] * cis(kf[1][I[1]] * (xv[j] - x0) + kf[2][I[2]] * (yv[j] - y0))
         end
         ref[j] = real(acc)
     end

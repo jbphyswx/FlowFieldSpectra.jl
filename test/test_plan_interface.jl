@@ -48,6 +48,8 @@ function pi_agrees(name, g, f, ms; batch = (), kw...)
     Test.@test all(iszero, buf)
     FFS.calculate_spectrum!(buf, p, f)
     Test.@test isapprox(buf, c; rtol = 1e-8)
+    # A buffer of the same length and another shape is refused.
+    Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(vec(similar(buf)), p, f)
     return nothing
 end
 
@@ -92,6 +94,10 @@ Test.@testset "A Cartesian plan answers for its own coefficients" begin
     # A halved axis carries its Nyquist twin, so the axes a reduction needs come from the plan too.
     p = FFS.plan_spectrum(gs, Float64, (N, N); transform = SB.DirectSumSpectralBackend(), execution = PI_SER)
     Test.@test FFS.Packing.axis_twin(FFS.wavenumbers(p)[1]) !== nothing
+
+    # The grid form checks the shape it writes as the plans do.
+    Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(zeros(ComplexF64, (N ÷ 2 + 1) * N), gs,
+        randn(N, N), (N, N); transform = SB.DirectSumSpectralBackend(), execution = PI_SER)
 end
 
 Test.@testset "A spherical plan reports real coefficients for a real field" begin
@@ -124,6 +130,8 @@ Test.@testset "A spherical plan reports real coefficients for a real field" begi
     Test.@test FFS.coefficient_type(pc) === ComplexF64
     Test.@test FFS.coefficient_size(pr) == FFS.coefficient_size(pc)
     Test.@test sizeof(FFS.allocate_coefficients(pr)) * 2 == sizeof(FFS.allocate_coefficients(pc))
+    Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(zeros(prod(ms)), ggl, randn(size(ggl)...), ms;
+        transform = SB.DirectSumSpectralBackend(), execution = PI_SER)
 end
 
 Test.@testset "A device plan answers the same way" begin

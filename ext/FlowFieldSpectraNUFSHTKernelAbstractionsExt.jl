@@ -95,6 +95,7 @@ function FFS.plan_spectrum(::SB.AbstractNUFSHTSpectralBackend, exec::Computation
 end
 
 function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, plan::NUSHTSphericalGPUPlan{T}, field) where {T}
+    FFS.Plans._check_coefficients(coeffs, plan)
     fill!(coeffs, zero(eltype(coeffs)))
     _nusht_gpu_pass!(coeffs, plan, field, real, one(T))
     eltype(field) <: Real || _nusht_gpu_pass!(coeffs, plan, field, imag, im)

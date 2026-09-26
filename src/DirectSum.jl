@@ -152,36 +152,48 @@ function _run_contraction!(dest::AbstractArray, c, field::AbstractArray, npts::I
 end
 
 """
-    cart_setup(layout, grid, T, ms, batch, iflag) -> NamedTuple
+    phase_geometry(grid, ::Type{FT}, ms, ::Val{R}, box = nothing) -> (xs, ks)
+
+The positions `x - x₀` and the wavenumber axes a Cartesian direct sum over `grid` reads, the layout
+halved for a real field (`R`). `box` holds a whole grid's origins and Fourier lengths when `grid` is
+part of it (see `Grids.axis_geometry`).
+"""
+function phase_geometry(g, ::Type{FT}, ms::NTuple{D, Int}, ::Val{R}, box = nothing) where {FT, D, R}
+    offs, ranges = Grids.axis_geometry(FT, g, D, box)
+    return Grids.relative_coordinates(g, offs), Grids.physical_wavenumbers(ranges, ms, Val(R))
+end
+
+"""
+    cart_setup(layout, grid, T, ms, batch, iflag; box = nothing) -> NamedTuple
 
 Everything a Cartesian direct sum reads from `grid`: the wavenumber axes, and for a tensor layout the
 per-axis DFT matrices and the working arrays their contraction walks through, plus the Nyquist-twin
-storage. `T` is the field's element type, whose realness fixes the packed layout.
+storage. `T` is the field's element type, whose realness fixes the packed layout; `box` is as in
+[`phase_geometry`](@ref).
 
 Run it against a field with [`cart_run!`](@ref). The result depends on the grid, `ms`, `iflag` and the
 batch shape alone, so `DirectSumCartesianPlan` holds it across executions.
 """
 function cart_setup(::TensorCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple,
-        iflag::Int) where {T, D}
+        iflag::Int; box = nothing) where {T, D}
     FT = real(float(T))
     R = T <: Real
     ss = size(g)
-    ks = Grids.physical_wavenumbers(g, ms, Val(R))
+    xs, ks = phase_geometry(g, FT, ms, Val(R), box)
     pms = Packing.packed_size(ms, Val(R))
     return (; ks, pms, Npts = prod(ss), iflag,
-        fwd = _contraction(FT, ks, FlowGeometries.Grids.coordinates(g), ss, pms, batch, iflag),
-        twin = _twin_setup(TensorCartesian(), g, T, ms, pms, ks, batch, iflag, FT))
+        fwd = _contraction(FT, ks, xs, ss, pms, batch, iflag),
+        twin = _twin_setup(TensorCartesian(), g, xs, T, ms, pms, ks, batch, iflag, FT))
 end
 
 function cart_setup(::CloudCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple,
-        iflag::Int) where {T, D}
+        iflag::Int; box = nothing) where {T, D}
     FT = real(float(T))
     R = T <: Real
-    coords = FlowGeometries.Grids.coordinates(g)
-    ks = Grids.physical_wavenumbers(g, ms, Val(R))
+    coords, ks = phase_geometry(g, FT, ms, Val(R), box)
     pms = Packing.packed_size(ms, Val(R))
     return (; ks, pms, coords, N = length(coords[1]), iflag,
-        twin = _twin_setup(CloudCartesian(), g, T, ms, pms, ks, batch, iflag, FT))
+        twin = _twin_setup(CloudCartesian(), g, coords, T, ms, pms, ks, batch, iflag, FT))
 end
 
 """
@@ -226,7 +238,8 @@ function _cloud_sum!(dest::AbstractArray{Complex{FT}}, kaxes::Tuple, coords::Tup
 end
 
 # =============================================================================
-# Cartesian forward (analysis):  C[k, b] = (1/Npts) Σ_p f[p, b] · exp(-iflag · i · k·x_p)
+# Cartesian forward (analysis):  C[k, b] = (1/Npts) Σ_p f[p, b] · exp(-iflag · i · k·(x_p - x₀)), `x₀` each
+# direction's smallest coordinate (`phase_geometry`)
 # =============================================================================
 
 # A structured tensor-product grid (uniform or nonuniform) separates into `D` successive 1-D transforms,
@@ -242,11 +255,12 @@ function _calculate_spectrum_cartesian_direct!(
     field::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
+    box = nothing,
 ) where {FT, D}
     layout = _cart_layout(g)
     T = eltype(field) <: Real ? FT : Complex{FT}
     batch = Grids.field_batch_shape(g, field)
-    return cart_run!(coeffs, layout, cart_setup(layout, g, T, ms, batch, iflag), field)
+    return cart_run!(coeffs, layout, cart_setup(layout, g, T, ms, batch, iflag; box), field)
 end
 
 # =============================================================================
@@ -288,9 +302,9 @@ end
 # outright, `D == 1`'s twins are conjugates so the mirror is already exact, and uniform sampling makes
 # `exp(±i(N_d/2)x_j)` the same vector, so a uniform grid's twins equal their negated-index partners.
 # `isuniform` reads the axis types, so that branch resolves at compile time.
-_twin_setup(l, g, ::Type{T}, ms, pms, ks, batch, iflag::Int, ::Type{FT}) where {T, FT} = nothing
+_twin_setup(l, g, xs, ::Type{T}, ms, pms, ks, batch, iflag::Int, ::Type{FT}) where {T, FT} = nothing
 function _twin_setup(l, g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ::Type{T}, ms::NTuple{D, Int}, pms::NTuple{D, Int}, ks::Tuple, batch::Tuple, iflag::Int,
+        xs::Tuple, ::Type{T}, ms::NTuple{D, Int}, pms::NTuple{D, Int}, ks::Tuple, batch::Tuple, iflag::Int,
         ::Type{FT}) where {T <: Real, FT, D}
     (D >= 2 && !FlowGeometries.Grids.isuniform(g)) || return nothing
     nm = Packing.n_twin_slices(Val(D))
@@ -300,16 +314,15 @@ function _twin_setup(l, g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Ge
     tw = Packing.NyquistTwin(slices)
     return (; slices, kax, shapes,
         ks = (Packing.with_twin(ks[1], tw), Base.tail(ks)...),
-        contractions = _twin_contractions(l, g, shapes, kax, batch, iflag, FT))
+        contractions = _twin_contractions(l, xs, size(g), shapes, kax, batch, iflag, FT))
 end
 
-# The structured twin separates the same way the forward does, on the masked wavenumbers. A point cloud
-# sums directly and needs no contraction.
-_twin_contractions(::CloudCartesian, g, shapes, kax, batch, iflag::Int, ::Type{FT}) where {FT} = nothing
-_twin_contractions(::TensorCartesian, g, shapes::NTuple{NM}, kax, batch, iflag::Int,
+# The structured twin separates the same way the forward does, on the masked wavenumbers, over the same
+# positions `xs`. A point cloud sums directly and needs no contraction.
+_twin_contractions(::CloudCartesian, xs, ss, shapes, kax, batch, iflag::Int, ::Type{FT}) where {FT} = nothing
+_twin_contractions(::TensorCartesian, xs::Tuple, ss::Tuple, shapes::NTuple{NM}, kax, batch, iflag::Int,
         ::Type{FT}) where {NM, FT} =
-    ntuple(mask -> _contraction(FT, kax[mask], FlowGeometries.Grids.coordinates(g), size(g),
-        shapes[mask], batch, iflag), NM)
+    ntuple(mask -> _contraction(FT, kax[mask], xs, ss, shapes[mask], batch, iflag), NM)
 
 # Fill the twin from this field and hand back the `ks` carrying it; with no twin required, `ks` as built.
 @inline _attach_twin(::Nothing, l, s, field) = s.ks
@@ -379,12 +392,11 @@ end
 function _synthesize_packed_direct!(
     out::AbstractArray{FT},
     g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin,
+    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing,
 ) where {FT, D}
-    axes = FlowGeometries.Grids.coordinates(g)
+    axes, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(true)) : geo
     ss = size(g)
     Npts = prod(ss)
-    ks = Grids.physical_wavenumbers(g, ms, Val(true))
     pms = Packing.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ Npts
@@ -408,11 +420,10 @@ end
 function _synthesize_packed_direct!(
     out::AbstractArray{FT},
     g::Grids.PointwiseCartesian,
-    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin,
+    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing,
 ) where {FT, D}
-    coords = FlowGeometries.Grids.coordinates(g)
+    coords, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(true)) : geo
     N = length(coords[1])
-    ks = Grids.physical_wavenumbers(g, ms, Val(true))
     pms = Packing.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ N
@@ -434,7 +445,7 @@ function _synthesize_packed_direct!(
 end
 
 # =============================================================================
-# Cartesian inverse (synthesis):  f[p, b] = Σ_k C[k, b] · exp(+iflag · i · k·x_p)
+# Cartesian inverse (synthesis):  f[p, b] = Σ_k C[k, b] · exp(+iflag · i · k·(x_p - x₀))
 # =============================================================================
 
 function _synthesize_cartesian_direct!(
@@ -443,13 +454,14 @@ function _synthesize_cartesian_direct!(
     coeffs::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
+    geo = nothing,
 ) where {FT, D}
-    axes = FlowGeometries.Grids.coordinates(g)
+    # Native order, matching the forward's output.
+    axes, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(false)) : geo
     ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(out) ÷ Npts
-    ks = Grids.physical_wavenumbers(g, ms, Val(false))   # native order, matching the forward's output
     fill!(out, zero(Complex{FT}))
     spat = CartesianIndices(ss)
     @inbounds for (pj, P) in enumerate(spat)
@@ -470,12 +482,12 @@ function _synthesize_cartesian_direct!(
     coeffs::AbstractArray,
     ms::NTuple{D, Int},
     iflag::Int,
+    geo = nothing,
 ) where {FT, D}
-    coords = FlowGeometries.Grids.coordinates(g)
+    coords, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(false)) : geo
     N = length(coords[1])
     M = prod(ms)
     B = length(out) ÷ N
-    ks = Grids.physical_wavenumbers(g, ms, Val(false))   # native order, matching the forward's output
     fill!(out, zero(Complex{FT}))
     @inbounds for j in 1:N
         for (mi, I) in enumerate(CartesianIndices(ms))

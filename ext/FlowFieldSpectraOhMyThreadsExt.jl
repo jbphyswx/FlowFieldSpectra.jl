@@ -16,18 +16,18 @@ using FlowGeometries: FlowGeometries
 # Separable and BLAS-threaded, so the ThreadedBackend runs the same factorized path as Serial.
 FFS._directsum_cartesian!(::ComputationalBackends.AbstractThreadedBackend, coeffs::AbstractArray{Complex{FT}},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D} =
-    FFS.DirectSum._calculate_spectrum_cartesian_direct!(coeffs, g, field, ms, iflag)
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int, box = nothing) where {FT, D} =
+    FFS.DirectSum._calculate_spectrum_cartesian_direct!(coeffs, g, field, ms, iflag, box)
 
 # ---- Cartesian forward (unstructured / scattered) ----
 # A point cloud does not factorize; parallelize the direct sum over the packed modes (each mode owns its
 # coefficient row → race-free). A real field computes only the packed half.
 function FFS._directsum_cartesian!(::ComputationalBackends.AbstractThreadedBackend, coeffs::AbstractArray{Complex{FT}},
         g::FFS.Grids.PointwiseCartesian,
-        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int, box = nothing) where {FT, D}
     l = FFS.DirectSum.CloudCartesian()
     T = eltype(field) <: Real ? FT : Complex{FT}
-    s = FFS.DirectSum.cart_setup(l, g, T, ms, FFS.Grids.field_batch_shape(g, field), iflag)
+    s = FFS.DirectSum.cart_setup(l, g, T, ms, FFS.Grids.field_batch_shape(g, field), iflag; box)
     _cloud_sum_threaded!(coeffs, s.ks, s.coords, s.pms, s.N, iflag, field, FT)
     return FFS.DirectSum._attach_twin(s.twin, l, s, field)
 end
@@ -179,11 +179,10 @@ end
 # the point loop parallelized.
 function FFS._synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{FT},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin) where {FT, D}
-    axes = FlowGeometries.Grids.coordinates(g)
+        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing) where {FT, D}
+    axes, ks = geo === nothing ? FFS.DirectSum.phase_geometry(g, FT, ms, Val(true)) : geo
     ss = size(g)
     Npts = prod(ss)
-    ks = FFS.Grids.physical_wavenumbers(g, ms, Val(true))
     pms = FFS.Packing.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ Npts
@@ -212,10 +211,9 @@ end
 
 function FFS._synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{FT},
         g::FFS.Grids.PointwiseCartesian,
-        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin) where {FT, D}
-    coords = FlowGeometries.Grids.coordinates(g)
+        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing) where {FT, D}
+    coords, ks = geo === nothing ? FFS.DirectSum.phase_geometry(g, FT, ms, Val(true)) : geo
     N = length(coords[1])
-    ks = FFS.Grids.physical_wavenumbers(g, ms, Val(true))
     pms = FFS.Packing.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ N
@@ -243,13 +241,13 @@ end
 # ---- Cartesian inverse (parallel over independent output points) ----
 function FFS._synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{Complex{FT}},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
-    axes = FlowGeometries.Grids.coordinates(g)
+        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, geo = nothing) where {FT, D}
+    # Native order, as the forward's output.
+    axes, ks = geo === nothing ? FFS.DirectSum.phase_geometry(g, FT, ms, Val(false)) : geo
     ss = size(g)
     Npts = prod(ss)
     M = prod(ms)
     B = length(out) ÷ Npts
-    ks = FFS.Grids.physical_wavenumbers(g, ms, Val(false))   # native order, matching the forward's output
     O = reshape(out, Npts, B)
     C = reshape(coeffs, M, B)
     fill!(O, zero(Complex{FT}))
@@ -275,12 +273,11 @@ end
 
 function FFS._synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBackend, out::AbstractArray{Complex{FT}},
         g::FFS.Grids.PointwiseCartesian,
-        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {FT, D}
-    coords = FlowGeometries.Grids.coordinates(g)
+        coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, geo = nothing) where {FT, D}
+    coords, ks = geo === nothing ? FFS.DirectSum.phase_geometry(g, FT, ms, Val(false)) : geo
     N = length(coords[1])
     M = prod(ms)
     B = length(out) ÷ N
-    ks = FFS.Grids.physical_wavenumbers(g, ms, Val(false))   # native order, matching the forward's output
     O = reshape(out, N, B)
     C = reshape(coeffs, M, B)
     fill!(O, zero(Complex{FT}))

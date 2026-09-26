@@ -155,13 +155,12 @@ mode, and an odd axis has none, which empties the slice.
     ntuple(e -> in_nyquist_mask(mask, e) ? (iseven(ms[e]) ? 1 : 0) : packed_size(ms, Val(true))[e], Val(D))
 
 """
-    twin_table(Tr, ms, mask, dims, offsets, ranges, M; phis, normfactor, conjugate) -> (shape, src, fac)
+    twin_table(Tr, ms, mask, dims, M; phis, normfactor, conjugate) -> (shape, src, fac)
 
 Gather table for the `mask` slice of a [`NyquistTwin`](@ref) read out of a spectrum with array
 dimensions `dims`: `twin[i] = S(fk[src[i]]) * fac[i]`, where `S` is `conj` when `conjugate` and the
 identity otherwise. Each entry's target frequency is `+N_d/2` on the masked axes, `k₁` on axis 1, and
-`−k_d` elsewhere; `fac` carries the grid-offset phase at that target frequency together with `1/M` and,
-when `phis` is given, `normfactor / ∏ phis[d]`.
+`−k_d` elsewhere; `fac` is `1/M` and, when `phis` is given, `normfactor / ∏ phis[d]` with it.
 
 `src` indexes the target frequency itself (`conjugate = false`, for a spectrum that holds `+N_d/2`
 outright, such as an oversampled NUFFT grid) or its negative (`conjugate = true`, for a Hermitian
@@ -169,8 +168,7 @@ spectrum of a real field, where `fk[-k] = conj(fk[k])` puts the value within a n
 indices come from the target frequency, so an axis already sitting at `−N_d/2` still reads its `+N_d/2`
 partner. `phis` holds one per-axis coefficient table sampled at the native wavenumbers, even in `k`.
 """
-function twin_table(::Type{Tr}, ms::NTuple{D, Int}, mask::Int, dims::NTuple{D, Int},
-        offsets::NTuple{D}, ranges::NTuple{D}, M::Int;
+function twin_table(::Type{Tr}, ms::NTuple{D, Int}, mask::Int, dims::NTuple{D, Int}, M::Int;
         phis::Union{Nothing, Tuple} = nothing, normfactor::Real = 1, conjugate::Bool = false) where {Tr, D}
     shape = twin_slice_shape(ms, mask)
     S = prod(shape)
@@ -184,15 +182,13 @@ function twin_table(::Type{Tr}, ms::NTuple{D, Int}, mask::Int, dims::NTuple{D, I
         lin = 1
         stride = 1
         β = Tr(normfactor) * inv_M
-        ph = one(Complex{Tr})
         for d in 1:D
             lin += (ovs_index(isign * kt[d], dims[d]) - 1) * stride
             stride *= dims[d]
             phis === nothing || (β /= Tr(phis[d][even_table_index(kt[d], ms[d], d == 1)]))
-            ph *= cis(-Tr(kt[d]) * (Tr(offsets[d]) * Tr(2π) / Tr(ranges[d])))
         end
         src[si] = lin
-        fac[si] = β * ph
+        fac[si] = β
     end
     return shape, src, fac
 end
@@ -210,17 +206,17 @@ lands on `+N_d/2`, off-axis, so a conjugate read cannot substitute.
     ntuple(d -> d == 1 && iseven(ms[1]) ? ms[1] + 1 : ms[d], Val(D))
 
 """
-    publish_packed!(coeffs, fk, phase, ns, pms, ntrans, neg) -> coeffs
+    publish_packed!(coeffs, fk, scale, ns, pms, ntrans, neg) -> coeffs
 
 Write a real field's packed half from the full native spectrum `fk` of requested size `ns` (see
-[`hermitian_request_size`](@ref)). The half is the leading `pms[1]` entries of axis 1, so each axis-1 run
-copies contiguously out of the longer `ns[1]` run and the axes above it match one for one. `phase` is the
-packed-layout offset correction; `neg` conjugates the published values.
+[`hermitian_request_size`](@ref)), scaled by `scale`. The half is the leading `pms[1]` entries of axis 1,
+so each axis-1 run copies contiguously out of the longer `ns[1]` run and the axes above it match one for
+one. `neg` conjugates the published values.
 
 This is the HOST write: a linear scalar sweep, allocation-free on a host array. A device path takes
 [`packed_half_view`](@ref) and broadcasts, which reads no element from the host.
 """
-function publish_packed!(coeffs, fk, phase, ns::NTuple{D, Int}, pms::NTuple{D, Int}, ntrans::Int,
+function publish_packed!(coeffs, fk, scale::Real, ns::NTuple{D, Int}, pms::NTuple{D, Int}, ntrans::Int,
         neg::Bool) where {D}
     n1s = ns[1]
     n1p = pms[1]
@@ -234,7 +230,7 @@ function publish_packed!(coeffs, fk, phase, ns::NTuple{D, Int}, pms::NTuple{D, I
             soff = foff + j * n1s
             poff = j * n1p
             for i in 1:n1p
-                v = fk[soff + i] * phase[poff + i]
+                v = fk[soff + i] * scale
                 coeffs[coff + poff + i] = neg ? conj(v) : v
             end
         end
@@ -248,7 +244,7 @@ end
 The packed half of a full native spectrum as a lazy view: the leading `pms[1]` entries of axis 1 with
 every other axis whole, batch axis last.
 
-A device path publishes with `out .= view .* phase` (or its conjugate); [`publish_packed!`](@ref) is the
+A device path publishes with `out .= view .* scale` (or its conjugate); [`publish_packed!`](@ref) is the
 host form of the same write.
 """
 @inline packed_half_view(fk, ns::NTuple{D, Int}, pms::NTuple{D, Int}, ntrans::Int) where {D} =
@@ -267,18 +263,18 @@ struct ConjTwinSlice{SL, IX, FC}
 end
 
 """
-    conj_twins(Tr, ks_phys, ms, ns, offsets, ranges, M, batch) -> (ks, slices)
+    conj_twins(Tr, ks_phys, ms, ns, M, batch) -> (ks, slices)
 
 `ks_phys` with a [`NyquistTwin`](@ref) attached to its halved axis, plus the per-mask
 [`ConjTwinSlice`](@ref)s that fill it from a Hermitian native spectrum of requested size `ns`. A real
 field's transform is Hermitian, so each twin value is a conjugate read at the negated frequency, which
 that spectrum holds.
 """
-function conj_twins(::Type{Tr}, ks_phys::Tuple, ms::NTuple{D, Int}, ns::NTuple{D, Int},
-        offsets::NTuple{D}, ranges::NTuple{D}, M::Int, batch::Tuple) where {Tr, D}
+function conj_twins(::Type{Tr}, ks_phys::Tuple, ms::NTuple{D, Int}, ns::NTuple{D, Int}, M::Int,
+        batch::Tuple) where {Tr, D}
     D >= 2 || return ks_phys, ()
     gs = ntuple(n_twin_slices(Val(D))) do mask
-        shape, src, fac = twin_table(Tr, ms, mask, ns, offsets, ranges, M; conjugate = true)
+        shape, src, fac = twin_table(Tr, ms, mask, ns, M; conjugate = true)
         ConjTwinSlice(zeros(Complex{Tr}, shape..., batch...), src, fac)
     end
     return (with_twin(ks_phys[1], NyquistTwin(map(g -> g.slice, gs))), Base.tail(ks_phys)...), gs
@@ -403,28 +399,6 @@ function scatter_axis_block!(out, fks::Tuple, outoff::Vector{Int}, nvalid::Int, 
         end
     end
     return nothing
-end
-
-"""
-    offset_phase(Tr, ms, offsets, ranges, M, ::Val{R}, iflag=1) -> Array
-
-Grid-offset correction `exp(-iflag·i·k·x₀)/M` over the packed half (`R = true`) or the full native
-spectrum (`R = false`), for points scaled from a domain starting at `offsets` with period `ranges`.
-"""
-function offset_phase(::Type{Tr}, ms::NTuple{D, Int}, offsets::NTuple{D}, ranges::NTuple{D}, M::Int,
-        ::Val{R}, iflag::Int = 1) where {Tr, D, R}
-    sz = packed_size(ms, Val(R))
-    kint = ntuple(d -> (d == 1 && R) ? collect(0:(ms[1] ÷ 2)) : fftfreq_ints(ms[d]), D)
-    inv_M = one(Tr) / M
-    phase = Array{Complex{Tr}, D}(undef, sz...)
-    @inbounds for I in CartesianIndices(sz)
-        p = Complex{Tr}(inv_M)
-        for d in 1:D
-            p *= cis(-iflag * Tr(kint[d][I[d]]) * (Tr(offsets[d]) * Tr(2π) / Tr(ranges[d])))
-        end
-        phase[I] = p
-    end
-    return phase
 end
 
 # Energy fold multiplier for a mode: the product of the per-axis `fold_weight` over the halved (rfft)

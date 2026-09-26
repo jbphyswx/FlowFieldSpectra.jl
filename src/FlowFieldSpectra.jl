@@ -245,7 +245,7 @@ _auto_nufft(::ComputationalBackends.AbstractGPUBackend) =
     nothing
 
 _auto_fft(::ComputationalBackends.AbstractExecutionBackend) = _ext_loaded(:FlowFieldSpectraFFTWExt)
-_auto_fft(::ComputationalBackends.AbstractGPUBackend) = _ext_loaded(:FlowFieldSpectraGPUFFTExt)
+_auto_fft(::ComputationalBackends.AbstractGPUBackend) = _ext_loaded(:FlowFieldSpectraKernelAbstractionsAbstractFFTsExt)
 
 # The hybrid composite's FFT pass is `_region_fft`, which the FFTW extension provides for a host backend.
 _auto_hybrid(::ComputationalBackends.AbstractExecutionBackend) = _ext_loaded(:FlowFieldSpectraFFTWExt)
@@ -394,11 +394,11 @@ calculate_spectrum(t::SpectralBackends.AbstractSpectralBackend, e::Computational
 function calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {D}
+        field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, box = nothing, kwargs...) where {D}
     prob = TransformProblem(g, field)
     pms = Packing.packed_size(ms, Val(eltype(field) <: Real))
     coeffs = zeros(Complex{eltype(g)}, pms..., batch_shape(prob)...)
-    ks = _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag)
+    ks = _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag, box)
     return coeffs, ks
 end
 
@@ -415,8 +415,8 @@ function calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
 end
 
 # ---- Level 2: DirectSum on GPU (KernelAbstractions ext; portable on any KA device) ----
-calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {D} =
-    _gpu_directsum_cartesian(exec, g, quadrature_weighted(g, field), ms, iflag)
+calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, box = nothing, kwargs...) where {D} =
+    _gpu_directsum_cartesian(exec, g, quadrature_weighted(g, field), ms, iflag, box)
 calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, field::AbstractArray, ms::NTuple{2, Int}; kwargs...) =
     _gpu_directsum_spherical(exec, g, field, ms[1] - 1; kwargs...)
 
@@ -474,9 +474,9 @@ calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::Compu
 # present so each twin is a conjugate read of a native mode; a halved axis 1 holds no `−k₁` to read.
 # Where no twin is needed the pass is an `rfft` and halves axis 1 directly.
 #
-# Every pass leaves the raw transform in native order; the grid-offset phase (zero on the FFT axes, whose
-# points are not rescaled) and the single `1/∏N_d` normalization are applied once at the end, through the
-# same `Packing.offset_phase` / `publish_packed!` / `conj_twins` the separable NUFFT path uses. The
+# Every pass leaves the raw transform in native order, measured from each direction's origin (the FFT
+# axes' first sample, the NUFFT axes' folding origin); the single `1/∏N_d` normalization is applied once
+# at the end, through the same `publish_packed!` / `conj_twins` the separable NUFFT path uses. The
 # per-axis sign is the `Σ e^{-ikx}` convention for both providers, so `iflag = -1` is one conjugation of
 # the whole product.
 # =============================================================================
@@ -532,24 +532,13 @@ function _hybrid_derive(g, ::Type{Tr}, ms::NTuple{D, Int}, umask::NTuple{D, Bool
     pms = Packing.packed_size(ms, Val(true))
     # Spectrum extents entering the publish: axis 1 is already halved by an `rfft` pass.
     nsx = ntuple(d -> (d == 1 && halve) ? pms[1] : ms[d], Val(D))
-    # The FFT axes transform the grid's own points, so only the NUFFT axes carry a grid offset.
-    offs = ntuple(d -> umask[d] ? zero(Tr) : offs_all[d], Val(D))
     # Each stretched axis is asked for `ms[d]` modes; a uniform axis keeps its own length.
     ns = ms
-    if R
-        phase = Packing.offset_phase(Tr, ms, offs, ranges, npts, Val(true))
-        ks_phys = physical_wavenumbers(ranges, ms, Val(true))
-        ks, twins = need_twin ?
-            Packing.conj_twins(Tr, ks_phys, ms, nsx, offs, ranges, npts, batch) : (ks_phys, ())
-    else
-        phase = Packing.offset_phase(Tr, ms, offs, ranges, npts, Val(false), iflag)
-        ks_phys = physical_wavenumbers(ranges, ms, Val(false))
-        ks = ks_phys
-        twins = ()
-    end
+    ks_phys = physical_wavenumbers(ranges, ms, Val(R))
+    ks, twins = (R && need_twin) ? Packing.conj_twins(Tr, ks_phys, ms, nsx, npts, batch) : (ks_phys, ())
     # `ks_phys` carries no twin; a device path builds its own device-resident twins from it.
-    return (; Ns, npts, axs, offs, offs_all, ranges, udims, sdims, epsv, need_twin, halve, neg,
-        pms, nsx, ns, phase, ks, ks_phys, twins)
+    return (; Ns, npts, axs, offs_all, ranges, udims, sdims, epsv, need_twin, halve, neg,
+        pms, nsx, ns, scale = one(Tr) / npts, ks, ks_phys, twins)
 end
 
 function _calculate_spectrum_hybrid(t::SpectralBackends.AbstractNUFFTSpectralBackend,
@@ -569,12 +558,12 @@ function _calculate_spectrum_hybrid(t::SpectralBackends.AbstractNUFFTSpectralBac
     end
     if R
         coeffs = Array{Complex{Tr}}(undef, h.pms..., batch...)
-        Packing.publish_packed!(coeffs, W, h.phase, h.nsx, h.pms, ntrans, h.neg)
+        Packing.publish_packed!(coeffs, W, h.scale, h.nsx, h.pms, ntrans, h.neg)
         Packing.gather_conj_twins!(h.twins, W, prod(h.nsx), ntrans, h.neg)
         return coeffs, h.ks
     end
     h.neg && (W .= conj.(W))                     # closes the conjugation applied to the input
-    W .*= h.phase
+    W .*= h.scale
     return W, h.ks
 end
 
@@ -595,7 +584,7 @@ buffers), and the `D - length(sdims) + 1` working arrays the passes write throug
 `R` marks a real field, so the publish branch folds at compile time. Execute with
 `calculate_spectrum!(coeffs, plan, field)`.
 """
-struct HybridPlan{T, D, R, NB, FP, AP, W, QB, PH, KS, TW, QW} <: Plans.AbstractSpectralPlan
+struct HybridPlan{T, D, R, NB, FP, AP, W, QB, KS, TW, QW} <: Plans.AbstractSpectralPlan
     region::FP                       # the uniform-axis FFT, planned
     axes::AP                         # one axis plan per stretched dim, in `sdims` order
     sdims::Vector{Int}
@@ -608,7 +597,7 @@ struct HybridPlan{T, D, R, NB, FP, AP, W, QB, PH, KS, TW, QW} <: Plans.AbstractS
     ntrans::Int
     npts::Int
     neg::Bool
-    phase::PH
+    scale::T                         # 1/∏N_d
     ks_phys::KS
     twins::TW
     qw::QW
@@ -663,9 +652,9 @@ function _hybrid_plan(nufft::SpectralBackends.AbstractSpectralBackend,
     qbuf = qw === nothing ? nothing : Array{R ? Tr : Complex{Tr}}(undef, insize...)
     bt = NTuple{length(batch), Int}(batch)
     return HybridPlan{Tr, D, R, length(bt), typeof(region), typeof(apt), typeof(wt), typeof(qbuf),
-            typeof(h.phase), typeof(h.ks), typeof(h.twins), typeof(qw)}(
+            typeof(h.ks), typeof(h.twins), typeof(qw)}(
         region, apt, collect(h.sdims), wt, qbuf, ms, h.nsx, h.pms, bt, ntrans, h.npts, h.neg,
-        h.phase, h.ks, h.twins, qw)
+        h.scale, h.ks, h.twins, qw)
 end
 
 """
@@ -681,6 +670,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::HybridPlan
     length(field) == npts * plan.ntrans || throw(DimensionMismatch(
         "field holds $(length(field)) values; this plan was built for $(npts * plan.ntrans) — pass the " *
         "matching `batch=` to plan_spectrum"))
+    Plans._check_coefficients(coeffs, plan)
     # The grid quadrature factor scales into the plan's own buffer, so the caller's field is untouched
     # and a reused execution allocates nothing for it.
     f = plan.qbuf === nothing ? field :
@@ -690,17 +680,10 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::HybridPlan
         W = _axis_nufft_exec!(plan.work[i + 1], plan.axes[i], W, d)
     end
     if R
-        Packing.publish_packed!(coeffs, W, plan.phase, plan.nsx, plan.pms, plan.ntrans, plan.neg)
+        Packing.publish_packed!(coeffs, W, plan.scale, plan.nsx, plan.pms, plan.ntrans, plan.neg)
         Packing.gather_conj_twins!(plan.twins, W, prod(plan.nsx), plan.ntrans, plan.neg)
     else
-        plan.neg && (W .= conj.(W))
-        Pm = prod(plan.ms)
-        @inbounds for t in 1:plan.ntrans
-            o = (t - 1) * Pm
-            for i in 1:Pm
-                coeffs[o + i] = W[o + i] * plan.phase[i]
-            end
-        end
+        plan.neg ? (coeffs .= conj.(W) .* plan.scale) : (coeffs .= W .* plan.scale)
     end
     return plan.ks_phys
 end
@@ -823,13 +806,14 @@ end
 Reusable direct-sum inverse: the grid, resolution, sign and batch shape the inverse is fixed by, so
 `synthesize!` writes into the caller's array and allocates nothing of its own.
 
-The Cartesian inverse reads the grid's axes per call, and the spherical one its nodes and Legendre
-tables; a Nyquist twin arrives with the coefficients on `ks`, never held here.
+The plan holds what the inverse reads from the grid: the positions and wavenumbers of a Cartesian grid
+(`DirectSum.phase_geometry`), and the nodes and Legendre tables of a spherical one. A Nyquist twin arrives
+with the coefficients on `ks`, never held here.
 """
 struct DirectSumSynthesisPlan{FT, R, G, E, S, NB, ND} <: Plans.AbstractSynthesisPlan
     grid::G
     exec::E
-    setup::S                      # the spherical node/Legendre setup; `nothing` on a Cartesian grid
+    setup::S                      # Cartesian `(xs, ks)`, or the spherical node/Legendre setup
     ms::NTuple{ND, Int}
     batch::NTuple{NB, Int}
     iflag::Int
@@ -853,9 +837,8 @@ function Plans.plan_synthesis(::SpectralBackends.AbstractDirectSumSpectralBacken
         g, exec, s, ms, bt, iflag)
 end
 
-# The spherical inverse reads nodes and Legendre tables; the Cartesian one reads the grid's axes per
-# call and holds nothing.
-_synth_setup(g::FlowGeometries.Grids.AbstractGrid, ::Type{OT}, ms::Tuple) where {OT} = nothing
+_synth_setup(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+    ::Type{OT}, ms::Tuple) where {OT} = DirectSum.phase_geometry(g, real(float(OT)), ms, Val(OT <: Real))
 _synth_setup(g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ::Type{OT},
     ms::Tuple) where {OT} = DirectSum.sph_synth_setup(g, real(float(OT)), ms[1] - 1)
 
@@ -882,11 +865,11 @@ function _synthesize_into!(out::AbstractArray, plan::DirectSumSynthesisPlan{FT, 
         pms = Packing.packed_size(ms, Val(true))
         size(coeffs)[1:D] == pms || throw(DimensionMismatch(
             "a real-field plan expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D])"))
-        _synthesize_packed!(plan.exec, out, g, coeffs, ms, plan.iflag, _twin_for_inverse(g, ms, ks))
+        _synthesize_packed!(plan.exec, out, g, coeffs, ms, plan.iflag, _twin_for_inverse(g, ms, ks), plan.setup)
     else
         size(coeffs)[1:D] == ms || throw(DimensionMismatch(
             "a complex-field plan expects the full native spectrum $(ms) on the spectral dims; got $(size(coeffs)[1:D])"))
-        _synthesize_cartesian!(plan.exec, out, g, coeffs, ms, plan.iflag)
+        _synthesize_cartesian!(plan.exec, out, g, coeffs, ms, plan.iflag, plan.setup)
     end
     return out
 end
@@ -939,6 +922,8 @@ function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::SpectralBacke
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {T, D}
+    Plans._check_coefficients(coeffs,
+        (Packing.packed_size(ms, Val(eltype(field) <: Real))..., Grids.field_batch_shape(g, field)...))
     return _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag)
 end
 
@@ -946,6 +931,7 @@ function _calculate_spectrum!(coeffs::AbstractArray{<:Number}, ::SpectralBackend
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
         field::AbstractArray, ms::NTuple{2, Int}; kwargs...)
+    Plans._check_coefficients(coeffs, (ms[1], 2 * ms[1] - 1, Grids.field_batch_shape(g, field)...))
     return _directsum_spherical!(exec, coeffs, g, field, ms[1] - 1; kwargs...)
 end
 
@@ -1056,12 +1042,8 @@ Fill preallocated `coeffs` `(Nθ, Nφ, batch…)` with the spherical spectrum of
 """
 function calculate_spectrum!(coeffs::AbstractArray{<:Number}, plan::DirectSumSphericalPlan{T},
         field) where {T}
-    lmax = plan.lmax
-    nc = (lmax + 1) * (2 * lmax + 1) * plan.B
-    length(coeffs) == nc || throw(DimensionMismatch(
-        "coeffs holds $(length(coeffs)) values; this plan was built for $nc — pass the matching " *
-        "`batch=` to plan_spectrum"))
-    return DirectSum.sph_run!(coeffs, plan.layout, plan.setup, field, lmax, plan.B)
+    Plans._check_coefficients(coeffs, plan)
+    return DirectSum.sph_run!(coeffs, plan.layout, plan.setup, field, plan.lmax, plan.B)
 end
 
 """
@@ -1122,6 +1104,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::DirectSumC
     length(field) == plan.npts * plan.B || throw(DimensionMismatch(
         "field holds $(length(field)) values; this plan was built for $(plan.npts * plan.B) — pass the " *
         "matching `batch=` to plan_spectrum"))
+    Plans._check_coefficients(coeffs, plan)
     # The quadrature factor scales into the plan's own buffer, so the caller's field is untouched.
     f = plan.qbuf === nothing ? field :
         quadrature_weighted_into!(plan.qbuf, field, plan.qw, plan.npts, plan.B)
@@ -1145,20 +1128,21 @@ end
 # =============================================================================
 
 # DirectSum forward: core Serial; OhMyThreads / KernelAbstractions extensions add Threaded / GPU.
-_directsum_cartesian!(::ComputationalBackends.AbstractSerialBackend, coeffs, g, field, ms, iflag) =
-    DirectSum._calculate_spectrum_cartesian_direct!(coeffs, g, field, ms, iflag)
+_directsum_cartesian!(::ComputationalBackends.AbstractSerialBackend, coeffs, g, field, ms, iflag, box = nothing) =
+    DirectSum._calculate_spectrum_cartesian_direct!(coeffs, g, field, ms, iflag, box)
 _directsum_spherical!(::ComputationalBackends.AbstractSerialBackend, coeffs, g, field, lmax; kwargs...) =
     DirectSum._calculate_spectrum_spherical_direct!(coeffs, g, field, lmax; kwargs...)
 _directsum_cartesian!(::ComputationalBackends.AbstractThreadedBackend, args...) = throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads`."))
 _directsum_spherical!(::ComputationalBackends.AbstractThreadedBackend, args...; kwargs...) = throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads`."))
 
 # DirectSum inverse (synthesize): same Serial/Threaded split. `_synthesize_packed!` takes the packed
-# half and writes a real field; `_synthesize_cartesian!` takes the full native spectrum.
-_synthesize_packed!(::ComputationalBackends.AbstractSerialBackend, out, g, coeffs, ms, iflag, twin) =
-    DirectSum._synthesize_packed_direct!(out, g, coeffs, ms, iflag, twin)
+# half and writes a real field; `_synthesize_cartesian!` takes the full native spectrum. `geo` is the
+# `(xs, ks)` a synthesis plan holds, `nothing` to derive it from the grid.
+_synthesize_packed!(::ComputationalBackends.AbstractSerialBackend, out, g, coeffs, ms, iflag, twin, geo = nothing) =
+    DirectSum._synthesize_packed_direct!(out, g, coeffs, ms, iflag, twin, geo)
 _synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend, args...) = throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads`."))
-_synthesize_cartesian!(::ComputationalBackends.AbstractSerialBackend, out, g, coeffs, ms, iflag) =
-    DirectSum._synthesize_cartesian_direct!(out, g, coeffs, ms, iflag)
+_synthesize_cartesian!(::ComputationalBackends.AbstractSerialBackend, out, g, coeffs, ms, iflag, geo = nothing) =
+    DirectSum._synthesize_cartesian_direct!(out, g, coeffs, ms, iflag, geo)
 _synthesize_spherical!(::ComputationalBackends.AbstractSerialBackend, out, g, coeffs, lmax) =
     DirectSum._synthesize_spherical_direct!(out, g, coeffs, lmax)
 _synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBackend, args...) = throw(ArgumentError("ThreadedBackend is not loaded. Run `using OhMyThreads`."))
@@ -1247,12 +1231,18 @@ function _partition_weight(g::FlowGeometries.Grids.AbstractGrid, idx, ::Nothing)
 end
 _partition_weight(::FlowGeometries.Grids.AbstractGrid, idx, weights) = 1
 
-# A transform's keywords restricted to the points `idx`: explicit per-node `weights` sliced to them.
-function _partition_kwargs(kwargs, idx)
+# A transform's keywords restricted to the points `idx` of `g`: explicit per-node `weights` sliced to
+# them, and on a Cartesian grid the whole grid's origins and Fourier lengths as `box`, so every share's
+# coefficients sit on the whole grid's wavenumbers and origin.
+function _partition_kwargs(kwargs, g, idx)
     kw = NamedTuple(kwargs)
     w = get(kw, :weights, nothing)
-    return w === nothing ? kw : merge(kw, (; weights = w[idx]))
+    return merge(w === nothing ? kw : merge(kw, (; weights = w[idx])), _partition_box(g))
 end
+
+_partition_box(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}) =
+    (; box = Grids.axis_geometry(eltype(g), g, FlowGeometries.Grids.ncoordinates(g)))
+_partition_box(::FlowGeometries.Grids.AbstractGrid) = (;)
 
 # Transforms whose coefficients are additive over a disjoint point partition.
 _partitionable(::SpectralBackends.AbstractDirectSumSpectralBackend) = true

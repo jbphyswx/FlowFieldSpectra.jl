@@ -38,7 +38,7 @@ function _mpi_pointsum(b::ComputationalBackends.MPIBackend, transform, g::FlowGe
     sg = FFS._subgrid(g, idx)
     sf = collect(selectdim(fieldP, 1, idx))
     cw, kw = FFS.calculate_spectrum(transform, ComputationalBackends.local_backend(b), sg, sf, ms;
-                                    FFS._partition_kwargs(kwargs, idx)...)
+                                    FFS._partition_kwargs(kwargs, g, idx)...)
     FT = real(eltype(cw))
     α = FT(FFS._partition_weight(g, idx, get(kwargs, :weights, nothing)))
     coeffs = Array{eltype(cw)}(undef, size(cw))        # contiguous buffer for in-place Allreduce

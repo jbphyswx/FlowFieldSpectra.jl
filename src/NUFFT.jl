@@ -75,12 +75,16 @@ end
 # ---- gathers ----
 
 # `dst[doff + i] = S(src[soff + idx[i]]) · w[i]` for `i ≤ n`, `S` the conjugate where `csrc`, the product
-# conjugated where `neg`. The device method is the KernelAbstractions extension's.
-function _gather_scaled!(dst::AbstractArray, doff::Int, src::Array, soff::Int, idx::Array{Int}, w::Array,
-        n::Int, csrc::Bool, neg::Bool)
+# conjugated where `neg`; a number `w` scales every entry alike. The device method is the
+# KernelAbstractions extension's.
+@inline _weight(w::AbstractArray, i::Int) = @inbounds w[i]
+@inline _weight(w::Number, ::Int) = w
+
+function _gather_scaled!(dst::AbstractArray, doff::Int, src::Array, soff::Int, idx::Array{Int},
+        w::Union{Array, Number}, n::Int, csrc::Bool, neg::Bool)
     @inbounds for i in 1:n
         s = src[soff + idx[i]]
-        v = (csrc ? conj(s) : s) * w[i]
+        v = (csrc ? conj(s) : s) * _weight(w, i)
         dst[doff + i] = neg ? conj(v) : v
     end
     return dst
@@ -111,14 +115,12 @@ struct TwinGather{SL, IX, FC, ST}
     csrc::Bool
 end
 
-function _twin_set(exec, ::Type{Tr}, ks_phys::Tuple, ms::NTuple{D, Int}, dims::NTuple{D, Int},
-        offsets, ranges, M::Int, batch::Tuple; conjugate::Bool, phis = nothing,
-        normfactor::Real = 1) where {Tr, D}
+function _twin_set(exec, ::Type{Tr}, ks_phys::Tuple, ms::NTuple{D, Int}, dims::NTuple{D, Int}, M::Int,
+        batch::Tuple; conjugate::Bool, phis = nothing, normfactor::Real = 1) where {Tr, D}
     D >= 2 || return ks_phys, ()
     dev = _on_device(exec)
     gs = ntuple(Packing.n_twin_slices(Val(D))) do mask
-        shape, src, fac = Packing.twin_table(Tr, ms, mask, dims, offsets, ranges, M; phis, normfactor,
-            conjugate)
+        shape, src, fac = Packing.twin_table(Tr, ms, mask, dims, M; phis, normfactor, conjugate)
         S = length(src)
         TwinGather(zeros(Complex{Tr}, shape..., batch...), _to_exec(exec, S == 0 ? [1] : src),
             _to_exec(exec, S == 0 ? [zero(Complex{Tr})] : fac),
@@ -200,11 +202,11 @@ FlowTransformBindings plan with `C` transforms per execution, its strength and s
 tables that publish the packed layout and its Nyquist twins. `R` marks a real field. Execute with
 `calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref) releases the library plan.
 """
-struct NUFFTPointPlan{T, D, R, NB, P, V, U, PH, IX, ST, KS, TW, QW} <: Plans.AbstractSpectralPlan
+struct NUFFTPointPlan{T, D, R, NB, P, V, U, IX, ST, KS, TW, QW} <: Plans.AbstractSpectralPlan
     plan::P
     values::V                        # (M, C) strengths
     modes::U                         # (mode_size…, C) spectra
-    phase::PH                        # packed-layout offset phase × 1/M
+    scale::T                         # 1/M
     src::IX                          # packed index → index into one transform's spectrum
     stage::ST                        # device staging for the coefficients, or `nothing` on the host
     batch::NTuple{NB, Int}
@@ -228,13 +230,13 @@ Plans.wavenumbers(p::NUFFTPointPlan) = p.ks_phys
 Plans.close!(p::NUFFTPointPlan) = FTB.close!(p.plan)
 
 function _point_plan(t::_FTBLibrary, exec, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple, iflag::Int,
-        eps, batch_chunk) where {T, D}
+        eps, batch_chunk, box) where {T, D}
     Tr = real(float(T))
     R = T <: Real
     coords, _ = Grids.point_coordinates(Tr, g, D)
-    Ls = ntuple(d -> Grids.axis_range(Tr, g, d), Val(D))
+    # The points fold from each direction's origin, so the spectrum is measured from it as it comes.
+    offsets, Ls = Grids.axis_geometry(Tr, g, D, box)
     M = length(coords[1])
-    offsets = ntuple(d -> Tr(minimum(coords[d])), Val(D))
     B = prod(batch; init = 1)
     nth = _backend_nthreads(exec)
     dev = _on_device(exec)
@@ -247,16 +249,15 @@ function _point_plan(t::_FTBLibrary, exec, g, ::Type{T}, ms::NTuple{D, Int}, bat
         iflag = R ? -1 : -iflag)
     dims = FTB.mode_size(plan)
     pms = Packing.packed_size(ms, Val(R))
-    phase = _to_exec(exec, Packing.offset_phase(Tr, ms, offsets, Ls, M, Val(R), R ? 1 : iflag))
     ks_phys = Grids.physical_wavenumbers(Ls, ms, Val(R))
     ks, twins = if !R
         ks_phys, ()
     elseif realplan
         us, normfactor, phis = FTB.oversampled_spectra(plan)
-        _twin_set(exec, Tr, ks_phys, ms, size(first(us)), offsets, Ls, M, batch; conjugate = false,
+        _twin_set(exec, Tr, ks_phys, ms, size(first(us)), M, batch; conjugate = false,
             phis = map(collect, phis), normfactor)
     else
-        _twin_set(exec, Tr, ks_phys, ms, dims, offsets, Ls, M, batch; conjugate = true)
+        _twin_set(exec, Tr, ks_phys, ms, dims, M, batch; conjugate = true)
     end
     qwh = Grids.quadrature_scale(g, Tr, M)
     qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
@@ -265,9 +266,9 @@ function _point_plan(t::_FTBLibrary, exec, g, ::Type{T}, ms::NTuple{D, Int}, bat
     modes = _alloc(exec, Complex{Tr}, dims..., C)
     src = _to_exec(exec, _packed_src(ms, Val(R), dims))
     stage = dev ? _alloc(exec, Complex{Tr}, prod(pms)) : nothing
-    return NUFFTPointPlan{Tr, D, R, length(bt), typeof(plan), typeof(values), typeof(modes), typeof(phase),
+    return NUFFTPointPlan{Tr, D, R, length(bt), typeof(plan), typeof(values), typeof(modes),
             typeof(src), typeof(stage), typeof(ks), typeof(twins), typeof(qw)}(
-        plan, values, modes, phase, src, stage, bt, ms, pms, M, B, C, R && iflag < 0, ks, twins, qw)
+        plan, values, modes, one(Tr) / M, src, stage, bt, ms, pms, M, B, C, R && iflag < 0, ks, twins, qw)
 end
 
 # The twins of transform `t`, the `c`-th of its execution. A real-data plan's are read from the oversampled
@@ -292,9 +293,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTPointPla
     length(field) == M * B || throw(DimensionMismatch(
         "field holds $(length(field)) values; this plan transforms $B field(s) of $M points — pass the " *
         "matching `batch=` to plan_spectrum"))
-    size(coeffs) == Plans.coefficient_size(p) || throw(DimensionMismatch(
-        "coeffs is $(size(coeffs)); this plan writes $(Plans.coefficient_size(p)) — allocate it with " *
-        "`allocate_coefficients(plan)`"))
+    Plans._check_coefficients(coeffs, p)
     Pn = length(p.modes) ÷ C
     Ph = prod(p.pms)
     for base in 0:C:(B - 1)
@@ -309,7 +308,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTPointPla
         FTB.nufft_type1!(p.modes, p.plan, p.values)
         for c in 1:nvalid
             t = base + c
-            _publish!(coeffs, (t - 1) * Ph, p.modes, (c - 1) * Pn, p.src, p.phase, Ph, false, p.neg, p.stage)
+            _publish!(coeffs, (t - 1) * Ph, p.modes, (c - 1) * Pn, p.src, p.scale, Ph, false, p.neg, p.stage)
             R && _point_twins!(p, c, t)
         end
     end
@@ -319,15 +318,15 @@ end
 function Plans.plan_spectrum(t::_FTBLibrary,
         exec::Union{_HostExec, ComputationalBackends.AbstractGPUBackend}, g::Grids.PointwiseCartesian,
         ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, eps = nothing,
-        batch_chunk::Union{Nothing, Integer} = nothing) where {T, D}
-    return _point_plan(t, exec, g, T, ms, batch, iflag, eps, batch_chunk)
+        batch_chunk::Union{Nothing, Integer} = nothing, box = nothing) where {T, D}
+    return _point_plan(t, exec, g, T, ms, batch, iflag, eps, batch_chunk, box)
 end
 
 function _nufft_one_shot(t::_FTBLibrary, exec, g, field, ms::NTuple{D, Int}; iflag::Int = 1,
-        eps = nothing, batch_chunk = nothing, kwargs...) where {D}
+        eps = nothing, batch_chunk = nothing, box = nothing, kwargs...) where {D}
     E = float(eltype(field))
     batch = Grids.field_batch_shape(g, field)
-    plan = Plans.plan_spectrum(t, exec, g, E, ms; batch, iflag, eps, batch_chunk)
+    plan = Plans.plan_spectrum(t, exec, g, E, ms; batch, iflag, eps, batch_chunk, box)
     try
         coeffs = zeros(Complex{real(E)}, Plans.coefficient_size(plan)...)
         ks = calculate_spectrum!(coeffs, plan, field)
@@ -485,10 +484,10 @@ Reusable separable NUFFT over a nonuniform tensor-product Cartesian grid: one [`
 per axis, the working arrays the passes write through, and the publish and twin tables. Execute with
 `calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref) releases the library plans.
 """
-struct NUFFTSeparablePlan{T, D, R, NB, AP, W, PH, IX, ST, KS, TW, QW} <: Plans.AbstractSpectralPlan
+struct NUFFTSeparablePlan{T, D, R, NB, AP, W, IX, ST, KS, TW, QW} <: Plans.AbstractSpectralPlan
     axes::AP                         # D × NUFFTAxisPass
     work::W                          # D+1 working arrays; `work[1]` takes the field
-    phase::PH                        # offset phase × 1/∏N_d
+    scale::T                         # 1/∏N_d
     src::IX
     stage::ST
     batch::NTuple{NB, Int}
@@ -515,12 +514,12 @@ function Plans.plan_spectrum(t::_FTBLibrary,
         exec::Union{_HostExec, ComputationalBackends.AbstractGPUBackend},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, eps = nothing,
-        batch_chunk::Union{Nothing, Integer} = nothing) where {T, D}
+        batch_chunk::Union{Nothing, Integer} = nothing, box = nothing) where {T, D}
     Tr = real(float(T))
     R = T <: Real
     ndims(g) == D || throw(DimensionMismatch("grid has $(ndims(g)) dims; asked for $D mode counts"))
     axs = ntuple(d -> Tr.(FlowGeometries.Grids.coordinates(g, d)), Val(D))
-    offsets, ranges = Grids.axis_geometry(Tr, g, D)
+    offsets, ranges = Grids.axis_geometry(Tr, g, D, box)
     Ns = ntuple(d -> length(axs[d]), Val(D))
     npts = prod(Ns)
     ntrans = prod(batch; init = 1)
@@ -531,18 +530,16 @@ function Plans.plan_spectrum(t::_FTBLibrary,
     axes = ntuple(d -> _axis_pass(t, exec, Tr, size(work[d]), d, axs[d], ns[d], ranges[d], offsets[d], tol,
         batch_chunk; iflag = sgn), Val(D))
     pms = Packing.packed_size(ms, Val(R))
-    phase = _to_exec(exec, Packing.offset_phase(Tr, ms, offsets, ranges, npts, Val(R), R ? 1 : iflag))
     ks_phys = Grids.physical_wavenumbers(ranges, ms, Val(R))
-    ks, twins = R ? _twin_set(exec, Tr, ks_phys, ms, ns, offsets, ranges, npts, batch; conjugate = true) :
-                    (ks_phys, ())
+    ks, twins = R ? _twin_set(exec, Tr, ks_phys, ms, ns, npts, batch; conjugate = true) : (ks_phys, ())
     qwh = Grids.quadrature_scale(g, Tr, npts)
     qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
     src = _to_exec(exec, _packed_src(ms, Val(R), ns))
     stage = _on_device(exec) ? _alloc(exec, Complex{Tr}, prod(pms)) : nothing
     bt = NTuple{length(batch), Int}(batch)
-    return NUFFTSeparablePlan{Tr, D, R, length(bt), typeof(axes), typeof(work), typeof(phase), typeof(src),
+    return NUFFTSeparablePlan{Tr, D, R, length(bt), typeof(axes), typeof(work), typeof(src),
             typeof(stage), typeof(ks), typeof(twins), typeof(qw)}(
-        axes, work, phase, src, stage, bt, ms, ns, pms, npts, ntrans, R && iflag < 0, ks, twins, qw)
+        axes, work, one(Tr) / npts, src, stage, bt, ms, ns, pms, npts, ntrans, R && iflag < 0, ks, twins, qw)
 end
 
 """
@@ -557,9 +554,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTSeparabl
     length(field) == length(A) || throw(DimensionMismatch(
         "field holds $(length(field)) values; this plan was built for $(length(A)) — pass the matching " *
         "`batch=` to plan_spectrum"))
-    size(coeffs) == Plans.coefficient_size(p) || throw(DimensionMismatch(
-        "coeffs is $(size(coeffs)); this plan writes $(Plans.coefficient_size(p)) — allocate it with " *
-        "`allocate_coefficients(plan)`"))
+    Plans._check_coefficients(coeffs, p)
     _stage!(A, field)
     _scale_points!(A, p.qw, p.npts, p.ntrans)
     _run_axes!(p.work, p.axes, 1)
@@ -567,7 +562,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTSeparabl
     Pn = prod(p.ns)
     Ph = prod(p.pms)
     for t in 1:p.ntrans
-        _publish!(coeffs, (t - 1) * Ph, F, (t - 1) * Pn, p.src, p.phase, Ph, false, p.neg, p.stage)
+        _publish!(coeffs, (t - 1) * Ph, F, (t - 1) * Pn, p.src, p.scale, Ph, false, p.neg, p.stage)
         _gather_twins!(p.twins, F, (t - 1) * Pn, t, p.neg)
     end
     return p.ks_phys
@@ -599,19 +594,17 @@ function _calculate_spectrum_hybrid(t::_FTBLibrary, exec::ComputationalBackends.
         Ph = prod(pms)
         coeffs = Array{Complex{Tr}}(undef, pms..., batch...)
         src = _to_exec(exec, _packed_src(ms, Val(true), h.nsx))
-        phase = _to_exec(exec, h.phase)
         stage = _alloc(exec, Complex{Tr}, Ph)
         ks, twins = h.need_twin ?
-            _twin_set(exec, Tr, h.ks_phys, ms, h.nsx, h.offs, h.ranges, h.npts, batch; conjugate = true) :
-            (h.ks_phys, ())
+            _twin_set(exec, Tr, h.ks_phys, ms, h.nsx, h.npts, batch; conjugate = true) : (h.ks_phys, ())
         for k in 1:ntrans
-            _publish!(coeffs, (k - 1) * Ph, W, (k - 1) * Pn, src, phase, Ph, false, h.neg, stage)
+            _publish!(coeffs, (k - 1) * Ph, W, (k - 1) * Pn, src, h.scale, Ph, false, h.neg, stage)
             _gather_twins!(twins, W, (k - 1) * Pn, k, h.neg)
         end
         return coeffs, ks
     end
     h.neg && (W .= conj.(W))                     # closes the conjugation applied to the input
-    W .*= _to_exec(exec, h.phase)
+    W .*= h.scale
     coeffs = Array{Complex{Tr}}(undef, ms..., batch...)
     copyto!(coeffs, W)
     return coeffs, h.ks
@@ -619,26 +612,25 @@ end
 
 # =============================================================================
 # Synthesis: a complex type 2 on the full native spectrum. A real field's packed half is first completed by
-# `Packing.unpacked` with its Nyquist twin, and the real part taken. The forward publishes `C = fk · p` with
-# `p` the offset phase × 1/M, so the type 2 takes `û = C · conj(p) · M` and evaluates
-# `Σ û e^{+iflag·ik·y}`.
+# `Packing.unpacked` with its Nyquist twin, and the real part taken. The forward publishes `C = fk / M`
+# measured from each direction's origin, the point positions `y` the type 2 folds, so it evaluates
+# `Σ C e^{+iflag·ik·y}` as given.
 # =============================================================================
 
 """
     NUFFTSynthesisPlan{T,D,R}
 
 Reusable type-2 NUFFT inverse onto a Cartesian grid's points: the plan with `C` transforms per execution,
-its spectrum and strength buffers (with host staging on a device), the offset phase, and the native cube a
-packed half expands into. Execute with `synthesize!(out, plan, coeffs; ks)`; [`close!`](@ref) releases
-the library plan.
+its spectrum and strength buffers (with host staging on a device), and the native cube a packed half
+expands into. Execute with `synthesize!(out, plan, coeffs; ks)`; [`close!`](@ref) releases the library
+plan.
 """
-struct NUFFTSynthesisPlan{T, D, R, NB, P, U, V, HU, HV, PH, FB, SP} <: Plans.AbstractSynthesisPlan
+struct NUFFTSynthesisPlan{T, D, R, NB, P, U, V, HU, HV, FB, SP} <: Plans.AbstractSynthesisPlan
     plan::P
     modes::U                         # (ms…, C)
     values::V                        # (M, C)
     hmodes::HU                       # host staging for `modes`, or `modes` itself on the host
     hvalues::HV                      # host staging for `values`, or `values` itself on the host
-    phase::PH                        # host (ms…) offset phase × M, built for `iflag`
     full::FB                         # host (ms…, ntrans)
     ms::NTuple{D, Int}
     spatial::SP
@@ -680,11 +672,10 @@ function Plans.plan_synthesis(t::_FTBLibrary,
     values = _alloc(exec, Complex{T}, M, C)
     hmodes = dev ? Array{Complex{T}}(undef, ms..., C) : modes
     hvalues = dev ? Array{Complex{T}}(undef, M, C) : values
-    phase = Packing.offset_phase(T, ms, offsets, Ls, M, Val(false), iflag) .* M
     full = Array{Complex{T}}(undef, ms..., ntrans)
     return NUFFTSynthesisPlan{T, D, R, length(bt), typeof(plan), typeof(modes), typeof(values), typeof(hmodes),
-            typeof(hvalues), typeof(phase), typeof(full), typeof(spatial)}(
-        plan, modes, values, hmodes, hvalues, phase, full, ms, spatial, bt, ntrans, M, C)
+            typeof(hvalues), typeof(full), typeof(spatial)}(
+        plan, modes, values, hmodes, hvalues, full, ms, spatial, bt, ntrans, M, C)
 end
 
 function Plans.synthesize!(out::AbstractArray, p::NUFFTSynthesisPlan{T, D, R}, coeffs::AbstractArray;
@@ -720,7 +711,7 @@ function _synthesis_run!(out::AbstractArray{Z}, p::NUFFTSynthesisPlan, full) whe
             end
             foff = (base + c - 1) * Pm
             for i in 1:Pm
-                fk[o + i] = full[foff + i] * conj(p.phase[i])
+                fk[o + i] = full[foff + i]
             end
         end
         fk === p.modes || copyto!(p.modes, fk)

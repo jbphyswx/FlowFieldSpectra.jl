@@ -83,6 +83,7 @@ packed half `(N_1÷2+1, N_2…N_D, batch…)` into `coeffs`, scaled by `1/∏N`.
 in steady state.
 """
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::RFFTPlan{RT, D}, field) where {RT, D}
+    FFS.Plans._check_coefficients(coeffs, plan)
     LA.mul!(coeffs, plan.fwd, field)
     LA.rmul!(coeffs, plan.norm)
     plan.neg && (coeffs .= conj.(coeffs))
@@ -96,6 +97,7 @@ Execute a prebuilt complex-input `CFFTPlan` in place: writes the full native spe
 into `coeffs`, scaled by `1/∏N`.
 """
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::CFFTPlan{RT, D}, field) where {RT, D}
+    FFS.Plans._check_coefficients(coeffs, plan)
     LA.mul!(coeffs, plan.fwd, field)
     LA.rmul!(coeffs, plan.norm)
     return plan.ks_phys

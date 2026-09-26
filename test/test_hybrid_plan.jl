@@ -132,8 +132,8 @@ Test.@testset "Hybrid plan holds every buffer it owns" begin
 
     # Publishing and the twin gather write into the caller's buffer and the plan's slices.
     W = FFS._axis_nufft_exec!(p.work[2], p.axes[1], W1, p.sdims[1])
-    hp_a_publish(buf, W, p.phase, p.nsx, p.pms, p.ntrans, p.neg)
-    Test.@test hp_a_publish(buf, W, p.phase, p.nsx, p.pms, p.ntrans, p.neg) == 0
+    hp_a_publish(buf, W, p.scale, p.nsx, p.pms, p.ntrans, p.neg)
+    Test.@test hp_a_publish(buf, W, p.scale, p.nsx, p.pms, p.ntrans, p.neg) == 0
     hp_a_twins(p.twins, W, prod(p.nsx), p.ntrans, p.neg)
     Test.@test hp_a_twins(p.twins, W, prod(p.nsx), p.ntrans, p.neg) == 0
 

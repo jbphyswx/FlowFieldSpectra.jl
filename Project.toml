@@ -28,7 +28,7 @@ NUFSHT = "e99b67a3-9706-455a-90e2-85b195a33206"
 OhMyThreads = "67456a42-1dca-4109-a031-0a68de7e3ad5"
 
 [extensions]
-FlowFieldSpectraGPUFFTExt = ["KernelAbstractions", "AbstractFFTs"]
+FlowFieldSpectraKernelAbstractionsAbstractFFTsExt = ["KernelAbstractions", "AbstractFFTs"]
 FlowFieldSpectraCairoMakieExt = "CairoMakie"
 FlowFieldSpectraDistributedExt = "Distributed"
 FlowFieldSpectraFFTWExt = "FFTW"

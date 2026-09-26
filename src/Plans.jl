@@ -74,6 +74,20 @@ A zeroed coefficient array of this plan's own size and element type, ready for
 allocate_coefficients(plan::AbstractSpectralPlan) =
     zeros(coefficient_type(plan), coefficient_size(plan)...)
 
+# A transform writes its modes by linear index, so `coeffs` must have the shape it writes.
+function _check_coefficients(coeffs::AbstractArray, plan::AbstractSpectralPlan)
+    size(coeffs) == coefficient_size(plan) || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this plan writes $(coefficient_size(plan)) — allocate it with " *
+        "`allocate_coefficients(plan)`"))
+    return nothing
+end
+
+function _check_coefficients(coeffs::AbstractArray, want::Tuple)
+    size(coeffs) == want || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this transform writes $want"))
+    return nothing
+end
+
 # =============================================================================
 # Synthesis: the inverse's counterpart to the analysis pair above.
 # =============================================================================

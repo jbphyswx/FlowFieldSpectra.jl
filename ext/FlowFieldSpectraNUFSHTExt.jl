@@ -164,6 +164,7 @@ Fill preallocated `coeffs` `(Nθ, Nφ, batch…)` with the scattered-spherical s
 `(N, batch…)`, reusing `plan`'s nodes / NUFSHT plan / LSMR solve workspace (no re-planning).
 """
 function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, plan::NUSHTSphericalPlan{T}, field) where {T}
+    FFS.Plans._check_coefficients(coeffs, plan)
     fill!(coeffs, zero(eltype(coeffs)))
     _nusht_pass!(coeffs, plan, field, real, one(T))
     eltype(field) <: Real || _nusht_pass!(coeffs, plan, field, imag, im)

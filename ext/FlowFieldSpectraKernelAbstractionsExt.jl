@@ -50,18 +50,19 @@ end
 FFS._alloc(exec::ComputationalBackends.GPUBackend{<:KA.Backend}, ::Type{T}, dims::Integer...) where {T} =
     KA.allocate(exec.backend, T, dims...)
 
-KA.@kernel function _gather_scaled_kernel!(dst, doff::Int, @Const(src), soff::Int, @Const(idx), @Const(w),
+# `w` is an array of per-entry weights or one number for every entry (`FFS._weight`).
+KA.@kernel function _gather_scaled_kernel!(dst, doff::Int, @Const(src), soff::Int, @Const(idx), w,
         csrc::Bool, neg::Bool)
     i = @index(Global)
     @inbounds begin
         s = src[soff + idx[i]]
-        v = (csrc ? conj(s) : s) * w[i]
+        v = (csrc ? conj(s) : s) * FFS._weight(w, i)
         dst[doff + i] = neg ? conj(v) : v
     end
 end
 
 function FFS._gather_scaled!(dst::AbstractArray, doff::Int, src::AbstractArray, soff::Int,
-        idx::AbstractArray{Int}, w::AbstractArray, n::Int, csrc::Bool, neg::Bool)
+        idx::AbstractArray{Int}, w::Union{AbstractArray, Number}, n::Int, csrc::Bool, neg::Bool)
     n == 0 && return dst
     backend = KA.get_backend(src)
     _gather_scaled_kernel!(backend)(dst, doff, src, soff, idx, w, csrc, neg; ndrange = n)
@@ -87,13 +88,13 @@ end
 
 function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBackend,
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int) where {D}
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int, box = nothing) where {D}
     FT = eltype(g)
     backend = exec.backend
     ss = size(g)
     Npts = prod(ss)
     R = eltype(field) <: Real
-    ks_cpu = FFS.Grids.physical_wavenumbers(g, ms, Val(R))
+    xs, ks_cpu = FFS.DirectSum.phase_geometry(g, FT, ms, Val(R), box)
     pms = FFS.Packing.packed_size(ms, Val(R))
     M = prod(pms)
     B = length(field) ÷ Npts
@@ -101,10 +102,10 @@ function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBac
     ET = eltype(field) <: Real ? FT : Complex{FT}          # stage the field in its own float type
     fieldd = _dev_field(backend, field, Npts, B, ET)
     coeffs_dev = KA.zeros(backend, Complex{FT}, M, B)
-    _launch_cartesian!(coeffs_dev, backend, g, fieldd, ksd, ss, pms, Npts, M, B, iflag)
+    _launch_cartesian!(coeffs_dev, backend, g, xs, fieldd, ksd, ss, pms, Npts, M, B, iflag)
     KA.synchronize(backend)
     coeffs_dev ./= Npts
-    tw = _gpu_nyquist_twin(backend, g, field, fieldd, ms, iflag, ss, Npts, B, FT)
+    tw = _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms, iflag, ss, Npts, B, FT)
     ks_out = tw === nothing ? ks_cpu : (FFS.Packing.with_twin(ks_cpu[1], tw), Base.tail(ks_cpu)...)
     return reshape(FFS._to_host(coeffs_dev), pms..., FFS.Grids.field_batch_shape(g, field)...), ks_out
 end
@@ -112,10 +113,9 @@ end
 # The twin the packed half needs where index negation misses `+N_d/2`, evaluated on device by rerunning
 # the forward kernel over each masked mode set: the mask shape replaces `pms` and the masked wavenumbers
 # replace `ks`. `nothing` when negation already reaches every partner.
-function _gpu_nyquist_twin(backend, g, field, fieldd, ms::NTuple{D, Int}, iflag::Int, ss, Npts, B,
-        ::Type{FT}) where {FT, D}
+function _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms::NTuple{D, Int}, iflag::Int, ss, Npts,
+        B, ::Type{FT}) where {FT, D}
     (D >= 2 && eltype(field) <: Real && !FlowGeometries.Grids.isuniform(g)) || return nothing
-    ks_cpu = FFS.Grids.physical_wavenumbers(g, ms, Val(true))
     pms = FFS.Packing.packed_size(ms, Val(true))
     batch = FFS.Grids.field_batch_shape(g, field)
     slices = ntuple(FFS.Packing.n_twin_slices(Val(D))) do mask
@@ -124,7 +124,7 @@ function _gpu_nyquist_twin(backend, g, field, fieldd, ms::NTuple{D, Int}, iflag:
         out = KA.zeros(backend, Complex{FT}, S, B)
         if S > 0
             kaxd = ntuple(d -> _dev_vec(backend, FFS.DirectSum._twin_kaxis(FT, ks_cpu, ms, mask, d, sl[d]), FT), D)
-            _launch_cartesian!(out, backend, g, fieldd, kaxd, ss, sl, Npts, S, B, iflag)
+            _launch_cartesian!(out, backend, g, xs, fieldd, kaxd, ss, sl, Npts, S, B, iflag)
             KA.synchronize(backend)
             out ./= Npts
         end
@@ -133,24 +133,25 @@ function _gpu_nyquist_twin(backend, g, field, fieldd, ms::NTuple{D, Int}, iflag:
     return FFS.Packing.NyquistTwin(slices)
 end
 
-# Structured (tensor-product) grid: stage the D axes and decode point coordinates on device. `pms` is the
-# packed mode count per axis (axis 1 halved for a real field).
+# Structured (tensor-product) grid: stage the D axes of positions `xs` (`DirectSum.phase_geometry`) and
+# decode point coordinates on device. `pms` is the packed mode count per axis (axis 1 halved for a real
+# field).
 function _launch_cartesian!(coeffs_dev, backend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        fieldd, ksd, ss::NTuple{D, Int}, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
+        xs::Tuple, fieldd, ksd, ss::NTuple{D, Int}, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
     FT = real(eltype(coeffs_dev))
-    axesd = ntuple(d -> _dev_vec(backend, collect(FlowGeometries.Grids.coordinates(g, d)), FT), D)
+    axesd = ntuple(d -> _dev_vec(backend, collect(xs[d]), FT), D)
     kernel! = _cart_tensor_kernel!(backend)
     kernel!(coeffs_dev, fieldd, axesd, ksd, ss, pms, Npts, M, B, D, iflag; ndrange = M)
     return coeffs_dev
 end
 
-# Pointwise grid: stage the D per-point coordinate arrays. The ambient dimension D is `length(pms)`; `ss`
+# Pointwise grid: stage the D per-point position arrays. The ambient dimension D is `length(pms)`; `ss`
 # is the grid's own spatial shape and is unused here. A curvilinear grid holds one coordinate value per
 # cell in an N-D array, so `vec` gives the point list the kernel indexes.
 function _launch_cartesian!(coeffs_dev, backend, g::FFS.Grids.PointwiseCartesian,
-        fieldd, ksd, ss, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
+        xs::Tuple, fieldd, ksd, ss, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
     FT = real(eltype(coeffs_dev))
-    coordsd = ntuple(d -> _dev_vec(backend, vec(collect(FlowGeometries.Grids.coordinates(g, d))), FT), D)
+    coordsd = ntuple(d -> _dev_vec(backend, vec(collect(xs[d])), FT), D)
     kernel! = _cart_scattered_kernel!(backend)
     kernel!(coeffs_dev, fieldd, coordsd, ksd, pms, Npts, M, B, D, iflag; ndrange = M)
     return coeffs_dev

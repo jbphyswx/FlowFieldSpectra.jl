@@ -84,8 +84,9 @@ end
 
 # -----------------------------------------------------------------------------
 # Cartesian quadrature. A transform estimates the domain average
-# `C(k) = Σ_j w_j f_j e^{-i k·x_j} / Σ_j w_j` with `w` the grid's per-node measure. Every backend here
-# normalizes by the plain node count instead, and
+# `C(k) = Σ_j w_j f_j e^{-i k·(x_j - x₀)} / Σ_j w_j` with `w` the grid's per-node measure and `x₀` each
+# direction's smallest coordinate, the first sample of an ascending axis, so an FFT of the samples
+# returns it with no phase applied. Every backend here normalizes by the plain node count instead, and
 #
 #     Σ_j w_j f_j e^{-ikx} / Σw  ==  (1/N) Σ_j (N w_j / Σw) f_j e^{-ikx},
 #
@@ -138,15 +139,11 @@ field_batch_shape(g::FlowGeometries.Grids.AbstractGrid, field) =
 """
     axis_geometry(::Type{FT}, grid, D) -> (offsets, ranges)
 
-Per-axis origin and Fourier length: `offsets[d]` is the smallest coordinate along direction `d`, and
-`ranges[d]` its wrap length where the direction wraps and `1` where it does not.
+Per-axis origin and Fourier length: `offsets[d]` is the smallest coordinate along direction `d`, the `x₀`
+every phase is measured from, and `ranges[d]` the [`axis_range`](@ref) of direction `d`.
 
 `offsets` comes from `FlowGeometries.Grids.bounds`, which is `O(1)` on a structured grid (an axis is
 monotone, so its extremes are its endpoints) against an `O(N)` scan of the coordinates.
-
-`ranges` reads `isperiodic` before `period`, whose own contract states it is meaningful only where the
-direction wraps: a grid may declare a direction non-periodic while carrying a nonzero `period` entry, so
-the flag decides. A non-periodic direction gets `1`, making its wavenumbers raw per-sample.
 """
 function axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int) where {FT}
     offsets = ntuple(d -> FT(FlowGeometries.Grids.bounds(g, d)[1]), D)
@@ -154,9 +151,30 @@ function axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int)
     return offsets, ranges
 end
 
-"""`axis_range(FT, grid, d)` — direction `d`'s Fourier length: its wrap period, or `1` where it does not wrap."""
+# A transform of part of a grid's points takes the whole grid's origins and Fourier lengths as `box`, so
+# the parts' coefficients sit on one wavenumber lattice and sum to the whole's.
+axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int, ::Nothing) where {FT} =
+    axis_geometry(FT, g, D)
+axis_geometry(::Type{FT}, ::FlowGeometries.Grids.AbstractGrid, D::Int, box::Tuple) where {FT} =
+    (map(FT, box[1]), map(FT, box[2]))
+
+"""
+    relative_coordinates(grid, offsets) -> NTuple
+
+Each direction's coordinates less its origin, `x - x₀`: the positions a phase `e^{-ik·(x - x₀)}` reads.
+"""
+relative_coordinates(g::FlowGeometries.Grids.AbstractGrid, offsets::Tuple) =
+    map((x, o) -> x .- o, FlowGeometries.Grids.coordinates(g), offsets)
+
+"""
+    axis_range(FT, grid, d) -> FT
+
+Direction `d`'s Fourier length: the length `FlowGeometries.Grids.domain_length` gives the cells along
+`d`, which is the period where `d` wraps. A transform weights each sample by its measure, and the
+measure integrates over those cells, so the Fourier modes are periodic over the same length.
+"""
 @inline axis_range(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, d::Integer) where {FT} =
-    FlowGeometries.Grids.isperiodic(g, d) ? FT(FlowGeometries.Grids.period(g, d)) : one(FT)
+    FT(FlowGeometries.Grids.domain_length(g, d))
 
 """
     point_coordinates(::Type{FT}, grid, D) -> (coords::NTuple{D}, spatial::Tuple)

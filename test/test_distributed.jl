@@ -89,4 +89,16 @@ Test.@testset "Distributed spectrum parity" begin
     cx, _ = FFS.calculate_spectrum(sph, fθ, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend(), weights = w)
     cxd, _ = FFS.calculate_spectrum(sph, fθ, (8, 15); transform = SB.DirectSumSpectralBackend(), execution = CB.DistributedBackend(), weights = w)
     Test.@test isapprox(cxd, cx; atol = 1e-10)
+
+    # On a bounded cloud a share's own origins and Fourier lengths differ from the whole grid's, and every
+    # share transforms on the whole grid's.
+    scb = FG.Grids.UnstructuredGrid(_cg(Float64), (xv, yv), ones(N))
+    Test.@test FFS.Grids.axis_geometry(Float64, FFS._subgrid(scb, 2:2:N), 2) != FFS.Grids.axis_geometry(Float64, scb, 2)
+    for t in (SB.DirectSumSpectralBackend(), FTB.FINUFFTBackend())
+        kw = t isa FTB.FINUFFTBackend ? (; eps = 1e-12) : (;)
+        cb, kb = FFS.calculate_spectrum(scb, f, ms; transform = t, execution = CB.SerialBackend(), kw...)
+        cbd, kbd = FFS.calculate_spectrum(scb, f, ms; transform = t, execution = CB.DistributedBackend(), kw...)
+        Test.@test isapprox(cbd, cb; atol = 1e-10)
+        Test.@test all(collect(kbd[d]) ≈ collect(kb[d]) for d in 1:2)
+    end
 end

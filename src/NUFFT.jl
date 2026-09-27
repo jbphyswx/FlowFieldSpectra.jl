@@ -45,11 +45,6 @@ _chunk(::Int, total::Int, bc::Integer) = bc <= 0 ? max(total, 1) : clamp(Int(bc)
 
 # ---- layout tables ----
 
-# Frequency at index `j` of a packed axis of `n` modes: `0 … n÷2` on the halved axis 1 of a real field,
-# `fftfreq` order elsewhere.
-@inline _axis_freq(j::Int, n::Int, halved::Bool) =
-    halved ? j - 1 : (j - 1 <= (n - 1) ÷ 2 ? j - 1 : j - 1 - n)
-
 """
     _packed_src(ms, ::Val{R}, dims) -> Vector{Int}
 
@@ -63,7 +58,8 @@ function _packed_src(ms::NTuple{D, Int}, ::Val{R}, dims::NTuple{D, Int}) where {
         lin = 1
         stride = 1
         for d in 1:D
-            k = _axis_freq(I[d], ms[d], R && d == 1)
+            # `0 … n₁÷2` on the halved axis 1 of a real field, `FFTModes` order elsewhere.
+            k = R && d == 1 ? I[d] - 1 : FTB.mode_frequency(FTB.FFTModes(), I[d], ms[d])
             lin += (FTB.ovs_index(k, dims[d]) - 1) * stride
             stride *= dims[d]
         end

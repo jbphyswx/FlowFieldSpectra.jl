@@ -1,6 +1,7 @@
 module FlowFieldSpectraNUFSHTExt
 
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends as SB
@@ -36,7 +37,7 @@ fixed point set and batch shape. Reuse across many fields via `calculate_spectru
 struct NUSHTSphericalPlan{T, CT, NB, P, CR, WS, QW, FW, KS} <: FFS.AbstractSpectralPlan
     plan::P                       # NUFSHT.NUSHTplan (fixed nodes + NUFFT setup), ntrans = C
     C_real::CR                    # (Nθ, Nφ, C) real NUFSHT coeff buffer (FSH sph_mode layout), reused
-    ws::WS                        # LSMRWorkspace for solve=true (built once); nothing otherwise
+    ws::WS                        # FTB.LSMRWorkspace for solve=true (built once); nothing otherwise
     qw::QW                        # (N,) per-node quadrature weights, Σw = 4π
     fw::FW                        # (N, C) weighted-field buffer the type-1 reads, reused
     lmax::Int
@@ -123,7 +124,7 @@ function _nusht_plan(::Type{CT}, ::Type{FT}, g, ms::Tuple, batch::NTuple{NB, Int
     C = _chunk(B, batch_chunk)
     plan = NUFSHT.make_plan(FT, θ, φ, lmax; tol = tol, ntrans = C, nthreads = FFS._backend_nthreads(exec), nufft = nufft)
     C_real = zeros(FT, Nθ, Nφ, C)
-    ws = solve ? NUFSHT.LSMRWorkspace(plan) : nothing
+    ws = solve ? FTB.LSMRWorkspace(plan) : nothing
     fw = zeros(FT, N, C)
     ks = (0:lmax, -lmax:lmax)
     return NUSHTSphericalPlan{FT, CT, NB, typeof(plan), typeof(C_real), typeof(ws), typeof(w), typeof(fw), typeof(ks)}(

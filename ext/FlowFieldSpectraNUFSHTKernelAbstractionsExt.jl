@@ -1,6 +1,7 @@
 module FlowFieldSpectraNUFSHTKernelAbstractionsExt
 
 using NUFSHT: NUFSHT
+using FlowTransformBindings: FlowTransformBindings as FTB
 using KernelAbstractions: KernelAbstractions as KA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using ComputationalBackends: ComputationalBackends
@@ -30,7 +31,7 @@ struct NUSHTSphericalGPUPlan{T, CT, NB, P, FD, FH, CD, HB, WS, QW, KS} <: FFS.Ab
     fh::FH             # host (N, B) real staging for one component of a complex field
     Cd::CD             # device (Nθ, Nφ, B) real coeff buffer
     Cr_host::HB        # host (Nθ, Nφ, B) staging for the small layout remap
-    ws::WS             # device LSMRWorkspace for solve=true; nothing otherwise
+    ws::WS             # device FTB.LSMRWorkspace for solve=true; nothing otherwise
     qwd::QW            # device (N, 1) per-node quadrature weights, Σw = 4π; nothing for solve=true
     lmax::Int
     Nθ::Int
@@ -63,7 +64,7 @@ function _nusht_gpu_plan(::Type{CT}, ::Type{FT}, backend, g, ms::Tuple, batch::N
     fh = zeros(FT, N, B)
     Cd = KA.zeros(backend, FT, Nθ, Nφ, B)
     Cr_host = zeros(FT, Nθ, Nφ, B)
-    ws = solve ? NUFSHT.LSMRWorkspace(plan) : nothing
+    ws = solve ? FTB.LSMRWorkspace(plan) : nothing
     # `nusht_type1!` is the unweighted adjoint, so the quadrature reaches it through the field. Shaped
     # `(N, 1)` so one broadcast weights every transform in the batch. The solve reads the raw field.
     qwd = if solve

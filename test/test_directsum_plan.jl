@@ -10,6 +10,7 @@
 using Test: Test
 using Random: Random
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -32,7 +33,7 @@ function dp_pair(g, f, ms; batch = (), exec = DP_SER)
     p = FFS.plan_spectrum(g, T, ms; transform = DP_DS, execution = exec, batch = batch)
     c2 = similar(c1)
     k2 = FFS.calculate_spectrum!(c2, p, f)
-    return c2, c1, FFS.Packing.axis_twin(k2[1]), FFS.Packing.axis_twin(k1[1]), p
+    return c2, c1, FTB.axis_twin(k2[1]), FTB.axis_twin(k1[1]), p
 end
 
 # Every nonempty twin slice, plan against one-shot.
@@ -119,17 +120,17 @@ Test.@testset "Cartesian direct-sum plan reuses its setup" begin
 
     for (g, f) in ((gs, randn(N, N)), (gc, randn(40)))
         p = FFS.plan_spectrum(g, Float64, ms; transform = DP_DS, execution = DP_SER)
-        pms = FFS.Packing.packed_size(ms, Val(true))
+        pms = FTB.packed_size(ms, Val(true))
         buf = zeros(ComplexF64, pms...)
         ks = FFS.calculate_spectrum!(buf, p, f)
-        Test.@test FFS.Packing.axis_twin(ks[1]) !== nothing   # both grids need a twin, so the check is live
+        Test.@test FTB.axis_twin(ks[1]) !== nothing   # both grids need a twin, so the check is live
         first = copy(buf)
-        first_twin = copy(FFS.Packing.axis_twin(ks[1]).slices[1])
+        first_twin = copy(FTB.axis_twin(ks[1]).slices[1])
 
         # A second execution of the same field reproduces it exactly, twin included.
         FFS.calculate_spectrum!(buf, p, f)
         Test.@test buf == first
-        Test.@test FFS.Packing.axis_twin(ks[1]).slices[1] == first_twin
+        Test.@test FTB.axis_twin(ks[1]).slices[1] == first_twin
 
         # A different field moves both, and matches that field's own one-shot.
         f2 = randn(size(f)...)
@@ -154,7 +155,7 @@ Test.@testset "Cartesian direct-sum plan reuses its setup" begin
 
     # A batched plan is fixed to its batch shape.
     pb = FFS.plan_spectrum(gs, Float64, ms; transform = DP_DS, execution = DP_SER, batch = (2,))
-    bufb = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))..., 2)
+    bufb = zeros(ComplexF64, FTB.packed_size(ms, Val(true))..., 2)
     FFS.calculate_spectrum!(bufb, pb, randn(N, N, 2))
     Test.@test dp_exec(bufb, pb, randn(N, N, 2)) == 0
     Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(bufb, pb, randn(N, N))

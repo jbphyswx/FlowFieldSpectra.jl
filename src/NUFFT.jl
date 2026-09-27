@@ -57,14 +57,14 @@ For each packed coefficient, its linear index in one transform's spectrum of sha
 order: the same frequency, on axes holding at least the packed ones.
 """
 function _packed_src(ms::NTuple{D, Int}, ::Val{R}, dims::NTuple{D, Int}) where {D, R}
-    pms = Packing.packed_size(ms, Val(R))
+    pms = FTB.packed_size(ms, Val(R))
     src = Vector{Int}(undef, prod(pms))
     @inbounds for (i, I) in enumerate(CartesianIndices(pms))
         lin = 1
         stride = 1
         for d in 1:D
             k = _axis_freq(I[d], ms[d], R && d == 1)
-            lin += (Packing.ovs_index(k, dims[d]) - 1) * stride
+            lin += (FTB.ovs_index(k, dims[d]) - 1) * stride
             stride *= dims[d]
         end
         src[i] = lin
@@ -103,8 +103,8 @@ end
 """
     TwinGather
 
-One mask's [`Packing.NyquistTwin`](@ref) slice with the [`Packing.twin_table`](@ref) that fills it from a
-spectrum, a conjugate read where `csrc`.
+One mask's `FlowTransformBindings.NyquistTwin` slice with the `FlowTransformBindings.twin_table` that
+fills it from a spectrum, a conjugate read where `csrc`.
 """
 struct TwinGather{SL, IX, FC, ST}
     slice::SL        # host values, `(shape…, batch…)`
@@ -119,15 +119,15 @@ function _twin_set(exec, ::Type{Tr}, ks_phys::Tuple, ms::NTuple{D, Int}, dims::N
         batch::Tuple; conjugate::Bool, phis = nothing, normfactor::Real = 1) where {Tr, D}
     D >= 2 || return ks_phys, ()
     dev = _on_device(exec)
-    gs = ntuple(Packing.n_twin_slices(Val(D))) do mask
-        shape, src, fac = Packing.twin_table(Tr, ms, mask, dims, M; phis, normfactor, conjugate)
+    gs = ntuple(FTB.n_twin_slices(Val(D))) do mask
+        shape, src, fac = FTB.twin_table(Tr, ms, mask, dims, M; phis, normfactor, conjugate)
         S = length(src)
         TwinGather(zeros(Complex{Tr}, shape..., batch...), _to_exec(exec, S == 0 ? [1] : src),
             _to_exec(exec, S == 0 ? [zero(Complex{Tr})] : fac),
             dev ? _alloc(exec, Complex{Tr}, max(S, 1)) : nothing, S, conjugate)
     end
-    twin = Packing.NyquistTwin(map(g -> g.slice, gs))
-    return (Packing.with_twin(ks_phys[1], twin), Base.tail(ks_phys)...), gs
+    twin = FTB.NyquistTwin(map(g -> g.slice, gs))
+    return (FTB.with_twin(ks_phys[1], twin), Base.tail(ks_phys)...), gs
 end
 
 @inline _gather_twins!(::Tuple{}, fk, soff::Int, t::Int, neg::Bool) = nothing
@@ -185,9 +185,9 @@ _stage!(A::AbstractArray, field) = copyto!(A, eltype(field) === eltype(A) ? fiel
 # the native box, so `+N_d/2` is there before truncation, and each twin is one oversampled entry times the
 # deconvolution the kept modes get (`FlowTransformBindings.oversampled_spectra`).
 #
-# A real field on FINUFFT takes complex strengths at `Packing.hermitian_request_size`, which puts `±N₁/2`
-# on axis 1; the packed half is the leading axis-1 entries and each twin a conjugate read of the Hermitian
-# spectrum.
+# A real field on FINUFFT takes complex strengths at `FlowTransformBindings.hermitian_request_size`, which
+# puts `±N₁/2` on axis 1; the packed half is the leading axis-1 entries and each twin a conjugate read of the
+# Hermitian spectrum.
 # =============================================================================
 
 # How a real field's point plan is built and where its twins are read.
@@ -242,13 +242,13 @@ function _point_plan(t::_FTBLibrary, exec, g, ::Type{T}, ms::NTuple{D, Int}, bat
     dev = _on_device(exec)
     C = _chunk(_batch_default(t, B, nth, dev), B, batch_chunk)
     realplan = R && _real_values(t)
-    ns = (R && !realplan) ? Packing.hermitian_request_size(ms) : ms
+    ns = (R && !realplan) ? FTB.hermitian_request_size(ms) : ms
     VT = realplan ? Tr : Complex{Tr}
     plan = FTB.plan_nufft(t, VT, ntuple(d -> _to_exec(exec, coords[d]), Val(D)), ns; ntrans = C,
         tol = _nufft_tol(Tr, eps), order = FTB.FFTModes(), period = Ls, origin = offsets, nthreads = nth,
         iflag = R ? -1 : -iflag)
     dims = FTB.mode_size(plan)
-    pms = Packing.packed_size(ms, Val(R))
+    pms = FTB.packed_size(ms, Val(R))
     ks_phys = Grids.physical_wavenumbers(Ls, ms, Val(R))
     ks, twins = if !R
         ks_phys, ()
@@ -353,6 +353,42 @@ _calculate_spectrum_gpu_nufft(t::_FTBLibrary, exec::ComputationalBackends.Abstra
 # dim of the working array a transform of the batch. `iflag` is FlowTransformBindings' sign.
 # =============================================================================
 
+# An array of size `sz` read as `(pre, N_d, post)` along axis `d`: `pre` the product of the sizes below `d`,
+# `post` of those above. Line `r` of the `pre·post` lines starts at `mod1(r, pre) + ((r - 1) ÷ pre)·pre·N_d`.
+@inline function _axis_layout(sz::NTuple{N, Int}, d::Int) where {N}
+    pre = 1
+    for i in 1:(d - 1)
+        pre *= sz[i]
+    end
+    post = 1
+    for i in (d + 1):N
+        post *= sz[i]
+    end
+    return pre, sz[d], post
+end
+
+# `sz` with axis `d` transformed to `m` modes.
+@inline _axis_out_size(sz::NTuple{N, Int}, d::Int, m::Int) where {N} = ntuple(i -> i == d ? m : sz[i], Val(N))
+
+# The working array entering pass `d`: axes below `d` at their `ns` modes, the rest at their `Ns` points,
+# the batch after them.
+@inline _axis_work_shape(Ns::NTuple{D, Int}, ns::NTuple{D, Int}, d::Int, batch::Tuple) where {D} =
+    (ntuple(i -> i < d ? ns[i] : Ns[i], Val(D))..., batch...)
+
+# Starting linear indices of lines `base+1 … base+nvalid` in the input (`Nd` per line) and the output (`m`
+# per line).
+@inline function _axis_chunk_offsets!(inoff::Vector{Int}, outoff::Vector{Int}, base::Int, nvalid::Int,
+        pre::Int, Nd::Int, m::Int)
+    @inbounds for t in 1:nvalid
+        r = base + t
+        a = mod1(r, pre)
+        c = (r - 1) ÷ pre
+        inoff[t] = a + c * pre * Nd
+        outoff[t] = a + c * pre * m
+    end
+    return nothing
+end
+
 """
     NUFFTAxisPass
 
@@ -382,7 +418,7 @@ function _axis_pass(t::_FTBLibrary, exec, ::Type{Tr}, insize::Tuple, d::Int, axi
         m::Int, rng, off, tol, batch_chunk; iflag::Int = -1) where {Tr}
     Nd = length(axis)
     insize[d] == Nd || throw(DimensionMismatch("axis $d: working length $(insize[d]) ≠ grid axis length $Nd"))
-    pre, _, post = Packing.axis_layout(insize, d)
+    pre, _, post = _axis_layout(insize, d)
     rest = pre * post
     nth = _backend_nthreads(exec)
     dev = _on_device(exec)
@@ -397,14 +433,14 @@ end
 # Transform axis `d` of `A` into `out`, whose dim `d` holds `ap.m` modes. On the host the lines are
 # gathered straight out of `A` and scattered straight into `out`, so neither is permuted.
 function _axis_run!(out::Array, A::Array, d::Int, ap::NUFFTAxisPass)
-    pre, Nd, post = Packing.axis_layout(size(A), d)
+    pre, Nd, post = _axis_layout(size(A), d)
     Nd == ap.Nd || throw(DimensionMismatch("axis $d: field length $Nd ≠ this plan's grid axis length $(ap.Nd)"))
     m, C = ap.m, ap.C
     V, U = ap.values, ap.modes
     rest = pre * post
     for base in 0:C:(rest - 1)
         nvalid = min(C, rest - base)
-        Packing.axis_chunk_offsets!(ap.inoff, ap.outoff, base, nvalid, pre, Nd, m)
+        _axis_chunk_offsets!(ap.inoff, ap.outoff, base, nvalid, pre, Nd, m)
         @inbounds for i in 1:Nd
             s = (i - 1) * pre
             for c in 1:nvalid
@@ -451,7 +487,7 @@ function _axis_nufft(t::_FTBLibrary, exec::ComputationalBackends.AbstractExecuti
         batch_chunk = nothing, kwargs...) where {Tr}
     ap = _axis_pass(t, exec, Tr, size(A), d, axis, m, rng, off, eps, batch_chunk)
     try
-        return _axis_run!(_alloc(exec, Complex{Tr}, Packing.axis_out_size(size(A), d, m)...), A, d, ap)
+        return _axis_run!(_alloc(exec, Complex{Tr}, _axis_out_size(size(A), d, m)...), A, d, ap)
     finally
         _close!(ap)
     end
@@ -523,13 +559,13 @@ function Plans.plan_spectrum(t::_FTBLibrary,
     Ns = ntuple(d -> length(axs[d]), Val(D))
     npts = prod(Ns)
     ntrans = prod(batch; init = 1)
-    ns = R ? Packing.hermitian_request_size(ms) : ms
+    ns = R ? FTB.hermitian_request_size(ms) : ms
     tol = _nufft_tol(Tr, eps)
     sgn = R ? -1 : -iflag
-    work = ntuple(d -> _alloc(exec, Complex{Tr}, Packing.axis_work_shape(Ns, ns, d, batch)...), Val(D + 1))
+    work = ntuple(d -> _alloc(exec, Complex{Tr}, _axis_work_shape(Ns, ns, d, batch)...), Val(D + 1))
     axes = ntuple(d -> _axis_pass(t, exec, Tr, size(work[d]), d, axs[d], ns[d], ranges[d], offsets[d], tol,
         batch_chunk; iflag = sgn), Val(D))
-    pms = Packing.packed_size(ms, Val(R))
+    pms = FTB.packed_size(ms, Val(R))
     ks_phys = Grids.physical_wavenumbers(ranges, ms, Val(R))
     ks, twins = R ? _twin_set(exec, Tr, ks_phys, ms, ns, npts, batch; conjugate = true) : (ks_phys, ())
     qwh = Grids.quadrature_scale(g, Tr, npts)
@@ -612,7 +648,7 @@ end
 
 # =============================================================================
 # Synthesis: a complex type 2 on the full native spectrum. A real field's packed half is first completed by
-# `Packing.unpacked` with its Nyquist twin, and the real part taken. The forward publishes `C = fk / M`
+# `FlowTransformBindings.unpacked!` with its Nyquist twin, and the real part taken. The forward publishes `C = fk / M`
 # measured from each direction's origin, the point positions `y` the type 2 folds, so it evaluates
 # `Σ C e^{+iflag·ik·y}` as given.
 # =============================================================================
@@ -682,11 +718,11 @@ function Plans.synthesize!(out::AbstractArray, p::NUFFTSynthesisPlan{T, D, R}, c
         ks = nothing) where {T, D, R}
     size(out) == Plans.field_size(p) || throw(DimensionMismatch(
         "out is $(size(out)); this plan writes $(Plans.field_size(p))"))
-    sz = Packing.packed_size(p.ms, Val(R))
+    sz = FTB.packed_size(p.ms, Val(R))
     size(coeffs)[1:D] == sz || throw(DimensionMismatch(
         "this plan expects $(sz) on the spectral dims; got $(size(coeffs)[1:D])"))
     full = if R
-        Packing.unpacked!(p.full, reshape(coeffs, sz..., p.ntrans), p.ms, ks)
+        FTB.unpacked!(p.full, reshape(coeffs, sz..., p.ntrans), p.ms, ks)
         p.full
     else
         reshape(coeffs, p.ms..., p.ntrans)
@@ -733,7 +769,7 @@ function _synthesize(t::_FTBLibrary, exec::Union{_HostExec, ComputationalBackend
                  Grids.PointwiseCartesian},
         coeffs::AbstractArray{Complex{Tr}}, ms::NTuple{D, Int}; real_output::Bool = true, iflag::Int = 1,
         ks = nothing, eps = nothing, batch_chunk = nothing, kwargs...) where {Tr <: Real, D}
-    sz = Packing.packed_size(ms, Val(real_output))
+    sz = FTB.packed_size(ms, Val(real_output))
     size(coeffs)[1:D] == sz || throw(DimensionMismatch(
         "real_output=$(real_output) expects $(sz) on the spectral dims; got $(size(coeffs)[1:D])."))
     batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)

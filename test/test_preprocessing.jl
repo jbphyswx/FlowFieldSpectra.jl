@@ -8,6 +8,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -26,7 +27,7 @@ pp_cart(L, N) = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}()
 function pp_parseval(ks, c)
     s = 0.0
     for I in CartesianIndices(size(c))
-        s += FFS.Packing.mode_fold(ks, I) * abs2(c[I])
+        s += FTB.mode_fold(ks, I) * abs2(c[I])
     end
     return s
 end
@@ -43,7 +44,7 @@ Test.@testset "A taper preserves variance, so Parseval survives it" begin
     for win in (FFS.NoWindow(), FFS.Hann(), FFS.Hamming(), FFS.Blackman(), FFS.Tukey(0.4))
         spec = FFS.Preprocess(; detrend = FFS.NoDetrend(), window = win)
         c, ks = FFS.calculate_spectrum(g, f, (N, N); preprocess = spec, execution = PP_SER)
-        Test.@test size(c) == FFS.Packing.packed_size((N, N), Val(true))
+        Test.@test size(c) == FTB.packed_size((N, N), Val(true))
         # The tapered field's own mean square, which the coefficients must reproduce.
         _, ftap, _ = FFS.preprocess_field(g, f, spec)
         Test.@test isapprox(pp_parseval(ks, c), sum(abs2, ftap) / length(ftap); rtol = 1e-10)
@@ -130,7 +131,7 @@ Test.@testset "Zero padding narrows the wavenumber spacing" begin
         preprocess = FFS.Preprocess(; detrend = FFS.NoDetrend(), pad = 2.0))
 
     # Twice the modes per axis, at half the spacing, over the same wavenumber range.
-    Test.@test size(c2) == FFS.Packing.packed_size((2N, 2N), Val(true))
+    Test.@test size(c2) == FTB.packed_size((2N, 2N), Val(true))
     dk0 = ks0[1][2] - ks0[1][1]
     dk2 = ks2[1][2] - ks2[1][1]
     Test.@test isapprox(dk2, dk0 / 2; rtol = 1e-12)
@@ -205,7 +206,7 @@ Test.@testset "Preprocessing composes with the batch axis and the backends" begi
     spec = FFS.Preprocess(; detrend = FFS.Demean(), window = FFS.Hann())
 
     c, _ = FFS.calculate_spectrum(g, fb, (N, N); preprocess = spec, execution = PP_SER)
-    Test.@test size(c) == (FFS.Packing.packed_size((N, N), Val(true))..., 2)
+    Test.@test size(c) == (FTB.packed_size((N, N), Val(true))..., 2)
     # Detrending runs before the taper, and a taper reweights the samples, so a demeaned field carries a
     # small mean again afterwards. What the pairing gives is a DC mode far below the untrended one.
     cw, _ = FFS.calculate_spectrum(g, fb, (N, N); execution = PP_SER,

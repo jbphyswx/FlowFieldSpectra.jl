@@ -2,6 +2,7 @@ module FlowFieldSpectraOhMyThreadsExt
 
 using OhMyThreads: OhMyThreads as OMT
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using FlowGeometries: FlowGeometries
 
@@ -183,7 +184,7 @@ function FFS._synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend
     axes, ks = geo === nothing ? FFS.DirectSum.phase_geometry(g, FT, ms, Val(true)) : geo
     ss = size(g)
     Npts = prod(ss)
-    pms = FFS.Packing.packed_size(ms, Val(true))
+    pms = FTB.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ Npts
     O = reshape(out, Npts, B)
@@ -194,7 +195,7 @@ function FFS._synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend
         @inbounds begin
             P = spat[pj]
             for (mi, I) in enumerate(modes)
-                nyq = FFS.Packing.is_nyquist(ks[1], I[1])
+                nyq = FTB.is_nyquist(ks[1], I[1])
                 W = nyq ? zero(Complex{FT}) : cis(iflag * FFS.DirectSum._phase_tensor(ks, axes, I, P, FT))
                 Wn = I[1] > 1 ? cis(iflag * FFS.DirectSum._phase_tensor_neg(ks, axes, I, P, FT)) : zero(Complex{FT})
                 for b in 1:B
@@ -214,7 +215,7 @@ function FFS._synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend
         coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing) where {FT, D}
     coords, ks = geo === nothing ? FFS.DirectSum.phase_geometry(g, FT, ms, Val(true)) : geo
     N = length(coords[1])
-    pms = FFS.Packing.packed_size(ms, Val(true))
+    pms = FTB.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ N
     O = reshape(out, N, B)
@@ -223,7 +224,7 @@ function FFS._synthesize_packed!(::ComputationalBackends.AbstractThreadedBackend
     OMT.@tasks for j in 1:N
         @inbounds begin
             for (mi, I) in enumerate(modes)
-                nyq = FFS.Packing.is_nyquist(ks[1], I[1])
+                nyq = FTB.is_nyquist(ks[1], I[1])
                 W = nyq ? zero(Complex{FT}) : cis(iflag * FFS.DirectSum._phase_scattered(ks, coords, I, j, FT))
                 Wn = I[1] > 1 ? cis(iflag * FFS.DirectSum._phase_scattered_neg(ks, coords, I, j, FT)) : zero(Complex{FT})
                 for b in 1:B
@@ -257,11 +258,7 @@ function FFS._synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBack
         @inbounds begin
             P = spat[pj]
             for (mi, I) in enumerate(modes)
-                phi = zero(FT)
-                for d in 1:D
-                    phi += ks[d][I[d]] * FT(axes[d][P[d]])
-                end
-                W = cis(iflag * phi)
+                W = cis(iflag * FFS.DirectSum._phase_tensor(ks, axes, I, P, FT))
                 for b in 1:B
                     O[pj, b] += C[mi, b] * W
                 end
@@ -285,11 +282,7 @@ function FFS._synthesize_cartesian!(::ComputationalBackends.AbstractThreadedBack
     OMT.@tasks for j in 1:N
         @inbounds begin
             for (mi, I) in enumerate(modes)
-                phi = zero(FT)
-                for d in 1:D
-                    phi += ks[d][I[d]] * FT(coords[d][j])
-                end
-                W = cis(iflag * phi)
+                W = cis(iflag * FFS.DirectSum._phase_scattered(ks, coords, I, j, FT))
                 for b in 1:B
                     O[j, b] += C[mi, b] * W
                 end

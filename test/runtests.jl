@@ -29,12 +29,12 @@ using FlowGeometries: FlowGeometries as FG
 _cg(::Type{T}) where {T} = FG.Geometry.CartesianGeometry{T}()
 
 # Packed coefficient size for a Cartesian transform of full sizes `ms`: a real field halves axis 1.
-pks(ms::Tuple, real::Bool = true) = FFS.Packing.packed_size(NTuple{length(ms), Int}(ms), Val(real))
+pks(ms::Tuple, real::Bool = true) = FTB.packed_size(NTuple{length(ms), Int}(ms), Val(real))
 
 # Two-sided Parseval sum over a packed spectrum: each stored mode counts with its fold weight, so this
 # equals `mean(abs2, field)` under the 1/∏N normalization on any layout.
 parseval(ks::Tuple, c::AbstractArray) =
-    sum(I -> FFS.Packing.mode_fold(ks, I) * abs2(c[I]), CartesianIndices(c))
+    sum(I -> FTB.mode_fold(ks, I) * abs2(c[I]), CartesianIndices(c))
 
 # Uniform Cartesian grid from per-axis point counts + periodic domain lengths.
 function ucg(::Type{T}, domain::Tuple, n::Tuple) where {T}
@@ -113,7 +113,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         # `unpacked` restores the full native cube, which the complex transform produces directly.
         c_cplx, _ = FFS.calculate_spectrum(g, ComplexF64.(cat(u, v; dims = 3)), ms; transform = SB.FFTSpectralBackend())
         Test.@test size(c_cplx) == (ms..., 2)
-        Test.@test isapprox(FFS.unpacked(c_fft, ms), c_cplx; atol = 1e-12)
+        Test.@test isapprox(FTB.unpacked(c_fft, ms), c_cplx; atol = 1e-12)
 
         k_bins, E_k = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 8, dims = 3)
         Test.@test length(k_bins) == 8
@@ -484,7 +484,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
             c_cplx, _ = FFS.calculate_spectrum(g, ComplexF64.(f), ms; transform = SB.FFTSpectralBackend())
             Test.@test size(c_real) == pks(ms)
             Test.@test size(c_cplx) == ms
-            Test.@test isapprox(FFS.unpacked(c_real, ms), c_cplx; atol = 1e-12)
+            Test.@test isapprox(FTB.unpacked(c_real, ms), c_cplx; atol = 1e-12)
         end
     end
 
@@ -624,9 +624,9 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         urec = FFS.synthesize(g, coeffs, (N, N); transform = ds, ks = kk)
         Test.@test eltype(urec) === Float64
         Test.@test isapprox(urec, u; atol = 1e-10)
-        ufull = FFS.synthesize(g, FFS.unpacked(coeffs, (N, N)), (N, N); transform = ds, real_output = false)
+        ufull = FFS.synthesize(g, FTB.unpacked(coeffs, (N, N)), (N, N); transform = ds, real_output = false)
         Test.@test isapprox(real.(ufull), u; atol = 1e-10)
-        Test.@test_throws DimensionMismatch FFS.synthesize(g, FFS.unpacked(coeffs, (N, N)), (N, N); transform = ds)
+        Test.@test_throws DimensionMismatch FFS.synthesize(g, FTB.unpacked(coeffs, (N, N)), (N, N); transform = ds)
 
         lmax = 6; Nθ, Nφ = lmax + 1, 2lmax + 1
         N_pts = 4 * Nθ * Nφ

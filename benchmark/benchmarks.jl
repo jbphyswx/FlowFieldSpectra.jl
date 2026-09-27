@@ -147,7 +147,7 @@ for N in [128, 256, 512]
     f = randn(N, N)
     ms = (N, N)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.FFTSpectralBackend())
-    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
     SUITE["plans"]["fft_N=$N"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.FFTSpectralBackend())
     SUITE["plans"]["fft_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -164,7 +164,7 @@ for N in [64, 128, 256]
     f = randn(N, N)
     ms = (N, N)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.FFTSpectralBackend())
-    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
     SUITE["plans"]["hybrid_N=$N"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.FFTSpectralBackend())
     SUITE["plans"]["hybrid_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -182,7 +182,7 @@ for M in [10_000, 100_000]
         periodic = (true, true), period = (L, L))
     f = randn(M)
     p = FFS.plan_spectrum(g, Float64, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
-    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
     SUITE["plans"]["nufft_M=$M"]["one_shot"] = @benchmarkable FFS.calculate_spectrum($g, $f, $ms;
         transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
     SUITE["plans"]["nufft_M=$M"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -200,7 +200,7 @@ for N in [32, 64, 128]
     f = randn(N, N)
     ms = (N, N)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
-    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
     SUITE["plans"]["directsum_N=$N"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
     SUITE["plans"]["directsum_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -217,7 +217,7 @@ for M in [2_000, 8_000]
         periodic = (true, true), period = (L, L))
     f = randn(M)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
-    buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
     SUITE["plans"]["directsum_cloud_M=$M"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
     SUITE["plans"]["directsum_cloud_M=$M"]["plan_exec"] =

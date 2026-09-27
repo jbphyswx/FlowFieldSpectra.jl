@@ -55,7 +55,7 @@ function _zero_profile(N::Int)
     # Explicit SerialBackend: the zero-alloc guarantee is for the serial path. A ThreadedBackend plan
     # (what AutoBackend resolves to under `-t≥2`) carries FFTW/FINUFFT's internal task-spawn floor — a
     # real library cost, not a leak — so it is a bound, not `== 0`.
-    pms = FFS.Packing.packed_size(ms, Val(true))              # real fields ⇒ packed half on axis 1
+    pms = FTB.packed_size(ms, Val(true))                      # real fields ⇒ packed half on axis 1
 
     fplan = FFS.plan_spectrum(ug, Float64, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
     cf = zeros(ComplexF64, pms...)

@@ -8,7 +8,6 @@ using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
 
-include("Packing.jl")
 include("Grids.jl")
 include("Preprocessing.jl")
 include("Normalization.jl")
@@ -21,7 +20,6 @@ include("Operators.jl")
 include("Averaging.jl")
 include("LombScargle.jl")
 
-using .Packing: Packing, unpacked, unpacked!
 using .Grids: Grids, physical_wavenumbers
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling,
@@ -49,7 +47,6 @@ export coefficient_size, coefficient_type, wavenumbers, allocate_coefficients
 export AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 # APIs
 export calculate_spectrum, calculate_spectrum!, synthesize, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index, sph_coeff_type
-export unpacked, unpacked!
 export spectral_divergence, spectral_divergence!, spectral_vorticity, spectral_vorticity!,
     compensate, band_energy
 export cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
@@ -396,7 +393,7 @@ function calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, box = nothing, kwargs...) where {D}
     prob = TransformProblem(g, field)
-    pms = Packing.packed_size(ms, Val(eltype(field) <: Real))
+    pms = FTB.packed_size(ms, Val(eltype(field) <: Real))
     coeffs = zeros(Complex{eltype(g)}, pms..., batch_shape(prob)...)
     ks = _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag, box)
     return coeffs, ks
@@ -529,13 +526,13 @@ function _hybrid_derive(g, ::Type{Tr}, ms::NTuple{D, Int}, umask::NTuple{D, Bool
     need_twin = any(d -> !umask[d] && iseven(ms[d]), 2:D)
     halve = R && !need_twin
     neg = iflag < 0
-    pms = Packing.packed_size(ms, Val(true))
+    pms = FTB.packed_size(ms, Val(true))
     # Spectrum extents entering the publish: axis 1 is already halved by an `rfft` pass.
     nsx = ntuple(d -> (d == 1 && halve) ? pms[1] : ms[d], Val(D))
     # Each stretched axis is asked for `ms[d]` modes; a uniform axis keeps its own length.
     ns = ms
     ks_phys = physical_wavenumbers(ranges, ms, Val(R))
-    ks, twins = (R && need_twin) ? Packing.conj_twins(Tr, ks_phys, ms, nsx, npts, batch) : (ks_phys, ())
+    ks, twins = (R && need_twin) ? FTB.conj_twins(Tr, ks_phys, ms, nsx, npts, batch) : (ks_phys, ())
     # `ks_phys` carries no twin; a device path builds its own device-resident twins from it.
     return (; Ns, npts, axs, offs_all, ranges, udims, sdims, epsv, need_twin, halve, neg,
         pms, nsx, ns, scale = one(Tr) / npts, ks, ks_phys, twins)
@@ -558,8 +555,8 @@ function _calculate_spectrum_hybrid(t::SpectralBackends.AbstractNUFFTSpectralBac
     end
     if R
         coeffs = Array{Complex{Tr}}(undef, h.pms..., batch...)
-        Packing.publish_packed!(coeffs, W, h.scale, h.nsx, h.pms, ntrans, h.neg)
-        Packing.gather_conj_twins!(h.twins, W, prod(h.nsx), ntrans, h.neg)
+        FTB.publish_packed!(coeffs, W, h.scale, h.nsx, h.pms, ntrans, h.neg)
+        FTB.gather_conj_twins!(h.twins, W, prod(h.nsx), ntrans, h.neg)
         return coeffs, h.ks
     end
     h.neg && (W .= conj.(W))                     # closes the conjugation applied to the input
@@ -641,7 +638,7 @@ function _hybrid_plan(nufft::SpectralBackends.AbstractSpectralBackend,
         ap = _axis_nufft_plan(t, exec, Tr, cur, d, h.axs[d], h.ns[d], h.ranges[d], h.offs_all[d],
             h.epsv; kwargs...)
         push!(axplans, ap)
-        cur = Packing.axis_out_size(cur, d, h.ns[d])
+        cur = _axis_out_size(cur, d, h.ns[d])
         push!(work, Array{Complex{Tr}}(undef, cur...))
     end
     wt = Tuple(work)
@@ -680,8 +677,8 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::HybridPlan
         W = _axis_nufft_exec!(plan.work[i + 1], plan.axes[i], W, d)
     end
     if R
-        Packing.publish_packed!(coeffs, W, plan.scale, plan.nsx, plan.pms, plan.ntrans, plan.neg)
-        Packing.gather_conj_twins!(plan.twins, W, prod(plan.nsx), plan.ntrans, plan.neg)
+        FTB.publish_packed!(coeffs, W, plan.scale, plan.nsx, plan.pms, plan.ntrans, plan.neg)
+        FTB.gather_conj_twins!(plan.twins, W, prod(plan.nsx), plan.ntrans, plan.neg)
     else
         plan.neg ? (coeffs .= conj.(W) .* plan.scale) : (coeffs .= W .* plan.scale)
     end
@@ -744,7 +741,7 @@ end
 # otherwise fall back to is correct only under uniform sampling.
 function _twin_for_inverse(g, ms::NTuple{D, Int}, ks) where {D}
     if ks !== nothing
-        return Packing.axis_twin(ks[1])
+        return FTB.axis_twin(ks[1])
     end
     needed = D >= 2 && !FlowGeometries.Grids.isuniform(g) && any(d -> iseven(ms[d]), 2:D)
     needed && throw(ArgumentError(
@@ -762,7 +759,7 @@ function _synthesize(::SpectralBackends.AbstractDirectSumSpectralBackend,
     ss = size(g)
     FT = eltype(g)
     if real_output
-        pms = Packing.packed_size(ms, Val(true))
+        pms = FTB.packed_size(ms, Val(true))
         size(coeffs)[1:D] == pms || throw(DimensionMismatch(
             "real_output=true expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D]). " *
             "Pass real_output=false for a full native spectrum $(ms)."))
@@ -862,7 +859,7 @@ function _synthesize_into!(out::AbstractArray, plan::DirectSumSynthesisPlan{FT, 
     ms = plan.ms
     D = length(ms)
     if R
-        pms = Packing.packed_size(ms, Val(true))
+        pms = FTB.packed_size(ms, Val(true))
         size(coeffs)[1:D] == pms || throw(DimensionMismatch(
             "a real-field plan expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D])"))
         _synthesize_packed!(plan.exec, out, g, coeffs, ms, plan.iflag, _twin_for_inverse(g, ms, ks), plan.setup)
@@ -923,7 +920,7 @@ function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::SpectralBacke
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {T, D}
     Plans._check_coefficients(coeffs,
-        (Packing.packed_size(ms, Val(eltype(field) <: Real))..., Grids.field_batch_shape(g, field)...))
+        (FTB.packed_size(ms, Val(eltype(field) <: Real))..., Grids.field_batch_shape(g, field)...))
     return _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag)
 end
 
@@ -1253,7 +1250,7 @@ _partitionable(::SpectralBackends.AbstractSpectralBackend) = false
 # Spatial (spectral) shape of the coefficient array for a grid + `ms`, given whether the field is real
 # (a real Cartesian transform halves axis 1).
 _coeff_spatial(::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, ms, R::Bool) =
-    Packing.packed_size(NTuple{length(ms), Int}(Tuple(ms)), Val(R))
+    FTB.packed_size(NTuple{length(ms), Int}(Tuple(ms)), Val(R))
 _coeff_spatial(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ms, ::Bool) = (ms[1], 2 * (ms[1] - 1) + 1)
 
 # Element type of the coefficient array for a grid + field element type, without running a transform: a
@@ -1283,27 +1280,27 @@ function _combine_twins(ks::Tuple, twins::Tuple, weights)
         end
         acc
     end
-    return (Packing.with_twin(ks[1], Packing.NyquistTwin(slices)), Base.tail(ks)...)
+    return (FTB.with_twin(ks[1], FTB.NyquistTwin(slices)), Base.tail(ks)...)
 end
 
 # The twin a `ks` carries on its halved axis, if any.
-_ks_twin(ks::Tuple) = Packing.axis_twin(ks[1])
+_ks_twin(ks::Tuple) = FTB.axis_twin(ks[1])
 
 # Batch-partition twin assembly: each worker's slices cover its own batch columns, so they scatter into
 # full-batch slices along the trailing axis. A worker slice is `(shape…, nb)` for its `nb` columns.
 _alloc_batch_twins(::Nothing, B::Int) = nothing
-_alloc_batch_twins(t::Packing.NyquistTwin, B::Int) =
+_alloc_batch_twins(t::FTB.NyquistTwin, B::Int) =
     map(s -> zeros(eltype(s), ntuple(i -> size(s, i), ndims(s) - 1)..., B), t.slices)
 
 # Zeroed full-batch twin buffers sized from `ms` alone, so a rank that received no batch columns agrees
 # on the shapes with the ranks that did.
 _alloc_twins(::Type{C}, ms::NTuple{D, Int}, B::Int) where {C, D} =
-    ntuple(Packing.n_twin_slices(Val(D))) do mask
-        zeros(C, Packing.twin_slice_shape(ms, mask)..., B)
+    ntuple(FTB.n_twin_slices(Val(D))) do mask
+        zeros(C, FTB.twin_slice_shape(ms, mask)..., B)
     end
 
 _scatter_batch_twins!(::Nothing, ::Any, bc, B::Int) = nothing
-function _scatter_batch_twins!(dst::Tuple, t::Packing.NyquistTwin, bc, B::Int)
+function _scatter_batch_twins!(dst::Tuple, t::FTB.NyquistTwin, bc, B::Int)
     for (d, s) in zip(dst, t.slices)
         isempty(d) && continue
         shape = ntuple(i -> size(d, i), ndims(d) - 1)
@@ -1315,7 +1312,7 @@ end
 _reshape_batch_twins(ks::Tuple, ::Nothing, batch::Tuple) = ks
 function _reshape_batch_twins(ks::Tuple, dst::Tuple, batch::Tuple)
     slices = map(d -> reshape(d, ntuple(i -> size(d, i), ndims(d) - 1)..., batch...), dst)
-    return (Packing.with_twin(ks[1], Packing.NyquistTwin(slices)), Base.tail(ks)...)
+    return (FTB.with_twin(ks[1], FTB.NyquistTwin(slices)), Base.tail(ks)...)
 end
 
 include("NUFFT.jl")

@@ -10,6 +10,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -139,7 +140,7 @@ Test.@testset "Auto on the in-place and plan entries" begin
     f = randn(N, N)
 
     # The grid form of `calculate_spectrum!` is the direct sum's, so Auto names it there.
-    buf = zeros(ComplexF64, FFS.Packing.packed_size((N, N), Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size((N, N), Val(true))...)
     ks = FFS.calculate_spectrum!(buf, g, f, (N, N); execution = AT_SER)
     cd, _ = FFS.calculate_spectrum(g, f, (N, N); transform = AT_DS, execution = AT_SER)
     Test.@test at_rel(buf, cd) < 1e-12
@@ -147,12 +148,12 @@ Test.@testset "Auto on the in-place and plan entries" begin
     # `plan_spectrum` resolves Auto to a library plan, and the direct sum has one of its own.
     p = FFS.plan_spectrum(g, Float64, (N, N); execution = AT_SER)
     Test.@test p isa FFS.AbstractSpectralPlan
-    pbuf = zeros(ComplexF64, FFS.Packing.packed_size((N, N), Val(true))...)
+    pbuf = zeros(ComplexF64, FTB.packed_size((N, N), Val(true))...)
     FFS.calculate_spectrum!(pbuf, p, f)
     Test.@test at_rel(pbuf, cd) < 1e-10
     pd = FFS.plan_spectrum(g, Float64, (N, N); transform = AT_DS, execution = AT_SER)
     Test.@test pd isa FFS.DirectSumCartesianPlan
-    dbuf = zeros(ComplexF64, FFS.Packing.packed_size((N, N), Val(true))...)
+    dbuf = zeros(ComplexF64, FTB.packed_size((N, N), Val(true))...)
     FFS.calculate_spectrum!(dbuf, pd, f)
     Test.@test at_rel(dbuf, cd) == 0.0
 end

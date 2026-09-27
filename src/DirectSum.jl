@@ -1,9 +1,9 @@
 module DirectSum
 
 using FlowGeometries: FlowGeometries
+using FlowTransformBindings: FlowTransformBindings as FTB
 using LinearAlgebra: LinearAlgebra as LA
 using ..Grids: Grids
-using ..Packing: Packing
 using ..SphericalKernels: SphericalKernels
 
 export sph_mode_index
@@ -28,14 +28,17 @@ export sph_mode_index
     return CartesianIndex(row, col)
 end
 
-# Phase argument Σ_d ks[d][K[d]] · x_d, Val-unrolled over the type-parameter dim count so each tuple
-# index is a compile-time constant. This stays type-stable and allocation-free even when `@inbounds`
-# is disabled (as under `--check-bounds=yes`, how `Pkg.test` runs) — a plain `for d in 1:D` loop
-# indexing the heterogeneous `ks`/`axes`/`coords` tuples at a runtime `d` can otherwise box.
+# Phase argument Σ_d ks[d][K[d]] · x_d. `ks` mixes axis types, so its terms come from `map` over the
+# tuples, which types each term by its own axis; indexing `ks` at a loop variable, or at a closure
+# argument the compiler declines to inline, boxes the axis on every call.
+@inline _phase_terms(ks::Tuple, axes::Tuple, K::CartesianIndex, P::CartesianIndex, ::Type{FT}) where {FT} =
+    map((k, x, i, p) -> FT(k[i]) * FT(x[p]), ks, axes, Tuple(K), Tuple(P))
+@inline _phase_terms(ks::Tuple, coords::Tuple, K::CartesianIndex, j::Int, ::Type{FT}) where {FT} =
+    map((k, x, i) -> FT(k[i]) * FT(x[j]), ks, coords, Tuple(K))
 @inline _phase_tensor(ks::Tuple, axes::Tuple, K::CartesianIndex{D}, P::CartesianIndex{D}, ::Type{FT}) where {D, FT} =
-    sum(ntuple(d -> FT(ks[d][K[d]]) * FT(axes[d][P[d]]), Val(D)))
+    sum(_phase_terms(ks, axes, K, P, FT))
 @inline _phase_scattered(ks::Tuple, coords::Tuple, K::CartesianIndex{D}, j::Int, ::Type{FT}) where {D, FT} =
-    sum(ntuple(d -> FT(ks[d][K[d]]) * FT(coords[d][j]), Val(D)))
+    sum(_phase_terms(ks, coords, K, j, FT))
 
 # One axis's dense 1-D DFT matrix `Wₐₚ = exp(−iflag·i·k_a·x_p)`, `(m × n)` with `m` the packed mode count
 # along this axis and `n` the point count. Uniform or nonuniform `xaxis`.
@@ -180,10 +183,10 @@ function cart_setup(::TensorCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::
     R = T <: Real
     ss = size(g)
     xs, ks = phase_geometry(g, FT, ms, Val(R), box)
-    pms = Packing.packed_size(ms, Val(R))
+    pms = FTB.packed_size(ms, Val(R))
     return (; ks, pms, Npts = prod(ss), iflag,
         fwd = _contraction(FT, ks, xs, ss, pms, batch, iflag),
-        twin = _twin_setup(TensorCartesian(), g, xs, T, ms, pms, ks, batch, iflag, FT))
+        twin = _twin_setup(TensorCartesian(), g, xs, T, ms, ks, batch, iflag, FT))
 end
 
 function cart_setup(::CloudCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple,
@@ -191,9 +194,9 @@ function cart_setup(::CloudCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::T
     FT = real(float(T))
     R = T <: Real
     coords, ks = phase_geometry(g, FT, ms, Val(R), box)
-    pms = Packing.packed_size(ms, Val(R))
+    pms = FTB.packed_size(ms, Val(R))
     return (; ks, pms, coords, N = length(coords[1]), iflag,
-        twin = _twin_setup(CloudCartesian(), g, coords, T, ms, pms, ks, batch, iflag, FT))
+        twin = _twin_setup(CloudCartesian(), g, coords, T, ms, ks, batch, iflag, FT))
 end
 
 """
@@ -271,11 +274,6 @@ end
 # hyperplane.
 # =============================================================================
 
-# Shape of the `mask` slice: masked axes collapse to their single `+N_d/2` mode, and an odd axis has
-# none, which empties that slice.
-@inline _twin_shape(ms::NTuple{D, Int}, pms::NTuple{D, Int}, mask::Int) where {D} =
-    ntuple(e -> Packing.in_nyquist_mask(mask, e) ? (iseven(ms[e]) ? 1 : 0) : pms[e], Val(D))
-
 # Axis `d`'s wavenumbers under `mask`, length `m`: the single `+N_d/2` when masked, `k₁` as stored on
 # axis 1, and `−k_d` elsewhere. The stored `−N_d/2` sits at index `n÷2+1`, so its negative is `+N_d/2`.
 # The axis is materialized once per `(mask, d)`: reading `ks[d]` per MODE instead boxes the mixed
@@ -283,7 +281,7 @@ end
 function _twin_kaxis(::Type{FT}, ks::Tuple, ms::NTuple{D, Int}, mask::Int, d::Int, m::Int) where {FT, D}
     v = Vector{FT}(undef, m)
     kd = ks[d]
-    if Packing.in_nyquist_mask(mask, d)
+    if FTB.in_nyquist_mask(mask, d)
         m == 1 && (v[1] = -FT(kd[ms[d] ÷ 2 + 1]))
     else
         s = d == 1 ? one(FT) : -one(FT)
@@ -302,18 +300,18 @@ end
 # outright, `D == 1`'s twins are conjugates so the mirror is already exact, and uniform sampling makes
 # `exp(±i(N_d/2)x_j)` the same vector, so a uniform grid's twins equal their negated-index partners.
 # `isuniform` reads the axis types, so that branch resolves at compile time.
-_twin_setup(l, g, xs, ::Type{T}, ms, pms, ks, batch, iflag::Int, ::Type{FT}) where {T, FT} = nothing
+_twin_setup(l, g, xs, ::Type{T}, ms, ks, batch, iflag::Int, ::Type{FT}) where {T, FT} = nothing
 function _twin_setup(l, g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        xs::Tuple, ::Type{T}, ms::NTuple{D, Int}, pms::NTuple{D, Int}, ks::Tuple, batch::Tuple, iflag::Int,
+        xs::Tuple, ::Type{T}, ms::NTuple{D, Int}, ks::Tuple, batch::Tuple, iflag::Int,
         ::Type{FT}) where {T <: Real, FT, D}
     (D >= 2 && !FlowGeometries.Grids.isuniform(g)) || return nothing
-    nm = Packing.n_twin_slices(Val(D))
-    shapes = ntuple(mask -> _twin_shape(ms, pms, mask), nm)
+    nm = FTB.n_twin_slices(Val(D))
+    shapes = ntuple(mask -> FTB.twin_slice_shape(ms, mask), nm)
     kax = ntuple(mask -> ntuple(d -> _twin_kaxis(FT, ks, ms, mask, d, shapes[mask][d]), Val(D)), nm)
     slices = ntuple(mask -> zeros(Complex{FT}, shapes[mask]..., batch...), nm)
-    tw = Packing.NyquistTwin(slices)
+    tw = FTB.NyquistTwin(slices)
     return (; slices, kax, shapes,
-        ks = (Packing.with_twin(ks[1], tw), Base.tail(ks)...),
+        ks = (FTB.with_twin(ks[1], tw), Base.tail(ks)...),
         contractions = _twin_contractions(l, xs, size(g), shapes, kax, batch, iflag, FT))
 end
 
@@ -366,20 +364,19 @@ end
 
 # Phase of native mode `(−k₁(I), k_·(I))` at a tensor-grid point / a scattered point: axis 1 negated,
 # the rest as stored.
+@inline _negate_first(t::Tuple) = (-first(t), Base.tail(t)...)
 @inline _phase_tensor_neg(ks::Tuple, axes::Tuple, K::CartesianIndex{D}, P::CartesianIndex{D}, ::Type{FT}) where {D, FT} =
-    sum(ntuple(d -> (d == 1 ? -FT(ks[1][K[1]]) : FT(ks[d][K[d]])) * FT(axes[d][P[d]]), Val(D)))
+    sum(_negate_first(_phase_terms(ks, axes, K, P, FT)))
 @inline _phase_scattered_neg(ks::Tuple, coords::Tuple, K::CartesianIndex{D}, j::Int, ::Type{FT}) where {D, FT} =
-    sum(ntuple(d -> (d == 1 ? -FT(ks[1][K[1]]) : FT(ks[d][K[d]])) * FT(coords[d][j]), Val(D)))
+    sum(_negate_first(_phase_terms(ks, coords, K, j, FT)))
 
 # Value of native mode `(−k₁(I), k_·(I))`: `conj` of the store at `(k₁(I), −k_·)`, read from the twin
 # where index negation lands off the native axis.
 @inline function _neg_row_value(coeffs, ks::Tuple, twin, I::CartesianIndex{D}, off::Int,
         pms::NTuple{D, Int}, b::Int) where {D}
-    q = twin === nothing ? 0 : Packing.nyquist_mask(ks, I)
-    q != 0 && return conj(Packing.twin_at(twin, q, I, b))
-    # Val-unrolled so each `ks[d]` is a compile-time index: a runtime `d` on the mixed
-    # `RFFTAxis`/`FFTAxis` tuple boxes, once per mode per point.
-    idx = ntuple(d -> d == 1 ? I[1] : Packing.neg_index(ks[d], I[d]), Val(D))
+    q = twin === nothing ? 0 : FTB.nyquist_mask(ks, I)
+    q != 0 && return conj(FTB.twin_at(twin, q, I, b))
+    idx = (I[1], map(FTB.neg_index, Base.tail(ks), Base.tail(Tuple(I)))...)
     lin = 1
     stride = 1
     @inbounds for d in 1:D
@@ -397,13 +394,13 @@ function _synthesize_packed_direct!(
     axes, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(true)) : geo
     ss = size(g)
     Npts = prod(ss)
-    pms = Packing.packed_size(ms, Val(true))
+    pms = FTB.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ Npts
     fill!(out, zero(FT))
     @inbounds for (pj, P) in enumerate(CartesianIndices(ss))
         for (mi, I) in enumerate(CartesianIndices(pms))
-            nyq = Packing.is_nyquist(ks[1], I[1])
+            nyq = FTB.is_nyquist(ks[1], I[1])
             W = nyq ? zero(Complex{FT}) : cis(iflag * _phase_tensor(ks, axes, I, P, FT))
             Wn = I[1] > 1 ? cis(iflag * _phase_tensor_neg(ks, axes, I, P, FT)) : zero(Complex{FT})
             for b in 1:B
@@ -424,13 +421,13 @@ function _synthesize_packed_direct!(
 ) where {FT, D}
     coords, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(true)) : geo
     N = length(coords[1])
-    pms = Packing.packed_size(ms, Val(true))
+    pms = FTB.packed_size(ms, Val(true))
     M = prod(pms)
     B = length(out) ÷ N
     fill!(out, zero(FT))
     @inbounds for j in 1:N
         for (mi, I) in enumerate(CartesianIndices(pms))
-            nyq = Packing.is_nyquist(ks[1], I[1])
+            nyq = FTB.is_nyquist(ks[1], I[1])
             W = nyq ? zero(Complex{FT}) : cis(iflag * _phase_scattered(ks, coords, I, j, FT))
             Wn = I[1] > 1 ? cis(iflag * _phase_scattered_neg(ks, coords, I, j, FT)) : zero(Complex{FT})
             for b in 1:B

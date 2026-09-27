@@ -6,6 +6,7 @@ module FlowFieldSpectraKernelAbstractionsExt
 # stays module-qualified via `KA.`.
 using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using FlowGeometries: FlowGeometries
 
@@ -95,7 +96,7 @@ function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBac
     Npts = prod(ss)
     R = eltype(field) <: Real
     xs, ks_cpu = FFS.DirectSum.phase_geometry(g, FT, ms, Val(R), box)
-    pms = FFS.Packing.packed_size(ms, Val(R))
+    pms = FTB.packed_size(ms, Val(R))
     M = prod(pms)
     B = length(field) ÷ Npts
     ksd = ntuple(d -> _dev_vec(backend, collect(ks_cpu[d]), FT), D)
@@ -106,7 +107,7 @@ function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBac
     KA.synchronize(backend)
     coeffs_dev ./= Npts
     tw = _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms, iflag, ss, Npts, B, FT)
-    ks_out = tw === nothing ? ks_cpu : (FFS.Packing.with_twin(ks_cpu[1], tw), Base.tail(ks_cpu)...)
+    ks_out = tw === nothing ? ks_cpu : (FTB.with_twin(ks_cpu[1], tw), Base.tail(ks_cpu)...)
     return reshape(FFS._to_host(coeffs_dev), pms..., FFS.Grids.field_batch_shape(g, field)...), ks_out
 end
 
@@ -116,10 +117,9 @@ end
 function _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms::NTuple{D, Int}, iflag::Int, ss, Npts,
         B, ::Type{FT}) where {FT, D}
     (D >= 2 && eltype(field) <: Real && !FlowGeometries.Grids.isuniform(g)) || return nothing
-    pms = FFS.Packing.packed_size(ms, Val(true))
     batch = FFS.Grids.field_batch_shape(g, field)
-    slices = ntuple(FFS.Packing.n_twin_slices(Val(D))) do mask
-        sl = FFS.DirectSum._twin_shape(ms, pms, mask)
+    slices = ntuple(FTB.n_twin_slices(Val(D))) do mask
+        sl = FTB.twin_slice_shape(ms, mask)
         S = prod(sl)
         out = KA.zeros(backend, Complex{FT}, S, B)
         if S > 0
@@ -130,7 +130,7 @@ function _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms::NTuple{D, 
         end
         return reshape(FFS._to_host(out), sl..., batch...)
     end
-    return FFS.Packing.NyquistTwin(slices)
+    return FTB.NyquistTwin(slices)
 end
 
 # Structured (tensor-product) grid: stage the D axes of positions `xs` (`DirectSum.phase_geometry`) and

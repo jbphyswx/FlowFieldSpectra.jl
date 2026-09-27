@@ -1,7 +1,7 @@
 module Grids
 
 using FlowGeometries: FlowGeometries
-using ..Packing: Packing
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 export physical_wavenumbers
 
@@ -66,13 +66,13 @@ const SphericalHarmonicGeometry = Union{
     physical_wavenumbers(grid, ms, ::Val{real}) -> NTuple
 
 Packed native-order wavenumber axes matching the packed coefficient layout: for a real transform axis 1
-is a nonnegative rfft axis (`Packing.RFFTAxis`, length `ms[1]÷2+1`) and axes `2:D` are full fft axes
-(`Packing.FFTAxis`); for a complex transform every axis is a full fft axis. `ms[d]` is the full
-transform length along `d`.
+is a nonnegative rfft axis (`FlowTransformBindings.RFFTAxis`, length `ms[1]÷2+1`) and axes `2:D` are
+full fft axes (`FlowTransformBindings.FFTAxis`); for a complex transform every axis is a full fft axis.
+`ms[d]` is the full transform length along `d`, and a Fourier length of zero takes the spacing of unit
+length.
 """
-@inline physical_wavenumbers(Ls::NTuple{D, <:Real}, ms::NTuple{D, Int}, ::Val{R}) where {D, R} =
-    ntuple(d -> (d == 1 && R) ? Packing.RFFTAxis(Packing._axis_scale(Ls[d]), ms[d]) :
-                                Packing.FFTAxis(Packing._axis_scale(Ls[d]), ms[d]), Val(D))
+@inline physical_wavenumbers(Ls::NTuple{D, <:Real}, ms::NTuple{D, Int}, r::Val) where {D} =
+    FTB.wavenumber_axes(map(L -> iszero(L) ? one(L) : L, Ls), ms, r)
 
 @inline function physical_wavenumbers(
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},

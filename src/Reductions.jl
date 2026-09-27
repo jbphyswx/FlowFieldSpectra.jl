@@ -1,7 +1,7 @@
 module Reductions
 
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ..DirectSum: DirectSum, sph_mode_index
-using ..Packing: Packing
 using ..Normalization: Normalization
 
 export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!,
@@ -15,6 +15,38 @@ export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spec
 # vectorized pass with no per-slice reshape loop. `dims=` opts into folding designated batch axes into
 # the energy (e.g. `dims=D+1` sums the vector-component axis → a kinetic-energy spectrum).
 # =============================================================================
+
+# Wavenumber sums over the heterogeneous axis tuple, folded by recursion so `ks[d]` with a runtime `d`
+# never boxes: `ksq` is `Σ_d k_d(I_d)²`, `kmax` the largest shell the mode box holds whole
+# (`min_d max|k_d|`), `kcorner` the box's corner `√(Σ_d max|k_d|²)`, `dk_product` the product of the
+# spacings of the axes in `dims`, and `neg_rest` the indices of `-k_d` on the axes `2:D`.
+@inline ksq(::Type{T}, ks::Tuple, I::CartesianIndex) where {T} = ksq(T, ks, I, 1)
+@inline function ksq(::Type{T}, ks::Tuple, I::CartesianIndex, d::Int) where {T}
+    kv = T(first(ks)[I[d]])
+    return kv * kv + ksq(T, Base.tail(ks), I, d + 1)
+end
+@inline ksq(::Type{T}, ::Tuple{}, ::CartesianIndex, ::Int) where {T} = zero(T)
+
+@inline kmax(::Type{T}, ks::Tuple) where {T} = min(T(FTB.max_abs(first(ks))), kmax(T, Base.tail(ks)))
+@inline kmax(::Type{T}, ::Tuple{}) where {T} = T(Inf)
+
+@inline kcorner(::Type{T}, ks::Tuple) where {T} = sqrt(_kcorner_sq(T, ks))
+@inline _kcorner_sq(::Type{T}, ks::Tuple) where {T} = T(FTB.max_abs(first(ks)))^2 + _kcorner_sq(T, Base.tail(ks))
+@inline _kcorner_sq(::Type{T}, ::Tuple{}) where {T} = zero(T)
+
+@inline dk_product(::Type{T}, ks::Tuple, dims::Tuple) where {T} = _dkp(T, ks, dims, 1)
+@inline _dkp(::Type{T}, ks::Tuple, dims::Tuple, d::Int) where {T} =
+    (d in dims ? T(first(ks)[2] - first(ks)[1]) : one(T)) * _dkp(T, Base.tail(ks), dims, d + 1)
+@inline _dkp(::Type{T}, ::Tuple{}, ::Tuple, ::Int) where {T} = one(T)
+
+@inline neg_rest(ks::Tuple, I::CartesianIndex) = _neg_rest(Base.tail(ks), I, 2)
+@inline _neg_rest(ks::Tuple, I::CartesianIndex, d::Int) =
+    (FTB.neg_index(first(ks), I[d]), _neg_rest(Base.tail(ks), I, d + 1)...)
+@inline _neg_rest(::Tuple{}, ::CartesianIndex, ::Int) = ()
+
+# Default radial bin count: half the shortest axis's full mode count, the same for a real field's packed
+# half as for a complex field's full spectrum.
+@inline default_bins(ks::Tuple) = minimum(map(FTB.full_length, ks)) ÷ 2
 
 # Absolute batch dims to fold, validated ⊆ (D+1):N. Accepts an Int or a tuple; `()` folds nothing.
 @inline _fold_dims(dims::Integer, D, N) = _fold_dims((Int(dims),), D, N)
@@ -31,13 +63,13 @@ end
 # appends bins of the same width until they reach the box's corner, so the bins below `k_max` are the
 # same either way.
 @inline function _radial_extent(ks_phys::Tuple, num_bins::Int, ::Type{T}, ::Val{true}) where {T}
-    k_max = Packing.kmax(T, ks_phys)
-    num_bins <= 0 && (num_bins = Packing.default_bins(ks_phys))
+    k_max = kmax(T, ks_phys)
+    num_bins <= 0 && (num_bins = default_bins(ks_phys))
     return num_bins, k_max / num_bins, k_max
 end
 @inline function _radial_extent(ks_phys::Tuple, num_bins::Int, ::Type{T}, ::Val{false}) where {T}
     nb, dk, k_max = _radial_extent(ks_phys, num_bins, T, Val(true))
-    total = nb + ceil(Int, (Packing.kcorner(T, ks_phys) - k_max) / dk)
+    total = nb + ceil(Int, (kcorner(T, ks_phys) - k_max) / dk)
     return total, dk, total * dk
 end
 
@@ -65,7 +97,7 @@ _shell_values!(E, nmodes, dk, ks::Tuple, ::Normalization.ShellSum) = E
 function _shell_values!(E::AbstractArray, nmodes::AbstractVector{T}, dk::T, ks::Tuple,
         ::Normalization.ModeAverage) where {T}
     D = length(ks)
-    cell = Packing.dk_product(T, ks, ntuple(identity, Val(D)))
+    cell = dk_product(T, ks, ntuple(identity, Val(D)))
     vD = _unit_ball(T, Val(D))
     nb = length(nmodes)
     @inbounds for b in 1:nb
@@ -83,24 +115,24 @@ end
 
 `|C|²` over the native modes the stored mode `I` stands for: `I` itself, and on a halved axis its
 `k₁ < 0` partner, at the same `|k|`. The partner's magnitude is that of the stored `(k₁, −k_rest)`, or of
-the axis's [`Packing.NyquistTwin`](@ref) where `−k_rest` leaves the native axes. A stored `+N₁/2` is not
-itself a native mode.
+the axis's `FlowTransformBindings.NyquistTwin` where `−k_rest` leaves the native axes. A stored `+N₁/2`
+is not itself a native mode.
 """
 @inline function _native_energy(ks::Tuple, C::AbstractArray{Complex{T}, N}, I::CartesianIndex{N},
         twin) where {T, N}
-    Packing.is_halved(first(ks)) || return abs2(C[I])
+    FTB.is_halved(first(ks)) || return abs2(C[I])
     D = length(ks)
-    e = Packing.is_nyquist(first(ks), I[1]) ? zero(T) : abs2(C[I])
+    e = FTB.is_nyquist(first(ks), I[1]) ? zero(T) : abs2(C[I])
     I[1] > 1 || return e
-    q = twin === nothing ? 0 : Packing.nyquist_mask(ks, I)
+    q = twin === nothing ? 0 : FTB.nyquist_mask(ks, I)
     q != 0 && return e + abs2(twin[q, I])
-    J = CartesianIndex(I[1], Packing.neg_rest(ks, I)..., ntuple(i -> I[D + i], Val(N - D))...)
+    J = CartesianIndex(I[1], neg_rest(ks, I)..., ntuple(i -> I[D + i], Val(N - D))...)
     return e + abs2(C[J])
 end
 
 function _native_power(ks_phys::Tuple, C::AbstractArray{Complex{T}, N}) where {T, N}
     P = Array{T}(undef, size(C))
-    twin = Packing.axis_twin(first(ks_phys))
+    twin = FTB.axis_twin(first(ks_phys))
     @inbounds for I in CartesianIndices(C)
         P[I] = _native_energy(ks_phys, C, I, twin)
     end
@@ -170,10 +202,10 @@ function _bin_isotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_bins::Int,
     E = zeros(T, num_bins, size(bat)...)
     nmodes = zeros(T, num_bins)
     @inbounds for I in CartesianIndices(ntuple(d -> size(P, d), Val(D)))
-        kmag = sqrt(Packing.ksq(T, ks_phys, I))
+        kmag = sqrt(ksq(T, ks_phys, I))
         C && kmag > k_top && continue
         bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
-        n = T(Packing.mode_fold(ks_phys, I))
+        n = T(FTB.mode_fold(ks_phys, I))
         nmodes[bin] += n
         w = C ? n : one(T)
         for Ib in bat
@@ -235,13 +267,13 @@ function _fill_isotropic!(E::AbstractArray{T}, k_bins::AbstractVector{T}, ks_phy
     nb, dk, k_top = _radial_extent(ks_phys, req, T, cut)
     fill!(E, zero(T))
     fill!(k_bins, zero(T))
-    twin = Packing.axis_twin(first(ks_phys))
+    twin = FTB.axis_twin(first(ks_phys))
     bat = CartesianIndices(ntuple(i -> size(coeffs, D + i), Val(N - D)))
     @inbounds for I in CartesianIndices(ntuple(d -> size(coeffs, d), Val(D)))
-        kmag = sqrt(Packing.ksq(T, ks_phys, I))
+        kmag = sqrt(ksq(T, ks_phys, I))
         C && kmag > k_top && continue
         bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
-        n = T(Packing.mode_fold(ks_phys, I))
+        n = T(FTB.mode_fold(ks_phys, I))
         k_bins[bin] += n
         for Ib in bat
             J = CartesianIndex(I, Ib)
@@ -283,8 +315,8 @@ end
 
 function _bin_anisotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_k_bins::Int, num_θ_bins::Int,
         convention::Normalization.SpectralConvention) where {T, NP}
-    k_max = Packing.kmax(T, ks_phys)
-    num_k_bins <= 0 && (num_k_bins = Packing.default_bins(ks_phys))
+    k_max = kmax(T, ks_phys)
+    num_k_bins <= 0 && (num_k_bins = default_bins(ks_phys))
     dk = k_max / num_k_bins
     dθ = T(2π) / num_θ_bins
     k_bins = [T(0.5) * dk + (i - 1) * dk for i in 1:num_k_bins]
@@ -298,9 +330,9 @@ function _bin_anisotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_k_bins::I
         kmag = sqrt(kx^2 + ky^2)
         (kmag > k_max || kmag == 0) && continue
         ik = clamp(floor(Int, kmag / dk) + 1, 1, num_k_bins)
-        # The halved axis stores k₁ ≥ 0; its even-Nyquist column aliases to −k₁max in the fftfreq
-        # convention the full axes carry, so take that sign for the angle to match the two-sided spectrum.
-        kxa = Packing.is_nyquist(ks_phys[1], I[1]) ? -kx : kx
+        # The halved axis stores its even Nyquist slot as +k₁max, which a full axis labels −k₁max, so
+        # that sign gives the angle of the two-sided spectrum.
+        kxa = (FTB.is_halved(ks_phys[1]) && FTB.is_nyquist(ks_phys[1], I[1])) ? -kx : kx
         θ = atan(ky, kxa)
         iθ = clamp(floor(Int, (θ + T(π)) / dθ) + 1, 1, num_θ_bins)
         nmodes[ik, iθ] += one(T)
@@ -309,7 +341,7 @@ function _bin_anisotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_k_bins::I
         end
         # A halved-axis interior mode's conjugate partner at −k carries the same power at angle θ±π; on a
         # full layout `mode_fold` is 1 and the −k mode is binned on its own pass, so this is inert there.
-        if Packing.mode_fold(ks_phys, I) != one(T)
+        if FTB.mode_fold(ks_phys, I) != one(T)
             θm = θ > 0 ? θ - T(π) : θ + T(π)
             iθm = clamp(floor(Int, (θm + T(π)) / dθ) + 1, 1, num_θ_bins)
             nmodes[ik, iθm] += one(T)
@@ -326,7 +358,7 @@ end
 _sector_values!(E, nmodes, dk, dθ, ks::Tuple, ::Normalization.ShellSum) = E
 function _sector_values!(E::AbstractArray, nmodes::AbstractMatrix{T}, dk::T, dθ::T, ks::Tuple,
         ::Normalization.ModeAverage) where {T}
-    cell = Packing.dk_product(T, ks, (1, 2))
+    cell = dk_product(T, ks, (1, 2))
     nk, nθ = size(nmodes)
     @inbounds for iθ in 1:nθ, ik in 1:nk
         whole = dθ / 2 * ((ik * dk)^2 - ((ik - 1) * dk)^2) / cell
@@ -370,13 +402,13 @@ function _bin_cross(ks_phys::Tuple, P::AbstractArray{Complex{T}, NP}, num_bins::
     S = zeros(Complex{T}, num_bins, size(bat)...)
     nmodes = zeros(T, num_bins)
     @inbounds for I in CartesianIndices(ntuple(d -> size(P, d), Val(D)))
-        kmag = sqrt(Packing.ksq(T, ks_phys, I))
+        kmag = sqrt(ksq(T, ks_phys, I))
         kmag > k_max && continue
         bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
         # A halved-axis interior mode's conjugate partner at −k is stored once; the two-sided cross bin
         # is X + conj(X). `mode_fold` is 2 there and 1 at dc/Nyquist and on a full layout (where the −k
         # mode is stored separately), so `(w−1)` selects the partner term without a branch.
-        w = T(Packing.mode_fold(ks_phys, I))
+        w = T(FTB.mode_fold(ks_phys, I))
         nmodes[bin] += w
         for Ib in bat
             x = P[I, Ib]
@@ -417,8 +449,9 @@ the `−k₁` energy folded in. So a kept full axis's entries at `±k` are equal
 and differ for a complex field's, where the sign carries the propagation direction.
 
 This is the one reduction with no radial cutoff, so it reaches the `−N_d/2` modes whose `k₁ < 0`
-partners are the `+N_d/2` twins. It reads those from the halved axis's [`Packing.NyquistTwin`](@ref),
-which the transform attaches whenever index negation cannot reach them.
+partners are the `+N_d/2` twins. It reads those from the halved axis's
+`FlowTransformBindings.NyquistTwin`, which the transform attaches whenever index negation cannot reach
+them.
 """
 function transect_spectrum(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}, dims::Tuple) where {T, N}
     D = length(ks_phys)
@@ -440,15 +473,15 @@ function transect_spectrum!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
         coeffs::AbstractArray{Complex{T}, N}, dims::Tuple) where {T, N}
     D = length(ks_phys)
     all(d -> 1 <= d <= D, dims) || throw(ArgumentError("transect dims must be spectral (1:$D)"))
-    dk_prod = Packing.dk_product(T, ks_phys, dims)
+    dk_prod = dk_product(T, ks_phys, dims)
     fill!(E_reduced, zero(T))
     # Column-major linear index into E_reduced (kept spectral dims + all batch dims), built inline so
     # the reduction over the summed spectral dims is allocation-free.
-    halved_out = Packing.is_halved(ks_phys[1]) && (1 in dims)
+    halved_out = FTB.is_halved(ks_phys[1]) && (1 in dims)
     # A halved axis that is KEPT reports `|k₁|`, and the field's `−k₁` energy is stored nowhere else, so
     # each interior stored mode carries its `fold_weight` of 2 (1 at dc and, for even `n₁`, at Nyquist).
-    halved_kept = Packing.is_halved(ks_phys[1]) && !(1 in dims)
-    nyquist_twin = Packing.axis_twin(ks_phys[1])
+    halved_kept = FTB.is_halved(ks_phys[1]) && !(1 in dims)
+    nyquist_twin = FTB.axis_twin(ks_phys[1])
     @inbounds for I in CartesianIndices(coeffs)
         lin = 1
         stride = 1
@@ -464,19 +497,19 @@ function transect_spectrum!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
             # since the native set holds `−N₁/2` at that magnitude. Pass 2 takes the `k₁ < 0` rows, which
             # carry `|C(k₁>0, −k_·)|`. On a `−N_d/2` entry the negation aliases to itself (the
             # periodic-grid identity), so the axis's twin (the `+N_d/2` value) is read there.
-            Packing.is_nyquist(ks_phys[1], I[1]) || (E_reduced[lin] += T(0.5) * abs2(coeffs[I]))
+            FTB.is_nyquist(ks_phys[1], I[1]) || (E_reduced[lin] += T(0.5) * abs2(coeffs[I]))
             if I[1] > 1
-                q = nyquist_twin === nothing ? 0 : Packing.nyquist_mask(ks_phys, I)
+                q = nyquist_twin === nothing ? 0 : FTB.nyquist_mask(ks_phys, I)
                 if q != 0
                     E_reduced[lin] += T(0.5) * abs2(nyquist_twin[q, I])
                 else
                     J = CartesianIndex(ntuple(d -> d == 1 ? I[1] :
-                            (d <= D ? Packing.neg_index(ks_phys[d], I[d]) : I[d]), Val(N)))
+                            (d <= D ? FTB.neg_index(ks_phys[d], I[d]) : I[d]), Val(N)))
                     E_reduced[lin] += T(0.5) * abs2(coeffs[J])
                 end
             end
         else
-            w = halved_kept ? Packing.fold_weight(ks_phys[1], I[1]) : one(T)
+            w = halved_kept ? T(FTB.fold_weight(ks_phys[1], I[1])) : one(T)
             E_reduced[lin] += w * T(0.5) * abs2(coeffs[I])
         end
     end

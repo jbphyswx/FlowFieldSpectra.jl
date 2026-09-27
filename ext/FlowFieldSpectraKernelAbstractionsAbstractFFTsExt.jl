@@ -4,6 +4,7 @@ using KernelAbstractions: KernelAbstractions as KA, @kernel, @index, @Const
 using AbstractFFTs: AbstractFFTs
 using LinearAlgebra: LinearAlgebra as LA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
@@ -67,7 +68,7 @@ function _gpu_fft_plan(dev, ::Type{Complex{RT}}, g, ns::NTuple{D, Int}, batch::T
 end
 
 FFS.Plans.coefficient_size(p::GPUFFTRealPlan) =
-    (FFS.Packing.packed_size(p.ns, Val(true))..., p.batch...)
+    (FTB.packed_size(p.ns, Val(true))..., p.batch...)
 FFS.Plans.coefficient_type(::GPUFFTRealPlan{RT}) where {RT} = Complex{RT}
 FFS.Plans.wavenumbers(p::GPUFFTRealPlan) = p.ks_phys
 
@@ -141,7 +142,7 @@ function FFS._calculate_spectrum_gpu_fft(exec::ComputationalBackends.AbstractGPU
     RT = real(float(T))
     ET = T <: Real ? float(T) : Complex{RT}
     plan = _gpu_fft_plan(exec.backend, ET, g, ns, batch, iflag)
-    pms = FFS.Packing.packed_size(ns, Val(T <: Real))
+    pms = FTB.packed_size(ns, Val(T <: Real))
     coeffs_dev = KA.allocate(exec.backend, Complex{RT}, pms..., batch...)
     ks = FFS.calculate_spectrum!(coeffs_dev, plan, field)
     return FFS._to_host(coeffs_dev), ks
@@ -196,7 +197,7 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
     R = T <: Real
     bt = NTuple{length(batch), Int}(batch)
     if R
-        scratch = KA.allocate(dev, Complex{RT}, FFS.Packing.packed_size(ns, Val(true))..., bt...)
+        scratch = KA.allocate(dev, Complex{RT}, FTB.packed_size(ns, Val(true))..., bt...)
         outd = KA.allocate(dev, RT, ns..., bt...)
         bwd = AbstractFFTs.plan_brfft(scratch, ns[1], 1:D)
     else
@@ -234,7 +235,7 @@ function FFS._synthesize(::SpectralBackends.AbstractFFTSpectralBackend,
     dev = exec.backend
     batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
     if real_output
-        pms = FFS.Packing.packed_size(ns, Val(true))
+        pms = FTB.packed_size(ns, Val(true))
         size(coeffs)[1:D] == pms || throw(DimensionMismatch(
             "real_output=true expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D]). " *
             "Pass real_output=false for a full native spectrum $(ns)."))

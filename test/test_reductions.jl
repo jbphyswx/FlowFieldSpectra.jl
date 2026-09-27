@@ -25,8 +25,8 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
         f = randn(ms...)
         c, ks = FFS.calculate_spectrum(g, f, ms; transform = SB.FFTSpectralBackend())
         cc, ksc = FFS.calculate_spectrum(g, ComplexF64.(f), ms; transform = SB.FFTSpectralBackend())
-        full = FFS.unpacked(c, ms)
-        kmax = FFS.Packing.kmax(Float64, ks)
+        full = FTB.unpacked(c, ms)
+        kmax = FFS.Reductions.kmax(Float64, ks)
 
         # Every mode binned: the bins hold `½⟨f²⟩` (Parseval under the `1/N` normalization).
         kb, E = FFS.isotropic_spectrum(ks, c; cutoff = false)
@@ -51,19 +51,19 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
     ms = (10, 8)
     fn = [cos(2x) + 0.5sin(3y) + 0.3cos(x + 2y) for x in xax, y in yax]
     cn, ksn = FFS.calculate_spectrum(gn, fn, ms; transform = FTB.FINUFFTBackend(), eps = 1e-13)
-    Test.@test FFS.Packing.axis_twin(ksn[1]) !== nothing
+    Test.@test FTB.axis_twin(ksn[1]) !== nothing
     kb, E = FFS.isotropic_spectrum(ksn, cn; cutoff = false)
-    Test.@test sum(E) * (kb[2] - kb[1]) ≈ 0.5 * sum(abs2, FFS.unpacked(cn, ms, ksn)) rtol = 1e-12
+    Test.@test sum(E) * (kb[2] - kb[1]) ≈ 0.5 * sum(abs2, FTB.unpacked(cn, ms, ksn)) rtol = 1e-12
 
     # Unit power on every mode: a shell sum counts the lattice's modes in each bin; a mode average reports
     # a whole shell's count `π(k₊² − k₋²)/(Δk₁Δk₂)`, and a bin holding no mode is NaN.
-    ks = (FFS.Packing.RFFTAxis(1.0, 16), FFS.Packing.FFTAxis(1.0, 16))
+    ks = (FTB.RFFTAxis(16, 1.0), FTB.FFTAxis(16, 1.0))
     c = ones(ComplexF64, 9, 16)
     freqs = [(i, j) for i in _native_freqs(16), j in _native_freqs(16)]
     for cut in (true, false)
         kb, Es = FFS.isotropic_spectrum(ks, c; cutoff = cut, convention = FFS.SpectralConvention(scaling = FFS.PowerScaling()))
         dk = kb[2] - kb[1]
-        top = cut ? FFS.Packing.kmax(Float64, ks) : Inf
+        top = cut ? FFS.Reductions.kmax(Float64, ks) : Inf
         count = zeros(length(kb))
         for (i, j) in freqs
             k = hypot(i, j)

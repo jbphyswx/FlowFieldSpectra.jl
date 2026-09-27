@@ -1,6 +1,6 @@
 module Averaging
 
-using ..Packing: Packing
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ..Normalization: Normalization
 using ..Reductions: Reductions
 
@@ -43,13 +43,13 @@ function _fill_welch!(E_k::AbstractVector{T}, k_bins::AbstractVector{T}, ks_phys
     nb, dk, k_top = Reductions._radial_extent(ks_phys, req, T, cut)
     fill!(E_k, zero(T))
     fill!(k_bins, zero(T))
-    twin = Packing.axis_twin(first(ks_phys))
+    twin = FTB.axis_twin(first(ks_phys))
     real_idx = CartesianIndices(ntuple(i -> size(coeffs, D + i), Val(N - D)))
     nreal = length(real_idx)
     @inbounds for I in CartesianIndices(ntuple(d -> size(coeffs, d), Val(D)))
-        kmag = sqrt(Packing.ksq(T, ks_phys, I))
+        kmag = sqrt(Reductions.ksq(T, ks_phys, I))
         C && kmag > k_top && continue
-        n = T(Packing.mode_fold(ks_phys, I))
+        n = T(FTB.mode_fold(ks_phys, I))
         p = zero(T)
         for Ir in real_idx
             J = CartesianIndex(I, Ir)
@@ -116,7 +116,7 @@ function coherence_spectrum!(coherence²::AbstractVector{T}, phase::AbstractVect
     fill!(phase, zero(T))
     Sfg = zeros(Complex{T}, nb)
     @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
-        kmag = sqrt(Packing.ksq(T, ks_phys, I))
+        kmag = sqrt(Reductions.ksq(T, ks_phys, I))
         kmag > k_max && continue
         bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
         sff = zero(T)
@@ -131,7 +131,7 @@ function coherence_spectrum!(coherence²::AbstractVector{T}, phase::AbstractVect
         end
         # Fold the missing negative half: the auto-spectra double on interior halved modes, the cross
         # spectrum takes its conjugate partner (`X+conj(X)`). Inert on a full layout (`w==1`).
-        w = Packing.mode_fold(ks_phys, I)
+        w = FTB.mode_fold(ks_phys, I)
         coherence²[bin] += w * sff
         phase[bin] += w * sgg
         Sfg[bin] += sfg + (w - one(w)) * conj(sfg)

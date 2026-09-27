@@ -10,6 +10,7 @@
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -30,8 +31,8 @@ hp_grid(L, N1, N2) = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float
 hp_a_plan(out, pl, fld) = @allocated FFS.calculate_spectrum!(out, pl, fld)
 hp_a_one(gr, fld, ms) = @allocated FFS.calculate_spectrum(gr, fld, ms; transform = HP_FFT, execution = HP_SER)
 hp_a_region(out, r, fld) = @allocated FFS._region_fft_exec!(out, r, fld)
-hp_a_publish(c, W, ph, nsx, pms, nt, neg) = @allocated FFS.Packing.publish_packed!(c, W, ph, nsx, pms, nt, neg)
-hp_a_twins(tw, W, n, nt, neg) = @allocated FFS.Packing.gather_conj_twins!(tw, W, n, nt, neg)
+hp_a_publish(c, W, ph, nsx, pms, nt, neg) = @allocated FTB.publish_packed!(c, W, ph, nsx, pms, nt, neg)
+hp_a_twins(tw, W, n, nt, neg) = @allocated FTB.gather_conj_twins!(tw, W, n, nt, neg)
 hp_a_quad(out, fld, α, np, nt) = @allocated FFS.quadrature_weighted_into!(out, fld, α, np, nt)
 
 Test.@testset "Hybrid plan matches the one-shot" begin
@@ -43,13 +44,13 @@ Test.@testset "Hybrid plan matches the one-shot" begin
         cref, ksref = FFS.calculate_spectrum(g, f, (N1, N2); transform = HP_FFT, execution = HP_SER)
         p = FFS.plan_spectrum(g, Float64, (N1, N2); transform = HP_FFT, execution = HP_SER)
         Test.@test p isa FFS.HybridPlan
-        buf = zeros(ComplexF64, FFS.Packing.packed_size((N1, N2), Val(true))...)
+        buf = zeros(ComplexF64, FTB.packed_size((N1, N2), Val(true))...)
         ks = FFS.calculate_spectrum!(buf, p, f)
         Test.@test hp_rel(buf, cref) < 1e-11
 
         # The Nyquist twin rides on `ks` and must agree with the one-shot's.
-        tw = FFS.Packing.axis_twin(ks[1])
-        twr = FFS.Packing.axis_twin(ksref[1])
+        tw = FTB.axis_twin(ks[1])
+        twr = FTB.axis_twin(ksref[1])
         Test.@test (tw === nothing) == (twr === nothing)
         if tw !== nothing
             for (a, b) in zip(tw.slices, twr.slices)
@@ -83,7 +84,7 @@ Test.@testset "Hybrid plan: complex, batched, and the uniform split" begin
     fb = randn(N, N, 2)
     cb, _ = FFS.calculate_spectrum(g, fb, (N, N); transform = HP_FFT, execution = HP_SER)
     pb = FFS.plan_spectrum(g, Float64, (N, N); transform = HP_FFT, execution = HP_SER, batch = (2,))
-    bb = zeros(ComplexF64, FFS.Packing.packed_size((N, N), Val(true))..., 2)
+    bb = zeros(ComplexF64, FTB.packed_size((N, N), Val(true))..., 2)
     FFS.calculate_spectrum!(bb, pb, fb)
     Test.@test hp_rel(bb, cb) < 1e-11
     Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(bb, pb, randn(N, N))
@@ -116,7 +117,7 @@ Test.@testset "Hybrid plan holds every buffer it owns" begin
     g = hp_grid(L, N, N)
     f = randn(N, N)
     p = FFS.plan_spectrum(g, Float64, (N, N); transform = HP_FFT, execution = HP_SER)
-    buf = zeros(ComplexF64, FFS.Packing.packed_size((N, N), Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size((N, N), Val(true))...)
     for _ in 1:3
         FFS.calculate_spectrum!(buf, p, f)
     end
@@ -157,8 +158,8 @@ Test.@testset "Hybrid composite on a device" begin
         cg, ksg = FFS.calculate_spectrum(g, f, (N1, N2); transform = HP_FFT, execution = gpu)
         Test.@test size(cg) == size(ch)
         Test.@test hp_rel(cg, ch) < 1e-11
-        tg = FFS.Packing.axis_twin(ksg[1])
-        th = FFS.Packing.axis_twin(ksh[1])
+        tg = FTB.axis_twin(ksg[1])
+        th = FTB.axis_twin(ksh[1])
         Test.@test (tg === nothing) == (th === nothing)
         if tg !== nothing
             for (a, b) in zip(tg.slices, th.slices)

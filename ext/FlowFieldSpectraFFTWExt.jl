@@ -3,6 +3,7 @@ module FlowFieldSpectraFFTWExt
 using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra as LA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
@@ -14,7 +15,7 @@ using FlowGeometries: FlowGeometries
 # `(N_1÷2+1, N_2…N_D, batch…)` in native (unshifted) order; a complex field gives the full native
 # spectrum `(N…, batch…)`. `mul!` writes the caller's `coeffs` directly and `rmul!` applies the `1/∏N`
 # normalization in place, so steady-state `calculate_spectrum!` allocates nothing and copies the input
-# zero times. `FFS.unpacked` reconstructs the full centered cube when one is needed.
+# zero times. `FlowTransformBindings.unpacked` reconstructs the full native cube when one is needed.
 #
 # FFT is a full transform, so `ms == size(grid)`. Physical wavenumbers use the grid's periodic length.
 # =============================================================================
@@ -42,7 +43,7 @@ struct CFFTPlan{RT, D, NB, P, KS} <: FFS.AbstractSpectralPlan
 end
 
 FFS.Plans.coefficient_size(p::RFFTPlan{RT, D}) where {RT, D} =
-    (FFS.Packing.packed_size(p.ns, Val(true))..., p.batch...)
+    (FTB.packed_size(p.ns, Val(true))..., p.batch...)
 FFS.Plans.coefficient_type(::RFFTPlan{RT}) where {RT} = Complex{RT}
 FFS.Plans.wavenumbers(p::RFFTPlan) = p.ks_phys
 
@@ -148,7 +149,7 @@ function FFS._calculate_spectrum_fft(exec::ComputationalBackends.AbstractExecuti
     if T <: Real
         f = eltype(field) === float(T) ? field : float.(field)
         plan = _fftw_plan(float(T), g, ns, f, nth, FFTW.ESTIMATE; iflag = iflag)
-        coeffs = Array{Complex{RT}}(undef, FFS.Packing.packed_size(ns, Val(true))..., batch...)
+        coeffs = Array{Complex{RT}}(undef, FTB.packed_size(ns, Val(true))..., batch...)
     else
         f = eltype(field) === Complex{RT} ? field : Complex{RT}.(field)
         plan = _fftw_plan(Complex{RT}, g, ns, f, nth, FFTW.ESTIMATE; iflag = iflag)
@@ -194,10 +195,10 @@ shortens axis 1 to `n₁÷2+1`; `conj_in` conjugates a complex input, carrying `
 composite. `scratch` takes the (possibly conjugated) input, so the caller's field is never mutated and
 the plan is built with `MEASURE`.
 """
-struct RegionFFT{P, S}
+struct RegionFFT{P, S, O <: Tuple}
     fwd::P
     scratch::S
-    outsize::Tuple
+    outsize::O
     halve::Bool
     conj_in::Bool
 end
@@ -213,7 +214,7 @@ function FFS._region_fft_plan(exec::ComputationalBackends.AbstractExecutionBacke
     scratch = halve ? Array{RT}(undef, insize...) : Array{Complex{RT}}(undef, insize...)
     fwd = halve ? FFTW.plan_rfft(scratch, dims; flags = FFTW.MEASURE, num_threads = nth) :
                   FFTW.plan_fft(scratch, dims; flags = FFTW.MEASURE, num_threads = nth)
-    return RegionFFT{typeof(fwd), typeof(scratch)}(fwd, scratch, outsize, halve, conj_in)
+    return RegionFFT{typeof(fwd), typeof(scratch), typeof(outsize)}(fwd, scratch, outsize, halve, conj_in)
 end
 
 # Output shape of the held region pass, so the composite sizes the working array that follows it.
@@ -262,7 +263,7 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
     R = T <: Real
     bt = NTuple{length(batch), Int}(batch)
     if R
-        scratch = Array{Complex{RT}}(undef, FFS.Packing.packed_size(ns, Val(true))..., bt...)
+        scratch = Array{Complex{RT}}(undef, FTB.packed_size(ns, Val(true))..., bt...)
         bwd = FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.MEASURE, num_threads = nth)
     else
         scratch = Array{Complex{RT}}(undef, ns..., bt...)
@@ -305,7 +306,7 @@ function FFS._synthesize(::SpectralBackends.AbstractFFTSpectralBackend,
     nth = FFS._backend_nthreads(exec)
     batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
     if real_output
-        pms = FFS.Packing.packed_size(ns, Val(true))
+        pms = FTB.packed_size(ns, Val(true))
         size(coeffs)[1:D] == pms || throw(DimensionMismatch(
             "real_output=true expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D]). " *
             "Pass real_output=false for a full native spectrum $(ns)."))

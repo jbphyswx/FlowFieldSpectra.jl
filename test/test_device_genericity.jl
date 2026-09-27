@@ -15,6 +15,7 @@ using JLArrays: JLArrays
 using GPUArraysCore: GPUArraysCore
 using KernelAbstractions: KernelAbstractions as KA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -81,8 +82,8 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     fs = randn(N, N)
     cs2, ks2, cd2, kd2 = dg_pair(gs, fs, (N, N))
     Test.@test dg_rel(cd2, cs2) < 1e-12
-    ts = FFS.Packing.axis_twin(ks2[1])
-    td = FFS.Packing.axis_twin(kd2[1])
+    ts = FTB.axis_twin(ks2[1])
+    td = FTB.axis_twin(kd2[1])
     Test.@test (ts === nothing) == (td === nothing)
     if ts !== nothing
         for (a, b) in zip(td.slices, ts.slices)

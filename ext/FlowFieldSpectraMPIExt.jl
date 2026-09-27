@@ -2,6 +2,7 @@ module FlowFieldSpectraMPIExt
 
 using MPI: MPI
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
@@ -51,14 +52,14 @@ function _mpi_pointsum(b::ComputationalBackends.MPIBackend, transform, g::FlowGe
 end
 
 _allreduce_twin(::Nothing, ks::Tuple, α, comm) = ks
-function _allreduce_twin(t::FFS.Packing.NyquistTwin, ks::Tuple, α, comm)
+function _allreduce_twin(t::FTB.NyquistTwin, ks::Tuple, α, comm)
     slices = map(t.slices) do s
         buf = Array{eltype(s)}(undef, size(s))
         buf .= α .* s
         isempty(buf) || MPI.Allreduce!(buf, +, comm)
         buf
     end
-    return (FFS.Packing.with_twin(ks[1], FFS.Packing.NyquistTwin(slices)), Base.tail(ks)...)
+    return (FTB.with_twin(ks[1], FTB.NyquistTwin(slices)), Base.tail(ks)...)
 end
 
 # ---- batch-partition: disjoint batch slices Allreduced into a zero buffer ----

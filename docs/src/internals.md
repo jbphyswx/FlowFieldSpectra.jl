@@ -114,27 +114,9 @@ FlowFieldSpectra._sht_applicable
 
 ## Packed spectral layout
 
-`Packing` owns the packed-native layout: the half a real transform publishes, the Nyquist twins a
-reduction or an inverse needs alongside it, and the per-axis gather/scatter the separable transforms
-walk. [`unpacked`](@ref) and [`unpacked!`](@ref) are the public entry points.
-
-```@docs
-FlowFieldSpectra.Packing.hermitian_request_size
-FlowFieldSpectra.Packing.publish_packed!
-FlowFieldSpectra.Packing.packed_half_view
-FlowFieldSpectra.Packing.NyquistTwin
-FlowFieldSpectra.Packing.twin_at
-FlowFieldSpectra.Packing.twin_table
-FlowFieldSpectra.Packing.twin_slice_shape
-FlowFieldSpectra.Packing.ConjTwinSlice
-FlowFieldSpectra.Packing.conj_twins
-FlowFieldSpectra.Packing.gather_conj_twins!
-FlowFieldSpectra.Packing.axis_layout
-FlowFieldSpectra.Packing.axis_work_shape
-FlowFieldSpectra.Packing.axis_chunk_offsets!
-FlowFieldSpectra.Packing.gather_axis_block!
-FlowFieldSpectra.Packing.scatter_axis_block!
-```
+The packed layout is FlowTransformBindings': the half a real transform publishes
+(`publish_packed!`, `packed_half_view`), and the Nyquist twins a reduction or an inverse reads alongside
+it (`NyquistTwin`, `twin_table`, `conj_twins`).
 
 ## Transform problem & layout
 

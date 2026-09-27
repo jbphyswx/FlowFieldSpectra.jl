@@ -44,7 +44,7 @@ Test.@testset "Factorized direct sum equals an inline naive sum" begin
     ms = (N, N)
     c, ks = FFS.calculate_spectrum(g, f, ms; transform = RP_DS, execution = RP_SER)
 
-    pms = FFS.Packing.packed_size(ms, Val(true))
+    pms = FTB.packed_size(ms, Val(true))
     naive = zeros(ComplexF64, pms...)
     for i1 in 1:pms[1], i2 in 1:pms[2]
         k1 = ks[1][i1]
@@ -95,8 +95,8 @@ Test.@testset "Hybrid composite equals the direct sum" begin
             Test.@test size(ch) == size(cd)
             Test.@test rp_rel(ch, cd) < 1e-9
             # The Nyquist twin the composite publishes must match the direct sum's entry for entry.
-            th = FFS.Packing.axis_twin(ksh[1])
-            td = FFS.Packing.axis_twin(ksd[1])
+            th = FTB.axis_twin(ksh[1])
+            td = FTB.axis_twin(ksd[1])
             if th !== nothing && td !== nothing
                 for (a, b) in zip(th.slices, td.slices)
                     isempty(a) || Test.@test rp_rel(a, b) < 1e-9
@@ -177,7 +177,7 @@ Test.@testset "A NUFFT type-2 evaluates the mode sum" begin
     c, ks = FFS.calculate_spectrum(g, f, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-12)
 
     # The full native cube the half stands for, and the physical wavenumbers of each native mode.
-    full = FFS.unpacked(c, ms, ks)
+    full = FTB.unpacked(c, ms, ks)
     kf = FFS.Grids.physical_wavenumbers(g, ms, Val(false))
     x0, y0 = minimum(xv), minimum(yv)
     ref = zeros(Float64, M)

@@ -54,8 +54,8 @@ Test.@testset "Curvilinear Cartesian transforms as a point cloud" begin
     Test.@test size(c) == size(cref)
     Test.@test cv_rel(c, cref) < 1e-13
     # the Nyquist twin rides on ks and must agree too
-    tw = FFS.Packing.axis_twin(ks[1])
-    twref = FFS.Packing.axis_twin(ksref[1])
+    tw = FTB.axis_twin(ks[1])
+    twref = FTB.axis_twin(ksref[1])
     Test.@test (tw === nothing) == (twref === nothing)
     if tw !== nothing
         for (a, b) in zip(tw.slices, twref.slices)
@@ -74,7 +74,7 @@ Test.@testset "Curvilinear Cartesian transforms as a point cloud" begin
         Test.@test cv_rel(cn, c) < 1e-11
         # and a reusable plan over the same grid
         p = FFS.plan_spectrum(g, Float64, ms; transform = tr, eps = 1e-12)
-        buf = zeros(ComplexF64, FFS.Packing.packed_size(ms, Val(true))...)
+        buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
         FFS.calculate_spectrum!(buf, p, f)
         Test.@test cv_rel(buf, cn) < 1e-11
     end
@@ -93,7 +93,7 @@ Test.@testset "Curvilinear Cartesian transforms as a point cloud" begin
     # Batched.
     fb = randn(n, n, 3)
     cb, _ = FFS.calculate_spectrum(g, fb, ms; transform = CV_DS, execution = CV_SER)
-    Test.@test size(cb) == (FFS.Packing.packed_size(ms, Val(true))..., 3)
+    Test.@test size(cb) == (FTB.packed_size(ms, Val(true))..., 3)
     for b in 1:3
         c1, _ = FFS.calculate_spectrum(g, fb[:, :, b], ms; transform = CV_DS, execution = CV_SER)
         Test.@test cv_rel(cb[:, :, b], c1) < 1e-13

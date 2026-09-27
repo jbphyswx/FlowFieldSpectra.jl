@@ -68,13 +68,10 @@ A uniform grid needs none.
 ### The packed layout
 
 A real Cartesian field transforms to the rfft-packed half `(m_1÷2+1, m_2…, batch…)`, the complete
-Hermitian representation of its spectrum. `unpacked` expands that half to the full native-order cube
-when a caller wants every mode addressable.
-
-```@docs
-unpacked
-unpacked!
-```
+Hermitian representation of its spectrum, over the wavenumber axes `FlowTransformBindings.RFFTAxis`
+(axis 1) and `FlowTransformBindings.FFTAxis`. `FlowTransformBindings.unpacked` expands the half to the
+full native-order cube; given the `ks` a transform returned, it reads the Nyquist twin a nonuniformly
+sampled grid needs.
 
 ## Grids
 

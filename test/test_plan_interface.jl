@@ -41,7 +41,7 @@ function pi_agrees(name, g, f, ms; batch = (), kw...)
     end
 
     # `allocate_coefficients` is the point of the pair: a plan alone is enough to preallocate against,
-    # with no reach into `Packing` and no throwaway allocating call to learn the shape.
+    # with no reach into the layout and no throwaway allocating call to learn the shape.
     buf = FFS.allocate_coefficients(p)
     Test.@test size(buf) == size(c)
     Test.@test eltype(buf) === eltype(c)
@@ -93,7 +93,7 @@ Test.@testset "A Cartesian plan answers for its own coefficients" begin
 
     # A halved axis carries its Nyquist twin, so the axes a reduction needs come from the plan too.
     p = FFS.plan_spectrum(gs, Float64, (N, N); transform = SB.DirectSumSpectralBackend(), execution = PI_SER)
-    Test.@test FFS.Packing.axis_twin(FFS.wavenumbers(p)[1]) !== nothing
+    Test.@test FTB.axis_twin(FFS.wavenumbers(p)[1]) !== nothing
 
     # The grid form checks the shape it writes as the plans do.
     Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(zeros(ComplexF64, (N ÷ 2 + 1) * N), gs,

@@ -1,6 +1,7 @@
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW           # activates the FFT extension
-using FINUFFT: FINUFFT     # activates the NUFFT extension
+using FINUFFT: FINUFFT     # activates FlowTransformBindings' FINUFFT binding
 using CairoMakie: CairoMakie as Mke
 using Random: Random
 using SpectralBackends: SpectralBackends as SB
@@ -40,7 +41,7 @@ function run_cartesian_example()
     vs = @. -sin(2 * xj) * cos(2 * yj)
     gscat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xj, yj), ones(N^2);
         periodic = (true, true), period = (L, L))
-    c_nu, k_nu = FFS.calculate_spectrum(gscat, (us, vs), (N, N); transform = FFS.FINUFFTBackend())
+    c_nu, k_nu = FFS.calculate_spectrum(gscat, (us, vs), (N, N); transform = FTB.FINUFFTBackend())
     k_bins_s, E_k_s = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 32, dims = 3)
 
     # 4. Figure.

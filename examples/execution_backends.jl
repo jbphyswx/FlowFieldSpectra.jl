@@ -55,9 +55,10 @@ function run_execution_backends_example()
     # using CUDA; dev = CB.GPUBackend(CUDA.CUDABackend())
     #   FFS.calculate_spectrum(grid, f, ms; transform=SB.FFTSpectralBackend(),  execution=dev)   # CUFFT
     #   scat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(length(xv)); periodic=(true,true), period=(L,L))
-    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.FINUFFTBackend(), execution=dev)  # cuFINUFFT
+    #   using FINUFFT; using FlowTransformBindings: FlowTransformBindings as FTB
+    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FTB.FINUFFTBackend(), execution=dev)  # cuFINUFFT
     # using Distributed; addprocs(4); @everywhere using FlowFieldSpectra, FINUFFT
-    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FFS.FINUFFTBackend(), execution=CB.DistributedBackend())
+    #   FFS.calculate_spectrum(scat, fscat, ms; transform=FTB.FINUFFTBackend(), execution=CB.DistributedBackend())
     # using MPI; MPI.Init()
     #   FFS.calculate_spectrum(scat, fscat, ms; transform=SB.DirectSumSpectralBackend(), execution=CB.MPIBackend())
 

@@ -16,6 +16,7 @@ using FINUFFT: FINUFFT
 using AbstractFFTs: AbstractFFTs
 using KernelAbstractions: KernelAbstractions as KA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using Random: Random
 using Test: Test
 using ComputationalBackends: ComputationalBackends as CB
@@ -53,8 +54,8 @@ function main()
         py = rand(M) .* L
         fs = @. cos(px) + sin(2py)                             # (M,) scattered field
         sg = FG.Grids.UnstructuredGrid(cart, (px, py), ones(M); periodic = (true, true), period = (L, L))
-        c_finufft, _ = FFS.calculate_spectrum(sg, fs, ms; transform = FFS.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
-        c_cuf, _ = FFS.calculate_spectrum(sg, fs, ms; transform = FFS.FINUFFTBackend(), execution = dev, eps = 1e-12)
+        c_finufft, _ = FFS.calculate_spectrum(sg, fs, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
+        c_cuf, _ = FFS.calculate_spectrum(sg, fs, ms; transform = FTB.FINUFFTBackend(), execution = dev, eps = 1e-12)
         Test.@test isapprox(Array(c_cuf), c_finufft; atol = 1e-8)
 
         # KA direct sum on the real CUDA device vs the serial CPU direct sum.

@@ -8,8 +8,9 @@ spectrum against the true spectrum from the full uniform grid.
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW                          # activates the FFT extension
-using FINUFFT: FINUFFT                    # activates the NUFFT extension
+using FINUFFT: FINUFFT                    # activates FlowTransformBindings' FINUFFT binding
 using Random: Random
 using SpectralBackends: SpectralBackends as SB
 using FlowGeometries: FlowGeometries as FG
@@ -42,7 +43,7 @@ fo = field.(xo, yo)                       # scattered field: a length-M vector
 # NUFFT on the irregular ocean-only cloud (an unstructured Cartesian grid).
 ocean_grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xo, yo),
     ones(length(xo)); periodic = (true, true), period = (L, L))
-c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-9)
+c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-9)
 k_b, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 24)
 ```
 

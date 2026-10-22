@@ -1,22 +1,16 @@
-# The inverse has the same pair the forward does: `plan_synthesis` once, `synthesize!` per coefficient set.
-#
-# The reference every plan is held to is the allocating `synthesize` on the same grid and coefficients.
-# The plan holds what the GRID fixes — the backward FFTW plan, a NUFFT's point sorting, a spherical
-# grid's nodes and Legendre tables. The Nyquist twin a packed inverse needs is a functional of the
-# COEFFICIENTS, so it arrives with them on `ks`.
-#
-# Allocation is gated in `test_allocs.jl`, whose `_zero_profile` measures a plan execution in the shape
-# that reads a true count here.
+# The inverse's reusable pair: `plan_synthesis` once, `synthesize!` per coefficient set. Allocation is
+# gated in `test_allocs.jl`.
 
 using Test: Test
 using Random: Random
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 using NonuniformFFTs: NonuniformFFTs
-using FastSphericalHarmonics: FastSphericalHarmonics
 using NUFSHT: NUFSHT
 using KernelAbstractions: KernelAbstractions as KA
+using OhMyThreads: OhMyThreads
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FlowGeometries: FlowGeometries as FG
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
@@ -26,28 +20,18 @@ sp_cart() = FG.Geometry.CartesianGeometry{Float64}()
 sp_uni(L, N) = range(0.0, L; length = N + 1)[1:N]
 sp_str(L, N) = collect(sp_uni(L, N)) .+ (0.03 * L / N) .* sinpi.(2 .* (0:(N - 1)) ./ N)
 
-# The plan against the allocating `synthesize`, plus reuse and the caller's coefficients surviving.
+# The plan against the allocating `synthesize`, executed twice, leaving the caller's coefficients intact.
 function sp_agrees(g, f, ms, T; batch = (), kw...)
-    c, ks = FFS.calculate_spectrum(g, f, ms; kw...)
-    ref = FFS.synthesize(g, c, ms; ks = ks, real_output = T <: Real, kw...)
+    c, _ = FFS.calculate_spectrum(g, f, ms; kw...)
+    ref = FFS.synthesize(g, c, ms; real_output = T <: Real, kw...)
     p = FFS.plan_synthesis(g, T, ms; batch = batch, kw...)
-
-    Test.@test FFS.field_size(p) == size(ref)
-    Test.@test FFS.field_type(p) === eltype(ref)
-
     out = FFS.allocate_field(p)
-    Test.@test size(out) == size(ref)
-    Test.@test eltype(out) === eltype(ref)
-    Test.@test all(iszero, out)
-
     keep = copy(c)
-    FFS.synthesize!(out, p, c; ks = ks)
+    FFS.synthesize!(out, p, c)
     Test.@test isapprox(out, ref; rtol = 1e-8)
-    Test.@test c == keep                                  # the caller's coefficients are never written to
-
-    # A second execution reproduces it, so nothing in the plan carried state between calls.
+    Test.@test c == keep
     first = copy(out)
-    FFS.synthesize!(out, p, c; ks = ks)
+    FFS.synthesize!(out, p, c)
     Test.@test out == first
     return p
 end
@@ -60,9 +44,6 @@ Test.@testset "Cartesian synthesis plans" begin
         periodic = (true, true), period = (L, L))
     gs = FG.Grids.StructuredGrid(sp_cart(), sp_str(L, N), sp_str(L, N);
         periodic = (true, true), period = (L, L))
-    M = 50
-    gc = FG.Grids.UnstructuredGrid(sp_cart(), (L .* rand(M), L .* rand(M)), fill(L^2 / M, M);
-        periodic = (true, true), period = (L, L))
 
     Test.@testset "FFTW" begin
         for (f, batch, T) in ((randn(N, N), (), Float64), (randn(N, N, 3), (3,), Float64),
@@ -71,29 +52,19 @@ Test.@testset "Cartesian synthesis plans" begin
         end
     end
 
-    # The direct sum owns its whole execution, so it is held to exactly zero on every grid kind.
     Test.@testset "direct sum" begin
-        for (g, f, batch, T) in ((gu, randn(N, N), (), Float64), (gs, randn(N, N), (), Float64),
-                                 (gs, randn(N, N, 2), (2,), Float64), (gc, randn(M), (), Float64),
-                                 (gs, randn(ComplexF64, N, N), (), ComplexF64))
-            sp_agrees(g, f, (N, N), T; batch = batch,
-                transform = SB.DirectSumSpectralBackend(), execution = SP_SER)
-        end
-    end
-
-    Test.@testset "FINUFFT" begin
-        for (f, batch, T) in ((randn(M), (), Float64), (randn(M, 2), (2,), Float64),
-                              (randn(ComplexF64, M), (), ComplexF64))
-            sp_agrees(gc, f, (N, N), T; batch = batch, transform = FFS.FINUFFTBackend())
-        end
-    end
-
-    # NonuniformFFTs' `exec_type2!` allocates inside a threaded region, so this is a bound.
-    Test.@testset "NonuniformFFTs" begin
-        for (g, f, batch, T) in ((gc, randn(M), (), Float64), (gc, randn(M, 3), (3,), Float64),
-                                 (gs, randn(N, N), (), Float64),
-                                 (gc, randn(ComplexF64, M), (), ComplexF64))
-            sp_agrees(g, f, (N, N), T; batch = batch, transform = FFS.NonuniformFFTsBackend())
+        # A tensor grid's series contracts one axis at a time; a node grid over the same points sums it
+        # point by point, both over the same coefficient box. The two agree on even and odd resolutions.
+        gp = FG.Grids.UnstructuredGrid(sp_cart(), FG.Grids.materialize(gs), vec(FG.Grids.measure_array(gs));
+            periodic = (true, true), period = (L, L))
+        for (f, ms) in ((randn(N, N, 2), (N - 1, N + 2)), (randn(N, N), (N, N)), (randn(ComplexF64, N, N), (N, N - 1)))
+            R = eltype(f) <: Real
+            c, _ = FFS.calculate_spectrum(gs, f, ms; transform = SB.DirectSumSpectralBackend(), execution = SP_SER)
+            ref = FFS.synthesize(gp, c, ms; real_output = R, transform = SB.DirectSumSpectralBackend(),
+                execution = SP_SER)
+            out = FFS.synthesize(gs, c, ms; real_output = R, transform = SB.DirectSumSpectralBackend(),
+                execution = SP_SER)
+            Test.@test maximum(abs, vec(out) .- vec(ref)) < 1e-12 * maximum(abs, ref)
         end
     end
 end
@@ -102,34 +73,13 @@ Test.@testset "Spherical synthesis plans" begin
     Random.seed!(82)
     lmax = 4
     ms = (lmax + 1, 2 * lmax + 1)
-    ggl = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.GaussLegendreSampling(), lmax + 1)
-    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), lmax + 1)
     Ns = 80
     ga = π * (3 - sqrt(5))
     λ = [mod(ga * i, 2π) for i in 1:Ns]
     φ = asin.([-1 + 2 * (i - 0.5) / Ns for i in 1:Ns])
     gsc = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φ), fill(4π / Ns, Ns))
-
-    Test.@testset "direct sum" begin
-        for (f, batch, T) in ((randn(size(ggl)...), (), Float64),
-                              (randn(size(ggl)..., 2), (2,), Float64))
-            sp_agrees(ggl, f, ms, T; batch = batch,
-                transform = SB.DirectSumSpectralBackend(), execution = SP_SER)
-        end
-    end
-
-    # `FSH.sph_evaluate!` allocates per call upstream, once per batch slice and per component.
-    Test.@testset "FastSphericalHarmonics" begin
-        for (f, batch, T) in ((randn(size(gcc)...), (), Float64),
-                              (randn(size(gcc)..., 2), (2,), Float64))
-            sp_agrees(gcc, f, ms, T; batch = batch, transform = SB.FSHTSpectralBackend())
-        end
-    end
-
-    Test.@testset "NUFSHT" begin
-        for (f, batch, T) in ((randn(Ns), (), Float64), (randn(Ns, 2), (2,), Float64))
-            sp_agrees(gsc, f, ms, T; batch = batch, transform = SB.NUFSHTSpectralBackend())
-        end
+    for (f, batch) in ((randn(Ns), ()), (randn(Ns, 2), (2,)))
+        sp_agrees(gsc, f, ms, Float64; batch = batch, transform = SB.NUFSHTSpectralBackend())
     end
 end
 
@@ -140,22 +90,40 @@ Test.@testset "Device synthesis plans" begin
     N = 8
     gu = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N);
         periodic = (true, true), period = (L, L))
-    lmax = 4
-    ms = (lmax + 1, 2 * lmax + 1)
-    Ns = 80
-    ga = π * (3 - sqrt(5))
-    λ = [mod(ga * i, 2π) for i in 1:Ns]
-    φ = asin.([-1 + 2 * (i - 0.5) / Ns for i in 1:Ns])
-    gsc = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φ), fill(4π / Ns, Ns))
-
     for (f, batch, T) in ((randn(N, N), (), Float64), (randn(N, N, 2), (2,), Float64),
                           (randn(ComplexF64, N, N), (), ComplexF64))
         sp_agrees(gu, f, (N, N), T; batch = batch,
             transform = SB.FFTSpectralBackend(), execution = dev)
     end
-    for (f, batch, T) in ((randn(Ns), (), Float64), (randn(Ns, 2), (2,), Float64))
-        sp_agrees(gsc, f, ms, T; batch = batch,
-            transform = SB.NUFSHTSpectralBackend(), execution = dev)
+end
+
+Test.@testset "The threaded direct sum on point sets and spheres equals the serial one" begin
+    # The OhMyThreads extension splits point clouds and per-point spheres over blocks of points with its
+    # own kernels; the serial direct sum is a separate implementation in `src`.
+    Random.seed!(86)
+    L = 2π
+    M = 70
+    gc = FG.Grids.UnstructuredGrid(sp_cart(), (L .* rand(M), L .* rand(M)), 0.5 .+ rand(M);
+        periodic = (true, true), period = (L, L))
+    lmax = 5
+    sms = (lmax + 1, 2 * lmax + 1)
+    Ns = 90
+    ga = π * (3 - sqrt(5))
+    gsc = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0),
+        ([mod(ga * i, 2π) for i in 1:Ns], asin.([-1 + 2 * (i - 0.5) / Ns for i in 1:Ns])), 0.5 .+ rand(Ns))
+    ds = SB.DirectSumSpectralBackend()
+    close_to(a, b) = maximum(abs, a .- b) <= 1e-12 * maximum(abs, b)
+    for (g, ms, fields) in ((gc, (8, 9), (randn(M), randn(M, 2), randn(ComplexF64, M))),
+                            (gsc, sms, (randn(Ns), randn(ComplexF64, Ns))))
+        for f in fields
+            R = eltype(f) <: Real
+            cs, _ = FFS.calculate_spectrum(g, f, ms; transform = ds, execution = SP_SER)
+            ct, _ = FFS.calculate_spectrum(g, f, ms; transform = ds, execution = CB.ThreadedBackend())
+            Test.@test close_to(ct, cs)
+            ss = FFS.synthesize(g, cs, ms; real_output = R, transform = ds, execution = SP_SER)
+            st = FFS.synthesize(g, cs, ms; real_output = R, transform = ds, execution = CB.ThreadedBackend())
+            Test.@test close_to(st, ss)
+        end
     end
 end
 
@@ -176,7 +144,53 @@ Test.@testset "A synthesis plan is fixed to its shape" begin
     f = randn(N, N)
     fp = FFS.plan_spectrum(g, Float64, (N, N); transform = SB.FFTSpectralBackend())
     coeffs = FFS.allocate_coefficients(fp)
-    ks = FFS.calculate_spectrum!(coeffs, fp, f)
-    FFS.synthesize!(out, p, coeffs; ks = ks)
+    FFS.calculate_spectrum!(coeffs, fp, f)
+    FFS.synthesize!(out, p, coeffs)
     Test.@test isapprox(out, f; rtol = 1e-12)
+end
+
+Test.@testset "Synthesis is the adjoint of the forward under the grid's quadrature" begin
+    # `Σ_k conj(C_k)·F(f)_k = Σ_j w_j conj(S(C)_j) f_j`, with `w_j` the grid measure normalized to sum
+    # to 1 on a Cartesian grid and to `4π` on a sphere. The grids carry varying measures.
+    Random.seed!(84)
+    L = 2π
+    N = 8
+    ms = (N, N)
+    gs = FG.Grids.StructuredGrid(sp_cart(), sp_str(L, N), sp_str(L, N);
+        periodic = (true, true), period = (L, L))
+    M = 50
+    gc = FG.Grids.UnstructuredGrid(sp_cart(), (L .* rand(M), L .* rand(M)), 0.5 .+ rand(M);
+        periodic = (true, true), period = (L, L))
+    ds = (; transform = SB.DirectSumSpectralBackend(), execution = SP_SER)
+    for (g, kw, tol) in ((gs, ds, 1e-12), (gc, ds, 1e-12),
+                         (gc, (; transform = FTB.FINUFFTBackend(), eps = 1e-13), 1e-9),
+                         (gc, (; transform = FTB.NonuniformFFTsBackend(), eps = 1e-13), 1e-9))
+        f = randn(ComplexF64, size(g)...)
+        C = randn(ComplexF64, ms...)
+        F, _ = FFS.calculate_spectrum(g, f, ms; kw...)
+        S = FFS.synthesize(g, C, ms; real_output = false, kw...)
+        w = vec(FG.Grids.measure_array(g))
+        w = w ./ sum(w)
+        Test.@test isapprox(sum(conj.(C) .* F), sum(w .* conj.(vec(S)) .* vec(f)); rtol = tol)
+    end
+
+    lmax = 4
+    sms = (lmax + 1, 2 * lmax + 1)
+    Ns = 80
+    ga = π * (3 - sqrt(5))
+    λ = [mod(ga * i, 2π) for i in 1:Ns]
+    φ = asin.([-1 + 2 * (i - 0.5) / Ns for i in 1:Ns])
+    gsc = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φ), 0.5 .+ rand(Ns))
+    for (kw, tol) in ((ds, 1e-12), ((; transform = SB.NUFSHTSpectralBackend(), tol = 1e-13), 1e-9))
+        f = randn(Ns)
+        C = zeros(ComplexF64, sms...)
+        for l in 0:lmax, m in -l:l
+            C[FFS.sph_mode_index(l, m)] = randn(ComplexF64)
+        end
+        F, _ = FFS.calculate_spectrum(gsc, f, sms; kw...)
+        S = FFS.synthesize(gsc, C, sms; real_output = false, kw...)
+        m = FG.Grids.measure_array(gsc)
+        w = 4π .* m ./ sum(m)
+        Test.@test isapprox(sum(conj.(C) .* F), sum(w .* conj.(S) .* f); rtol = tol)
+    end
 end

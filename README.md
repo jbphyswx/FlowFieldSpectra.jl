@@ -8,15 +8,15 @@
 
 `FlowFieldSpectra.jl` simplifies computing spectral coefficients, energy spectra, and spatial reductions (such as isotropic radial integration or dimension transects) across multi-dimensional grids. It supports **Cartesian** and **Spherical** coordinates on both **structured/uniform** and **unstructured/scattered** grids.
 
-Instead of writing custom FFT grid shifting, scaling, non-uniform coordinate mapping, or Legendre recurrence code, `FlowFieldSpectra.jl` handles the complexity behind a single type-stable function call: `calculate_spectrum`.
+FFT grid shifting, scaling, non-uniform coordinate mapping and Legendre recurrences sit behind a single type-stable call: `calculate_spectrum`.
 
 ---
 
 ## Core Features
 
 - **Unified, grid-typed interface**: one `calculate_spectrum` (and allocation-free `calculate_spectrum!`)
-  for any combination of coordinates, grid types, and dimensions — the grid type *is* the coordinate
-  system, so dispatch is exact with no coordinate guessing.
+  for any combination of coordinates, grid types, and dimensions; the grid type defines the coordinate
+  system.
 - **Cartesian & spherical**: Cartesian 1D / 2D / 3D / ND transforms; Spherical Harmonic Transforms on
   the sphere. Works for any number of field components (scalar, or 1-/2-/3-component vector flows).
 - **Structured & scattered grids**: uniform/rectilinear grids, and non-uniform / scattered / random
@@ -27,9 +27,9 @@ Instead of writing custom FFT grid shifting, scaling, non-uniform coordinate map
 - **Two orthogonal backend axes**: a `transform=` axis (the spectral math above) and an
   independent `execution=` axis — `SerialBackend`, `ThreadedBackend` (`OhMyThreads`),
   `GPUBackend` (`KernelAbstractions`: device-generic FFT via `AbstractFFTs` — CUFFT / rocFFT /
-  CPU-FFTW — and portable direct-sum kernels on *any* KA device, plus cuFINUFFT for scattered NUFFT
-  on CUDA), `DistributedBackend` (`Distributed`), and `MPIBackend` (`MPI`, incl. multi-GPU) — that
-  compose freely.
+  CPU-FFTW — the hybrid FFT/NUFFT composite, NonuniformFFTs on any KA device and cuFINUFFT on CUDA,
+  the spherical transforms, and portable direct-sum kernels on *any* KA device), `DistributedBackend`
+  (`Distributed`), and `MPIBackend` (`MPI`, incl. multi-GPU) — that compose freely.
 - **Reductions**: isotropic/radial binning, transects/slices, anisotropy-resolved `E(k, θ)`,
   wavenumber–frequency `E(k, ω)`, spherical degree spectra, compensated `kᵖE(k)` and band-integrated energy.
 - **Cross-analysis**: cross-/co-/quadrature spectra (flux by scale, e.g. `⟨u'w'⟩`), magnitude-squared
@@ -37,7 +37,8 @@ Instead of writing custom FFT grid shifting, scaling, non-uniform coordinate map
 - **Derived-quantity spectra**: vorticity, divergence, and enstrophy spectra via spectral differentiation
   (`Z(k) = k²E(k)` holds on incompressible 2D fields).
 - **Irregular sampling**: Lomb–Scargle periodogram for unevenly-sampled series (moorings, drifters, tracks).
-- **Synthesis & filtering**: first-class inverse transform for spectral filtering and round-trip validation.
+- **Synthesis & filtering**: first-class synthesis for spectral filtering and round-trip validation; it
+  inverts the transform on a uniform periodic grid and is its adjoint under the grid's quadrature on any grid.
 - **Performance**: reusable FFTW/FINUFFT plans with batched trailing axes (build once, reuse across
   z/t/components), transparent real-input `rfft` fast path, cached spherical Legendre tables, and `Float32`
   support end-to-end.
@@ -55,11 +56,8 @@ Pkg.add("FlowFieldSpectra")
 ```
 
 > **Julia 1.11+.** The package uses Project.toml `[sources]`/`[workspace]` (a Julia 1.11 feature) to
-> pull in the spherical backend [NUFSHT.jl](https://github.com/jbphyswx/NUFSHT.jl), which is not yet
-> in the General registry. Nothing in the source actually needs 1.11 — once NUFSHT and the sibling
-> packages are registered, the floor can drop back to 1.10 (possibly 1.9). If you only need the
-> Cartesian backends, or you `dev` NUFSHT locally, older Julia versions will likely work, but that is
-> untested.
+> pull in the spherical backend [NUFSHT.jl](https://github.com/jbphyswx/NUFSHT.jl), which is not in
+> the General registry.
 
 ---
 
@@ -70,7 +68,7 @@ By default, the package runs slow-path direct sums (DFT/SHT, ``O(N \cdot M)`` co
 | Grid Type | Coordinate System | Required Library | Backend Type | Description |
 |---|---|---|---|---|
 | **Structured** | Cartesian (ND) | `using FFTW` | `FFTSpectralBackend()` | Fast Fourier Transform via FFTW |
-| **Scattered** | Cartesian (ND) | `using FINUFFT` | `FINUFFTBackend()` | Non-uniform Fast Fourier Transform |
+| **Scattered / stretched** | Cartesian (ND) | `using NonuniformFFTs` or `using FINUFFT` | `FlowTransformBindings.NonuniformFFTsBackend()` / `FlowTransformBindings.FINUFFTBackend()` | Non-uniform Fast Fourier Transform through [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl) |
 | **Structured** | Spherical (2D) | `using FastSphericalHarmonics` | `FSHTSpectralBackend()` | Fast SHT on Clenshaw-Curtis grids |
 | **Scattered** | Spherical (2D) | `using NUFSHT` | `NUFSHTSpectralBackend()` | Non-uniform Fast SHT |
 | **Any** | Visualization | `using CairoMakie` | (Plotting Functions) | Enclosing plotting extension |
@@ -196,9 +194,10 @@ capability has a runnable, rendered [example in the docs](https://jbphyswx.githu
 See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/) for the full surface.
 
 ### Spectral calculation
-- `calculate_spectrum(grid, field, ms; transform=SB.DirectSumSpectralBackend(), execution=CB.AutoBackend(), kwargs...)`: complex coefficients + physical wavenumber grids. `field` is an N-D `AbstractArray` shaped `(spatial…, batch…)` — the grid fixes the leading spatial dims, every trailing dim is a preserved batch axis (components/levels/time/ensemble); a `Tuple` of equal-shaped arrays stacks them on a new trailing axis. The two backend axes are orthogonal and compose — `transform` (a `SpectralBackends` tag: which spectral math) × `execution` (a `ComputationalBackends` backend: serial/threaded/GPU/distributed/MPI).
+- `calculate_spectrum(grid, field, ms; transform=SB.AutoSpectralBackend(), execution=CB.AutoBackend(), kwargs...)`: coefficients + physical wavenumber grids. `field` is an N-D `AbstractArray` shaped `(spatial…, batch…)` — the grid fixes the leading spatial dims, every trailing dim is a preserved batch axis (components/levels/time/ensemble); a `Tuple` of equal-shaped arrays stacks them on a new trailing axis. The two backend axes are orthogonal and compose — `transform` (a `SpectralBackends` tag: which spectral math) × `execution` (a `ComputationalBackends` backend: serial/threaded/GPU/distributed/MPI).
 - `calculate_spectrum!(coeffs, plan, field)` / `plan_spectrum(grid, T, ms; transform, execution, batch=())`: reusable plans over a trailing batch shape for allocation-free, copy-free (real FFT) repeated transforms.
-- `synthesize(grid, coeffs, ms)`: inverse transform (spectral filtering, round-trip).
+- `synthesize(grid, coeffs, ms)`: the series evaluated at the grid's points (spectral filtering, round
+  trip); the inverse of `calculate_spectrum` on a uniform periodic grid, its adjoint on any grid.
 
 ### Reductions
 - `isotropic_spectrum(ks, coeffs; num_bins, dims=())`: radial integration to `E(k, batch…)` (batch preserved); `dims` folds designated batch axes (e.g. vector components) into the energy.
@@ -213,12 +212,10 @@ See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/)
 - `lomb_scargle(t, y, freqs)`: periodogram for irregularly-sampled series.
 
 ### Derived quantities
-- `spectral_vorticity(ks, coeffs)` / `spectral_divergence(ks, coeffs)`: spectral-differentiation operators.
+- `spectral_vorticity(ks, coeffs)` / `spectral_divergence(ks, coeffs)`: spectral-differentiation
+  operators, returning the derived field's coefficients on the same wavenumber axes `ks`.
 
 ### Plotting (with `CairoMakie`)
-- `plot_spectrum(ks, coeffs; title)`: plot 1D/2D Cartesian or spherical energy spectra.
-- `compare_spectra(spectra_list; labels)`: overlay multiple 1D spectra.
-- `compare_spectral_analysis(true_coeffs, approx_coeffs)`: spectral errors and coefficient deviations.
-
-
-### References
+- `plot_spectrum(ks, coeffs; title, u_idx)`: coefficient magnitude of one batch slice, a line in 1D and a heatmap in 2D.
+- `compare_spectra(results; u_idx)`: several spectra side by side, `results` an iterable of `label => (coeffs, ks)`.
+- `compare_spectral_analysis(input_data, results)`: `compare_spectra` with the input field plotted first.

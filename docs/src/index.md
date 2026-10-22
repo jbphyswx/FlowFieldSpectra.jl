@@ -26,8 +26,8 @@ A typical flow field spectral analysis consists of three main steps:
 ### Quickstart Tutorial: Cartesian 2D Flow Field
 
 A complete example computing the isotropic energy spectrum of a 2D uniform flow field. You
-construct an explicit **grid** (the coordinate system is the grid type — there is no guessing)
-and pass it to `calculate_spectrum`.
+construct an explicit **grid**, whose type defines the coordinate system, and pass it to
+`calculate_spectrum`.
 
 ```julia
 using FlowFieldSpectra: FlowFieldSpectra as FFS

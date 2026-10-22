@@ -6,8 +6,9 @@ Run from the root directory:
 """
 
 using FlowFieldSpectra: FlowFieldSpectra as FFS
+using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW                                       # activates the FFT extension
-using FINUFFT: FINUFFT                                 # activates the NUFFT extension
+using FINUFFT: FINUFFT                                 # activates FlowTransformBindings' FINUFFT binding
 using FastSphericalHarmonics: FastSphericalHarmonics as FSH
 using KernelAbstractions: KernelAbstractions as KA     # activates GPUBackend (+ device-generic GPU FFT)
 using OhMyThreads: OhMyThreads                         # activates ThreadedBackend
@@ -227,7 +228,7 @@ function generate_nufft_coastline_figure()
     fo = interp.(xo, yo)
 
     sgrid = scg((xo, yo); L = L)
-    c_nu, k_nu = FFS.calculate_spectrum(sgrid, fo, (N, N); transform = FFS.FINUFFTBackend(), eps = 1e-9)
+    c_nu, k_nu = FFS.calculate_spectrum(sgrid, fo, (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-9)
     knu, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 28)
 
     rng = 2:findlast(<=(0.6 * maximum(kr)), kr)
@@ -399,7 +400,7 @@ function generate_estimation_figure()
     K = 6
     V = FFS.dpss(Nx, 4.0, K)
     grid = FG.Grids.StructuredGrid(CART, x; periodic = (true,), period = (L,))
-    C = zeros(ComplexF64, Nx, K)
+    C = zeros(ComplexF64, Nx ÷ 2 + 1, K)          # a real field's packed half
     ks = nothing
     for k in 1:K
         c, ksk = FFS.calculate_spectrum(grid, V[:, k] .* sig, (Nx,); transform = SB.FFTSpectralBackend())
@@ -428,10 +429,10 @@ end
 
 # ─── Figure: execution-axis invariance (two orthogonal backend axes) ────────
 
-# The `execution=` axis says only WHERE/HOW a transform runs; it never changes the result. Here one
+# The `execution=` axis says only where and how a transform runs; it never changes the result. Here one
 # FFT transform is run under three execution backends — Serial, Threaded (OhMyThreads), and
-# GPUBackend(KA.CPU()) (the device-generic GPU FFT, which uses FFTW on the KA.CPU() host array
-# exactly as it would use CUFFT on a CUDA CuArray) — and the recovered spectra coincide to machine ε.
+# GPUBackend(KA.CPU()) (the device-generic GPU FFT, which takes FFTW on the KA.CPU() host array and CUFFT
+# on a CUDA CuArray) — and the recovered spectra coincide to machine ε.
 function generate_execution_figure()
     L = 2π
     N = 96

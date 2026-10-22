@@ -6,13 +6,10 @@ export TransformProblem, spatial_shape, batch_shape, n_batch, batch_length,
     coeff_output_size, stack_fields
 
 # =============================================================================
-# The shape contract, taken from the grid — never guessed.
-#
-# A field on `grid` is an AbstractArray shaped `(spatial…, batch…)`: the first `ndims(grid)` dims are
-# spatial (and must equal `size(grid)`), and EVERY trailing dim is a batch dim (components / vertical
-# levels / time / ensemble — any number), carried through the transform and (by default) through the
-# reductions. The coefficient array is `(spectral…, batch…)`. `ndims`/`size` come from FlowGeometries:
-# `ndims(grid)` is `N` for a structured grid and `1` for an unstructured point cloud.
+# The shape contract, read from the grid. A field on `grid` is shaped `(spatial…, batch…)`: the first
+# `ndims(grid)` dims equal `size(grid)`, and every trailing dim is a batch dim (components, vertical
+# levels, time, ensemble), carried through the transform and the reductions. The coefficient array is
+# `(spectral…, batch…)`. `ndims(grid)` is `N` for a structured grid and `1` for a point cloud.
 # =============================================================================
 
 """

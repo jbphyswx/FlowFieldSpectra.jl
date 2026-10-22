@@ -48,9 +48,9 @@ k0 = 20
 sig = @. 0.25 * cos(k0 * x) + bg            # tone at k₀ on a k⁻² (red-noise) continuum
 
 K = 6
-V = FFS.dpss(Nx, 4.0, K)                    # N×K taper matrix (NW = 4)
+V = FFS.dpss(Nx, 4.0, K)                    # N×K tapers, unit mean square (NW = 4)
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x; periodic = (true,), period = (L,))
-C = zeros(ComplexF64, Nx, K)
+C = zeros(ComplexF64, Nx ÷ 2 + 1, K)        # a real field's packed half
 for k in 1:K
     c, ks1 = FFS.calculate_spectrum(grid, V[:, k] .* sig, (Nx,); transform = SB.FFTSpectralBackend())
     C[:, k] .= c
@@ -58,10 +58,10 @@ for k in 1:K
 end
 kb, Emt = FFS.welch_power_spectrum(ks, C; num_bins = 48)
 
-# Compare against a single taper computed the same way, so only the variance differs (the tapers
-# carry a normalization that a raw periodogram would not, which would offset the levels).
-kb1, Esingle = FFS.welch_power_spectrum(ks, C[:, 1:1]; num_bins = 48)
+# The untapered periodogram, at the same level: each taper has unit mean square.
+craw, _ = FFS.calculate_spectrum(grid, sig, (Nx,); transform = SB.FFTSpectralBackend())
+kb1, Eraw = FFS.welch_power_spectrum(ks, reshape(craw, :, 1); num_bins = 48)
 ```
 
-The multitaper estimate is markedly smoother than a single taper at the same level, while preserving
-the spectral peak at `k₀ = 20`.
+The multitaper estimate is markedly smoother than the raw periodogram at the same level, while
+preserving the spectral peak at `k₀ = 20`.

@@ -1,22 +1,23 @@
 module Preprocessing
 
-using LinearAlgebra: SymTridiagonal, eigen
+using LinearAlgebra: SymTridiagonal, eigen, pinv
 
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey,
     AbstractDetrend, NoDetrend, Demean, LinearDetrend,
-    Preprocess, window_function, window_function!, window_correction, detrend!, dpss,
-    is_identity, axis_taper, detrend_spatial!, apply_window!
+    Preprocess, window_value, window_function, window_function!, window_correction, detrend!, dpss,
+    is_identity, axis_taper, point_window, apply_window!, detrend_spatial!
 
 # =============================================================================
-# Window tapers (dispatch on type, not Symbol)
+# Window tapers
 # =============================================================================
 
 """
     AbstractWindow
 
-Supertype for apodization tapers applied per spectral axis before transforming. Concrete
-windows dispatch `window_function!`. Reduces spectral leakage for non-periodic data;
-only meaningful on uniform axes.
+Supertype for apodization windows applied before transforming. Concrete windows dispatch
+[`window_value`](@ref), the window at a fractional position `t ∈ [0, 1]` across the domain's extent in one
+direction; a field is multiplied by the product over directions at each point's position
+([`point_window`](@ref)). Reduces spectral leakage for non-periodic data.
 """
 abstract type AbstractWindow end
 
@@ -44,57 +45,37 @@ end
 Tukey() = Tukey(0.5)
 
 """
+    window_value(win::AbstractWindow, t::T) -> T
+
+The taper `win` at the fractional position `t ∈ [0, 1]` along an axis, `0` and `1` its two ends: Hann
+`½(1 − cos 2πt)`, Hamming `0.54 − 0.46 cos 2πt`, Blackman `0.42 − ½cos 2πt + 0.08 cos 4πt`, and Tukey(α) a
+Hann edge over `t < α/2` and `t > 1 − α/2`, one between.
+"""
+function window_value end
+
+window_value(::NoWindow, t::T) where {T} = one(T)
+window_value(::Hann, t::T) where {T} = T(0.5) * (1 - cospi(2t))
+window_value(::Hamming, t::T) where {T} = T(0.54) - T(0.46) * cospi(2t)
+window_value(::Blackman, t::T) where {T} = T(0.42) - T(0.5) * cospi(2t) + T(0.08) * cospi(4t)
+function window_value(win::Tukey, t::T) where {T}
+    α = T(win.alpha)
+    α <= 0 && return one(T)
+    α >= 1 && return window_value(Hann(), t)
+    s = min(t, 1 - t)
+    return s < α / 2 ? T(0.5) * (1 + cospi(2s / α - 1)) : one(T)
+end
+
+"""
     window_function!(w::AbstractVector, win::AbstractWindow) -> w
 
-Fill `w` (length `n`) in place with the taper `win`.
+Fill `w` (length `n`) in place with the taper `win` at the `n` evenly spaced positions
+`t = (i − 1)/(n − 1)`; a single sample takes one.
 """
-function window_function! end
-
-function window_function!(w::AbstractVector{T}, ::NoWindow) where {T}
-    fill!(w, one(T))
-    return w
-end
-
-function window_function!(w::AbstractVector{T}, ::Hann) where {T}
+function window_function!(w::AbstractVector{T}, win::AbstractWindow) where {T}
     n = length(w)
     n == 1 && return fill!(w, one(T))
     @inbounds for i in 1:n
-        w[i] = T(0.5) * (1 - cos(2 * T(π) * (i - 1) / (n - 1)))
-    end
-    return w
-end
-
-function window_function!(w::AbstractVector{T}, ::Hamming) where {T}
-    n = length(w)
-    n == 1 && return fill!(w, one(T))
-    @inbounds for i in 1:n
-        w[i] = T(0.54) - T(0.46) * cos(2 * T(π) * (i - 1) / (n - 1))
-    end
-    return w
-end
-
-function window_function!(w::AbstractVector{T}, ::Blackman) where {T}
-    n = length(w)
-    n == 1 && return fill!(w, one(T))
-    @inbounds for i in 1:n
-        x = T(π) * (i - 1) / (n - 1)
-        w[i] = T(0.42) - T(0.5) * cos(2x) + T(0.08) * cos(4x)
-    end
-    return w
-end
-
-function window_function!(w::AbstractVector{T}, win::Tukey) where {T}
-    n = length(w)
-    α = T(win.alpha)
-    (α <= 0 || n == 1) && return fill!(w, one(T))
-    α >= 1 && return window_function!(w, Hann())
-    fill!(w, one(T))
-    edge = floor(Int, α * (n - 1) / 2)
-    @inbounds for i in 0:edge
-        x = T(2i) / (α * (n - 1))
-        taper = T(0.5) * (1 + cos(T(π) * (x - 1)))
-        w[i+1] = taper
-        w[n-i] = taper
+        w[i] = window_value(win, T(i - 1) / (n - 1))
     end
     return w
 end
@@ -122,7 +103,7 @@ function window_correction(w::AbstractVector{T}) where {T}
 end
 
 # =============================================================================
-# Detrending (dispatch on type, not Symbol)
+# Detrending
 # =============================================================================
 
 """
@@ -178,21 +159,20 @@ function detrend!(x::AbstractVector{T}, ::LinearDetrend) where {T}
 end
 
 # =============================================================================
-# Preprocess spec (typed fields → compile-time dispatch downstream)
+# Preprocess spec
 # =============================================================================
 
 """
     Preprocess(; detrend=Demean(), window=NoWindow(), pad=1.0)
 
-Preprocessing applied to a field (per spectral axis) before transforming. Fields are typed
-(not symbols) so downstream code dispatches at compile time.
+Preprocessing applied to a field before transforming.
 
 - `detrend::AbstractDetrend`: `Demean()` (default), `NoDetrend()`, or `LinearDetrend()`.
 - `window::AbstractWindow`: `NoWindow()` (default), `Hann()`, `Hamming()`, `Blackman()`, `Tukey(α)`.
 - `pad::Float64`: zero-padding factor (`≥ 1`); `1.0` means none.
 
-Window power/amplitude corrections for variance preservation are applied by the normalization
-layer via `window_correction`.
+A window is scaled to unit mean square under the grid's measure ([`point_window`](@ref)), so the
+windowed field keeps the variance of the original.
 """
 struct Preprocess{D<:AbstractDetrend, W<:AbstractWindow}
     detrend::D
@@ -218,11 +198,9 @@ is_identity(p::Preprocess) = p.detrend isa NoDetrend && p.window isa NoWindow &&
 
 Length-`n` taper for one axis, scaled to unit mean square (`Σw²/n == 1`).
 
-Under that scaling the tapered field carries the variance of the original, so Parseval holds on the
-coefficients with no correction applied afterwards: with `C_w(k) = (1/N) Σ w f e^{-ikx}`, the folded sum
-`Σ_k |C_w|²` is `mean|w·f|²`, which returns `mean|f|²` exactly when `Σw²/n = 1` on every axis (the tensor
-product's mean square is the product of the axes'). `NoWindow` already satisfies it, so a rectangular
-window is an exact no-op.
+Under that scaling Parseval holds on the tapered coefficients: with `C_w(k) = (1/N) Σ w f e^{-ikx}`, the
+folded sum `Σ_k |C_w|²` is `mean|w·f|²`, which returns `mean|f|²` when `Σw²/n = 1` on every axis (the
+tensor product's mean square is the product of the axes'). `NoWindow` is an exact no-op.
 """
 function axis_taper(::Type{FT}, window::AbstractWindow, n::Integer) where {FT}
     w = window_function(window, n, FT)
@@ -232,27 +210,74 @@ function axis_taper(::Type{FT}, window::AbstractWindow, n::Integer) where {FT}
 end
 
 """
-    detrend_spatial!(field, detrend, nsp::Int)
+    point_window(::Type{FT}, window, xs, w) -> Vector{FT}
 
-Detrend the leading `nsp` spatial dims of `field` in place, per batch slice.
-
-`Demean` subtracts each slice's spatial mean, which needs no axes and so applies to any grid.
-`LinearDetrend` subtracts the least-squares linear trend along each spatial axis in turn — a separable
-plane removal — and so reads an axis order; a caller whose grid has none gets an `ArgumentError` from
-the entry point.
+The window at points with coordinates `xs` (one vector per direction, one entry per point): the product
+over directions of [`window_value`](@ref) at `t_d = (x_d − min x_d)/(max x_d − min x_d)`, scaled to unit
+mean square under the point weights `w`, `Σ w τ² / Σ w = 1`. On a uniform lattice of equal weights this
+is the tensor product of the [`axis_taper`](@ref)s.
 """
-detrend_spatial!(field, ::NoDetrend, nsp::Int) = field
+function point_window(::Type{FT}, window::AbstractWindow, xs::Tuple, w) where {FT}
+    N = length(first(xs))
+    τ = ones(FT, N)
+    for x in xs
+        lo, hi = extrema(x)
+        hi > lo || continue
+        @inbounds for j in 1:N
+            τ[j] *= window_value(window, FT((x[j] - lo) / (hi - lo)))
+        end
+    end
+    ms = sum(j -> FT(w[j]) * τ[j]^2, 1:N) / sum(j -> FT(w[j]), 1:N)
+    ms > 0 || throw(ArgumentError("$(nameof(typeof(window))) has zero energy over these $N points"))
+    return τ .* inv(sqrt(ms))
+end
 
-function detrend_spatial!(field::AbstractArray{T}, ::Demean, nsp::Int) where {T}
+"""
+    apply_window!(field, τ, nsp)
+
+Multiply every batch slice of `field` point by point by the window `τ` of [`point_window`](@ref), one
+entry per spatial point of the leading `nsp` dims in column-major order.
+"""
+function apply_window!(field::AbstractArray, τ::AbstractVector, nsp::Int)
     N = prod(ntuple(d -> size(field, d), nsp))
+    length(τ) == N || throw(DimensionMismatch("a window of $(length(τ)) entries for $N points"))
+    B = length(field) ÷ N
+    @inbounds for b in 1:B, j in 1:N
+        field[(b - 1) * N + j] *= τ[j]
+    end
+    return field
+end
+
+"""
+    detrend_spatial!(field, ::Demean, nsp, w)
+    detrend_spatial!(field, ::LinearDetrend, nsp, w, xs)
+
+Detrend the leading `nsp` spatial dims of `field` in place, per batch slice, under the point weights `w`
+(one per spatial point in column-major order). A point of zero weight is left out of every fit, the
+`NaN` masked data commonly holds included.
+
+`Demean` subtracts the weighted mean `Σ w f / Σ w`. `LinearDetrend` subtracts the weighted
+least-squares fit `a + Σ_d b_d x_d` in the point coordinates `xs` (one vector per direction), which
+leaves the residual orthogonal under `w` to the constant and to every coordinate.
+"""
+detrend_spatial!(field, ::NoDetrend, nsp::Int, args...) = field
+
+function detrend_spatial!(field::AbstractArray{T}, ::Demean, nsp::Int, w) where {T}
+    N = prod(ntuple(d -> size(field, d), nsp))
+    length(w) == N || throw(DimensionMismatch("$(length(w)) weights for $N points"))
+    R = real(float(T))
     B = length(field) ÷ N
     @inbounds for b in 1:B
         off = (b - 1) * N
         s = zero(T)
+        W = zero(R)
         for j in 1:N
-            s += field[off + j]
+            wj = R(w[j])
+            iszero(wj) && continue
+            s += wj * field[off + j]
+            W += wj
         end
-        m = s / N
+        m = s / W
         for j in 1:N
             field[off + j] -= m
         end
@@ -260,38 +285,46 @@ function detrend_spatial!(field::AbstractArray{T}, ::Demean, nsp::Int) where {T}
     return field
 end
 
-function detrend_spatial!(field::AbstractArray{T}, ::LinearDetrend, nsp::Int) where {T}
-    sp = ntuple(d -> size(field, d), nsp)
-    N = prod(sp)
-    B = length(field) ÷ N
-    @inbounds for b in 1:B
-        slice = reshape(view(field, ((b - 1) * N + 1):(b * N)), sp...)
-        for d in 1:nsp
-            pre = prod(ntuple(i -> sp[i], d - 1))
-            n = sp[d]
-            post = N ÷ (pre * n)
-            for q in 0:(post - 1), p in 1:pre
-                detrend!(view(reshape(slice, pre, n, post), p, :, q + 1), LinearDetrend())
-            end
+function detrend_spatial!(field::AbstractArray{T}, ::LinearDetrend, nsp::Int, w, xs::Tuple) where {T}
+    N = prod(ntuple(d -> size(field, d), nsp))
+    length(w) == N || throw(DimensionMismatch("$(length(w)) weights for $N points"))
+    all(x -> length(x) == N, xs) || throw(DimensionMismatch("every coordinate needs one value per point"))
+    R = real(float(T))
+    K = length(xs)
+    # The coordinates centred on their weighted means, so the constant separates from the slopes, and
+    # their weighted Gram matrix, shared by every slice.
+    W = sum(j -> iszero(w[j]) ? zero(R) : R(w[j]), 1:N)
+    x̄ = [sum(j -> iszero(w[j]) ? zero(R) : R(w[j]) * R(x[j]), 1:N) / W for x in xs]
+    G = zeros(R, K, K)
+    @inbounds for j in 1:N
+        iszero(w[j]) && continue
+        for a in 1:K, c in 1:K
+            G[a, c] += R(w[j]) * (R(xs[a][j]) - x̄[a]) * (R(xs[c][j]) - x̄[c])
         end
     end
-    return field
-end
-
-"""
-    apply_window!(field, tapers::Tuple, nsp::Int)
-
-Multiply the leading `nsp` spatial dims of `field` by the tensor product of `tapers`, in place, over
-every batch slice. One taper per spatial axis, each already scaled by [`axis_taper`](@ref).
-"""
-function apply_window!(field::AbstractArray{T}, tapers::Tuple, nsp::Int) where {T}
-    sp = ntuple(d -> size(field, d), nsp)
-    N = prod(sp)
+    Gp = pinv(G)
     B = length(field) ÷ N
+    r = zeros(T, K)
     @inbounds for b in 1:B
         off = (b - 1) * N
-        for (j, I) in enumerate(CartesianIndices(sp))
-            field[off + j] *= prod(ntuple(d -> tapers[d][I[d]], nsp))
+        fill!(r, zero(T))
+        s = zero(T)
+        for j in 1:N
+            iszero(w[j]) && continue
+            v = R(w[j]) * field[off + j]
+            s += v
+            for a in 1:K
+                r[a] += v * (R(xs[a][j]) - x̄[a])
+            end
+        end
+        m = s / W
+        slope = Gp * r
+        for j in 1:N
+            t = m
+            for a in 1:K
+                t += slope[a] * (R(xs[a][j]) - x̄[a])
+            end
+            field[off + j] -= t
         end
     end
     return field
@@ -302,17 +335,17 @@ end
 # =============================================================================
 
 """
-    dpss(N::Integer, NW::Real, K::Integer = floor(Int, 2NW) - 1; T = Float64) -> Matrix{T}
+    dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2NW) - 1); T = Float64) -> Matrix{T}
 
 Discrete prolate spheroidal sequences (Slepian tapers): the `K` length-`N` sequences with maximal
-spectral concentration in the half-bandwidth `W = NW/N`, returned as an `N×K` orthonormal matrix
-whose column `k` is the order-`(k-1)` taper. `NW` is the time–bandwidth product (typical `2.5`–`4`);
-`K ≈ 2·NW − 1` tapers are usefully concentrated.
+spectral concentration in the half-bandwidth `W = NW/N`, returned as an `N×K` matrix whose column `k` is
+the order-`(k-1)` taper. The columns are orthogonal with unit mean square (`V'V = N·I`), the scaling
+[`axis_taper`](@ref) gives a window, so a tapered copy's periodogram has the untapered level. `NW` is the
+time–bandwidth product (typical `2.5`–`4`); `K ≈ 2·NW − 1` tapers are usefully concentrated.
 
-Multitaper power spectral estimation reuses the ensemble machinery: apply each taper to the
-(demeaned) signal, transform the `K` tapered copies as a batch, and average their periodograms
-with [`welch_power_spectrum`]. The tapers are the eigenvectors of a symmetric tridiagonal matrix
-(Percival & Walden), computed here with `LinearAlgebra.eigen`.
+The tapers are the eigenvectors of a symmetric tridiagonal matrix (Percival & Walden). A multitaper
+estimate transforms the `K` tapered copies as a batch and averages their periodograms with
+[`welch_power_spectrum`](@ref).
 """
 function dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1);
         T::Type = Float64)
@@ -324,12 +357,14 @@ function dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1);
     F = eigen(SymTridiagonal(diag, offd))
     # eigenvalues ascending → DPSS orders 0..K-1 are the K largest (take last K, reverse).
     V = Matrix{T}(F.vectors[:, (N-K+1):N][:, end:-1:1])
-    # Polarity convention: even orders have positive sum; odd orders a positive leading lobe.
+    # Sign convention: an even order has a positive sum, an odd order a positive first moment about the
+    # centre.
     @inbounds for k in 1:K
         v = @view V[:, k]
         s = isodd(k) ? sum(v) : sum(j -> (j - (N + 1) / 2) * v[j], 1:N)
         s < 0 && (v .*= -one(T))
     end
+    V .*= sqrt(T(N))
     return V
 end
 

@@ -10,7 +10,6 @@
 # *.nc
 *.png
 !docs/src/assets/*.png
-!examples/*.png
 *.json
 *.in
 *.gz

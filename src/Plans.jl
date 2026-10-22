@@ -2,19 +2,17 @@ module Plans
 
 export AbstractSpectralPlan, plan_spectrum,
     coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
-    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field
+    AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 
 """
     AbstractSpectralPlan
 
-Supertype for reusable transform plans. A plan is tied to the *fixed* geometry of a problem —
-the grid coordinates, the spectral resolution `ms`, the trailing `batch` shape, and the element type —
-but not to the field *values*. Build a plan once with
-[`plan_spectrum`](@ref) and reuse it across many fields / batch slices / time steps via
-`calculate_spectrum!`, avoiding repeated FFTW/FINUFFT plan construction and point sorting.
+Supertype for reusable transform plans, tied to the grid, the spectral resolution `ms`, the trailing
+`batch` shape and the element type. Build one with [`plan_spectrum`](@ref) and execute it on many fields
+with `calculate_spectrum!`.
 
-Concrete plan types are defined in the backend extensions (e.g. the FFTW and FINUFFT
-extensions); this module only declares the shared interface.
+A plan holds working buffers that each execution overwrites, so one task at a time may execute it;
+tasks running concurrently each build their own plan.
 """
 abstract type AbstractSpectralPlan end
 
@@ -37,19 +35,18 @@ function plan_spectrum end
 
 Shape of the coefficient array `calculate_spectrum!(coeffs, plan, field)` fills, batch axes included.
 
-A real Cartesian field's is the packed half `(ms[1]÷2+1, ms[2:D]…, batch…)` and a complex one's the full
-native `(ms…, batch…)`; a spherical plan's is `(lmax+1, 2lmax+1, batch…)`.
+A real Cartesian field's is the packed half `(box[1]÷2+1, box[2:D]…, batch…)` of its coefficient box
+(`Grids.mode_box`) and a complex one's the full native `(ms…, batch…)`; a spherical plan's is
+`(lmax+1, 2lmax+1, batch…)`.
 """
 function coefficient_size end
 
 """
     coefficient_type(plan) -> Type
 
-Element type of that array. Cartesian coefficients are complex; a spherical plan's follow the field, real
-for a real one, because the basis is the real spherical harmonics.
-
-An allocation needs this as well as [`coefficient_size`](@ref), and
-[`allocate_coefficients`](@ref) takes both.
+Element type of the [`coefficient_size`](@ref) array. Cartesian coefficients are complex; a spherical
+plan's are real for a real field, the basis being the real spherical harmonics.
+[`allocate_coefficients`](@ref) reads both.
 """
 function coefficient_type end
 
@@ -59,9 +56,6 @@ function coefficient_type end
 The physical wavenumber axes the matching `calculate_spectrum` returns as its second value, in the same
 packed native order as the coefficients: `rfftfreq`-like on a halved axis, `fftfreq` on a full one, and
 `(0:lmax, -lmax:lmax)` for a spherical plan.
-
-A halved axis carries the Nyquist twin the transform attached, so the axes a reduction needs come from
-here as well.
 """
 function wavenumbers end
 
@@ -74,46 +68,57 @@ A zeroed coefficient array of this plan's own size and element type, ready for
 allocate_coefficients(plan::AbstractSpectralPlan) =
     zeros(coefficient_type(plan), coefficient_size(plan)...)
 
+# A transform writes its modes by linear index, so `coeffs` must have the shape it writes.
+function _check_coefficients(coeffs::AbstractArray, plan::AbstractSpectralPlan)
+    size(coeffs) == coefficient_size(plan) || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this plan writes $(coefficient_size(plan)) — allocate it with " *
+        "`allocate_coefficients(plan)`"))
+    return nothing
+end
+
+function _check_coefficients(coeffs::AbstractArray, want::Tuple)
+    size(coeffs) == want || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this transform writes $want"))
+    return nothing
+end
+
 # =============================================================================
-# Synthesis: the inverse's counterpart to the analysis pair above.
+# Synthesis: the series evaluated at the grid's points.
 # =============================================================================
 
 """
     AbstractSynthesisPlan
 
-Supertype for reusable inverse-transform plans, the counterpart to [`AbstractSpectralPlan`](@ref). A
-synthesis plan is tied to the grid, the spectral resolution `ms`, the trailing `batch` shape, the element
-type, and whether the output is real — everything except the coefficient *values*.
+Supertype for reusable synthesis plans, the counterpart to [`AbstractSpectralPlan`](@ref), tied to the
+grid, the spectral resolution `ms`, the trailing `batch` shape and the element type. Build one with
+[`plan_synthesis`](@ref) and execute it on many coefficient sets with [`synthesize!`](@ref).
 
-Build one with [`plan_synthesis`](@ref) and reuse it across many coefficient sets via
-[`synthesize!`](@ref), so a snapshot series on one grid builds its backward transform once. The forward
-and inverse are separate objects, so a caller that only inverts never builds a forward plan.
+A plan holds working buffers that each execution overwrites, so one task at a time may execute it;
+tasks running concurrently each build their own plan.
 """
 abstract type AbstractSynthesisPlan end
 
 """
     plan_synthesis(grid, ::Type{T}, ms; transform=AutoSpectralBackend(), execution=AutoBackend(),
-                   batch=(), real_output=true, iflag=1, kwargs...)
-    plan_synthesis(transform, execution, grid, ::Type{T}, ms; batch=(), real_output=true, kwargs...)
+                   batch=(), iflag=1, kwargs...)
+    plan_synthesis(transform, execution, grid, ::Type{T}, ms; batch=(), kwargs...)
 
-Construct a reusable [`AbstractSynthesisPlan`](@ref) inverting an `ms`-resolution spectrum on `grid` back
-to a field with trailing batch shape `batch`. `T` is the FIELD's element type, which fixes both the
-coefficient layout the plan consumes (the packed half for a real field, the full native cube for a
-complex one) and the output it writes.
+Construct a reusable [`AbstractSynthesisPlan`](@ref) evaluating an `ms`-resolution series at the points
+of `grid`, a field with trailing batch shape `batch`: what `synthesize` computes, the adjoint of the
+forward transform under the grid's quadrature and its inverse only where that quadrature is exact. `T`
+is the field's element type, which fixes both the coefficient layout the plan consumes (the packed half
+for a real field, the full native cube for a complex one) and the output it writes.
 
 Execute with `synthesize!(out, plan, coeffs)`.
 """
 function plan_synthesis end
 
 """
-    synthesize!(out, plan::AbstractSynthesisPlan, coeffs; ks=nothing) -> out
+    synthesize!(out, plan::AbstractSynthesisPlan, coeffs) -> out
 
-Fill preallocated `out` with the inverse transform of `coeffs`, reusing everything `plan` holds. `out` is
-[`field_size`](@ref)-shaped of [`field_type`](@ref); [`allocate_field`](@ref) provides one.
-
-`ks` is the wavenumber tuple the forward returned. A plan holds what the GRID fixes, while the Nyquist
-twin a packed inverse needs on a nonuniformly-sampled grid is a functional of the coefficients, so it
-arrives with them on `ks[1]`. A uniform grid needs none.
+Fill preallocated `out` with the series `coeffs` evaluated at the plan's grid points, reusing everything
+`plan` holds. `out` is [`field_size`](@ref)-shaped of [`field_type`](@ref); [`allocate_field`](@ref)
+provides one.
 """
 function synthesize! end
 
@@ -139,5 +144,13 @@ A zeroed field array of this plan's own size and element type, ready for
 `synthesize!(out, plan, coeffs)`.
 """
 allocate_field(plan::AbstractSynthesisPlan) = zeros(field_type(plan), field_size(plan)...)
+
+"""
+    close!(plan) -> nothing
+
+Release the library resources `plan` holds; idempotent. A plan over FINUFFT holds C memory that only this
+frees. A plan over a Julia-only transform holds none, and this does nothing.
+"""
+close!(::Union{AbstractSpectralPlan, AbstractSynthesisPlan}) = nothing
 
 end # module Plans

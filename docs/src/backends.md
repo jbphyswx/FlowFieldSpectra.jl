@@ -1,8 +1,6 @@
 # Backends and Extensions
 
-`FlowFieldSpectra.jl` separates spectral algorithms from library dependencies using Julia 1.9+'s package extensions mechanism. By default, the core package is extremely lightweight and has no heavy external compiled dependencies (like FFTW or FINUFFT).
-
-To activate optimized, high-performance backends, you simply import the corresponding package in your workspace.
+`FlowFieldSpectra.jl` separates spectral algorithms from library dependencies with package extensions. The core package has no compiled library dependencies such as FFTW or FINUFFT; each fast backend activates when you load its library.
 
 Backends come in **two orthogonal axes** that compose freely — the public API takes one of each as
 the `transform=` and `execution=` keywords. The tag types live in two shared packages:
@@ -19,12 +17,17 @@ the `transform=` and `execution=` keywords. The tag types live in two shared pac
 ```julia
 using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
+using FlowTransformBindings: FlowTransformBindings as FTB
 
 # FFT transform, run threaded:
 calculate_spectrum(grid, fields, ms; transform = SB.FFTSpectralBackend(), execution = CB.ThreadedBackend())
 # Fast NUFFT on a CUDA GPU (cuFINUFFT):
-calculate_spectrum(grid, fields, ms; transform = FFS.FINUFFTBackend(), execution = CB.GPUBackend(CUDABackend()))
+calculate_spectrum(grid, fields, ms; transform = FTB.FINUFFTBackend(), execution = CB.GPUBackend(CUDABackend()))
 ```
+
+The NUFFT library tags, `FTB.FINUFFTBackend()` and `FTB.NonuniformFFTsBackend()`, belong to
+[FlowTransformBindings.jl](https://github.com/jbphyswx/FlowTransformBindings.jl), which binds both
+libraries for the whole package stack.
 
 ---
 
@@ -38,16 +41,15 @@ checks each backend's precondition first, so the transform it names always appli
 | grid | Auto selects | precondition |
 | :--- | :--- | :--- |
 | uniform structured Cartesian | `FFTSpectralBackend()` | `ms[d] == size(grid, d)` on every axis; `using FFTW` |
-| uniform in some directions, stretched in others | `FFTSpectralBackend()` (hybrid) | axis 1 uniform; `using FFTW` + a NUFFT provider |
+| uniform in some directions, stretched in others | `FFTSpectralBackend()` (hybrid) | axis 1 uniform; the FFT provider (`using FFTW`, or the device's under `GPUBackend`) + a NUFFT provider |
 | nonuniform structured / scattered / curvilinear Cartesian | a NUFFT provider | `using NonuniformFFTs` or `using FINUFFT` |
 | FastTransforms' Clenshaw–Curtis sphere | `FSHTSpectralBackend()` | grid size matches `ms` and the nodes are that grid; `using FastSphericalHarmonics` |
 | any other spherical grid | `NUFSHTSpectralBackend()` | `using NUFSHT` |
 | nothing loaded for it | `DirectSumSpectralBackend()` | warns once, naming the package to load |
 
-Two entry points differ. `calculate_spectrum!(coeffs, grid, field, ms)` is implemented for the direct
-sum, whose transform needs no plan, so Auto names it there; the library transforms execute in place
-through a plan. And `plan_spectrum` raises for `DirectSumSpectralBackend()`, which precomputes nothing a
-plan could hold.
+`calculate_spectrum!(coeffs, grid, field, ms)` defaults to the direct sum, which writes `coeffs`
+directly; Auto resolves there by the rules above, and every library transform runs through a plan built
+for the call. `plan_spectrum` holds a reusable plan for every transform, the direct sum included.
 
 ## Backend Selection Matrix (transform axis)
 
@@ -57,9 +59,9 @@ To choose explicitly, match the grid structure (structured vs. scattered/non-uni
 | :--- | :--- | :--- | :--- | :--- |
 | **Cartesian** | Uniform / Regular | `DirectSumSpectralBackend()` | `FFTSpectralBackend()` | `using FFTW` |
 | **Cartesian** | Uniform in some directions, stretched in others | `DirectSumSpectralBackend()` | `FFTSpectralBackend()` (hybrid) | `using FFTW` + a NUFFT provider |
-| **Cartesian** | Nonuniform tensor grid (all axes stretched) | `DirectSumSpectralBackend()` | `NonuniformFFTsBackend()` | `using NonuniformFFTs` |
-| **Cartesian** | Scattered / Unstructured | `DirectSumSpectralBackend()` | `FINUFFTBackend()` | `using FINUFFT` |
-| **Cartesian** | Curvilinear (`CurvilinearGrid`) | `DirectSumSpectralBackend()` | `FINUFFTBackend()` / `NonuniformFFTsBackend()` | `using FINUFFT` / `using NonuniformFFTs` |
+| **Cartesian** | Nonuniform tensor grid (all axes stretched) | `DirectSumSpectralBackend()` | `FTB.NonuniformFFTsBackend()` / `FTB.FINUFFTBackend()` | `using NonuniformFFTs` / `using FINUFFT` |
+| **Cartesian** | Scattered / Unstructured | `DirectSumSpectralBackend()` | `FTB.NonuniformFFTsBackend()` / `FTB.FINUFFTBackend()` | `using NonuniformFFTs` / `using FINUFFT` |
+| **Cartesian** | Curvilinear (`CurvilinearGrid`) | `DirectSumSpectralBackend()` | `FTB.NonuniformFFTsBackend()` / `FTB.FINUFFTBackend()` | `using NonuniformFFTs` / `using FINUFFT` |
 | **Spherical** | Structured (Clenshaw-Curtis) | `DirectSumSpectralBackend()` | `FSHTSpectralBackend()` | `using FastSphericalHarmonics` |
 | **Spherical** | Iso-latitude rings (HEALPix, reduced Gaussian) | `DirectSumSpectralBackend()` (ring-factorized) | — | none |
 | **Spherical** | Scattered / Unstructured / panel pixelizations | `DirectSumSpectralBackend()` | `NUFSHTSpectralBackend()` | `using NUFSHT` |
@@ -93,14 +95,14 @@ structure.
 
 ### Spherical layout routing
 
-The spherical transform picks its algorithm from the grid's **sampling**, whose traits
-(`FlowGeometries.SphericalSampling.is_tensor_product`, `is_iso_latitude`) state the structure it has —
-not from the grid's Julia type, which cannot distinguish the middle case:
+The spherical transform picks its algorithm from `FlowGeometries.Grids.ring_structure(grid)`, which
+reports whether the grid's cells form complete latitude rows, iso-latitude rings, or neither. A masked
+tensor grid, or one over a spheroid, takes the ring path:
 
 | layout | grids | algorithm | cost |
 | :--- | :--- | :--- | :--- |
 | tensor product | `StructuredGrid` (Gauss–Legendre, Clenshaw–Curtis, Driscoll–Healy, lat–lon) | longitude DFT on the shared `λ` axis, then a θ-Legendre contraction | `O(nlat·L²)` |
-| iso-latitude rings | `HEALPixGrid`, `RingGrid` (reduced/octahedral Gaussian) | longitude sum per ring (each ring has its own `nlon` and quadrature weight), then the same θ contraction over rings | `O(N·L + nrings·L²)` |
+| iso-latitude rings | `HEALPixGrid`, `RingGrid` (reduced/octahedral Gaussian), a masked `StructuredGrid` | longitude sum per ring over its own `nlon` points, each at its own quadrature weight, then the same θ contraction over rings | `O(N·L + nrings·L²)` |
 | point cloud | `UnstructuredGrid`, `CubedSphereGrid`, `IcosahedralGrid`, `YinYangGrid`, Fibonacci nodes | per-point projection | `O(N·L²)` |
 
 Whether a grid's quadrature is *exact* at its stated band limit is also a declared trait,
@@ -108,7 +110,7 @@ Whether a grid's quadrature is *exact* at its stated band limit is also a declar
 **false** for Clenshaw–Curtis (whose weights support analysis only to `lmax ≈ (nlat−1)/2`) and for the
 equal-area pixelizations. Use a Gauss–Legendre grid when analysis must be exact at the band limit.
 
-Measured single-harmonic round trips at each sampling's own band limit:
+Single-harmonic round trips at each sampling's own band limit:
 
 | sampling | `nlat` | `bandlimit` | exact by trait | round trip |
 | :--- | :--- | :--- | :--- | :--- |
@@ -119,8 +121,8 @@ Measured single-harmonic round trips at each sampling's own band limit:
 **Degrees are checked against the sampling.** `ms[1] - 1` is the requested degree, and each sampling
 states what its latitude count supports through `SphericalSampling.bandlimit`. That relation varies by
 sampling: Driscoll–Healy's is `nlat÷2 - 1` where Gauss–Legendre's and Clenshaw–Curtis's are `nlat - 1`.
-Asking for a higher degree emits one warning naming the limit and returns the coefficients, so a caller
-who wants them still gets them. `McEwenWiauxSampling` has no implemented latitude quadrature upstream and
+Asking for a higher degree emits one warning naming the limit and still returns the coefficients.
+`McEwenWiauxSampling` has no implemented latitude quadrature upstream and
 raises.
 
 ---
@@ -130,7 +132,9 @@ raises.
 ### `DirectSumSpectralBackend`
 - **Use Case**: Reference calculations, small grids, or zero-dependency runs.
 - **Mathematical Method**: Direct Discrete Fourier Transform (DFT) summation or Spherical Harmonic Transform (SHT) direct integration via Legendre recurrence relations.
-- **Complexity**: ``O(N \cdot M)``, where ``N`` is the number of grid nodes and ``M`` is the number of spectral modes.
+- **Complexity**: ``O(N \cdot M)`` on a point set, where ``N`` is the number of grid nodes and ``M`` is the
+  number of spectral modes. A tensor grid's forward and synthesis each take one dense matrix product per
+  axis, ``O(N \cdot \sum_d m_d)``.
 - **Dependencies**: None.
 
 ### `FFTSpectralBackend`
@@ -142,10 +146,15 @@ raises.
   transform: one FFT across all the uniform axes, then a 1-D type-1 NUFFT along each stretched axis, with
   every other spatial and batch dimension carried as that pass's batch. Axis 1 must be uniform; where it
   is stretched, use a NUFFT backend, whose separable path transforms every axis.
+  `synthesize` and `plan_synthesis` invert the same split: a backward FFT over the uniform axes and a
+  type-2 NUFFT along each stretched one, over the coefficient box a real field's packed half covers.
 - **Complexity**: ``O(N \log N)`` uniform; hybrid pays the NUFFT only along the stretched axes.
+- **Planning**: `plan_spectrum` and `plan_synthesis` plan FFTW with `MEASURE`, for a plan held across many
+  executions; `measure = false` takes `ESTIMATE`. A one-shot `calculate_spectrum`, `calculate_spectrum!`
+  or `synthesize` plans with `ESTIMATE`.
 - **Dependencies**: Requires `using FFTW`. The hybrid also needs a NUFFT provider for its stretched axes
-  (`using NonuniformFFTs` or `using FINUFFT`); choose it with `nufft = NonuniformFFTsBackend()`, or leave
-  the default and whichever provider is loaded is used.
+  (`using NonuniformFFTs` or `using FINUFFT`); choose it with `nufft = FTB.NonuniformFFTsBackend()`, or
+  leave the default, which takes NonuniformFFTs when loaded and FINUFFT otherwise.
 
 ```julia
 # uniform in x, stretched in z: FFT along x, 1-D NUFFT along z
@@ -156,16 +165,21 @@ grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(),
 coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nz); transform = SB.FFTSpectralBackend())
 ```
 
-### NUFFT — `FINUFFTBackend` / `NonuniformFFTsBackend`
-- **Use Case**: Scattered spatial points in Cartesian coordinates (e.g. ship tracks, sensor arrays, float data).
+### NUFFT — `FTB.FINUFFTBackend` / `FTB.NonuniformFFTsBackend`
+- **Use Case**: Scattered spatial points in Cartesian coordinates (e.g. ship tracks, sensor arrays, float data),
+  nonuniform tensor grids and curvilinear grids.
 - **Mathematical Method**: Non-Uniform Fast Fourier Transform (Type-1). `SpectralBackends.NUFFTSpectralBackend`
-  is the abstract math; a *provider* is a library choice, so FlowFieldSpectra exposes two symmetric,
-  concrete backends (neither is a default) — pass one as `transform=`:
-  - **`FINUFFTBackend()`** — via `FINUFFT.jl` (`using FINUFFT`; GPU via cuFINUFFT on CUDA).
-  - **`NonuniformFFTsBackend()`** — via `NonuniformFFTs.jl` (`using NonuniformFFTs`); a real-data fast path
-    (real-to-complex FFT — ≈2× faster and half the memory when the field is real).
+  names no library; pass a FlowTransformBindings tag as `transform=`:
+  - **`FTB.NonuniformFFTsBackend()`** — via `NonuniformFFTs.jl` (`using NonuniformFFTs`). A real field takes
+    its real-data plan, whose oversampled grid holds the modes at `+m_d/2` the widened coefficient box
+    adds.
+  - **`FTB.FINUFFTBackend()`** — via `FINUFFT.jl` (`using FINUFFT`; GPU via cuFINUFFT with `using CUDA`). A
+    real field takes complex strengths with one extra axis-1 mode, so each mode at `+m_d/2` is a conjugate
+    read.
+- **Tolerance**: `eps=` is the requested relative accuracy; the default is
+  `FlowTransformBindings.default_tolerance`, `1e-9` in `Float64` and `1e-6` in `Float32`.
 - **Complexity**: ``O(N \log N + M \log(1/\epsilon))``.
-- **Dependencies**: `using FINUFFT` and/or `using NonuniformFFTs`. Both may be loaded at once.
+- **Dependencies**: `using NonuniformFFTs` and/or `using FINUFFT`. Both may be loaded at once.
 
 ### `FSHTSpectralBackend`
 - **Use Case**: Regular spherical model grids (equiangular, Clenshaw-Curtis, etc.).
@@ -178,8 +192,8 @@ coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nz); transform = SB.FFTSpectra
 - **Mathematical Method**: Non-Uniform Fast Spherical Harmonic Transform via `NUFSHT.jl`.
 - **Complexity**: ``O(M \log M + N \log(1/\epsilon))`` (where ``M`` is number of modes, ``N`` is number of points).
 - **Dependencies**: Requires `using NUFSHT`.
-- **Note on Coefficient Recovery**: Because scattered points are unstructured, the direct SHT projection (adjoint) is not the exact inverse. The backend supports an iterative Conjugate Gradient solver via `solve=true` to accurately reconstruct coefficients from scattered data.
-- **NUFFT engine**: `nufft=` picks NUFSHT's internal non-uniform FFT (a `NUFSHT`/`SpectralBackends` marker; default `AutoSpectralBackend()` ⇒ FINUFFT). Pass `nufft=NUFSHT.NonuniformFFTsBackend()` for the real-data half-spectrum fast path on a real field. A reusable plan (`plan_spectrum` + `calculate_spectrum!`) presets the points / NUFSHT plan / CG workspace once for a fixed point set.
+- **Note on Coefficient Recovery**: Because scattered points are unstructured, the direct SHT projection (adjoint) is not the exact inverse. `solve=true` fits the coefficients to scattered data by LSMR least squares. On a masked grid, `inactive = ZeroFill()` (the default) fits the field extended by zero over every node, and `inactive = Exclude()` fits the active nodes as their own point set; neither reads a masked value.
+- **NUFFT engine**: `nufft=` picks the NUFFT library NUFSHT runs, `FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()`; both take real strengths for a real field. The default `AutoSpectralBackend()` takes NonuniformFFTs when it is loaded and FINUFFT when only it is. A reusable plan (`plan_spectrum` + `calculate_spectrum!`) presets the points, the NUFSHT plan and the LSMR workspace once for a fixed point set.
 
 ---
 
@@ -191,7 +205,7 @@ transform axis. Defaults to `AutoBackend()`.
 | Execution backend | Required library | Notes |
 | :--- | :--- | :--- |
 | `SerialBackend()` | none | Single-threaded CPU (always available). |
-| `ThreadedBackend()` | `using OhMyThreads` | Multithreaded CPU: parallelises the direct-sum loop; sets the internal thread count of the FFTW (`FFTSpectralBackend`) and FINUFFT (`FINUFFTBackend`) plans (`NonuniformFFTsBackend` manages its own internal threading). `FSHTSpectralBackend`/`NUFSHTSpectralBackend` have no distinct threaded path (execution is a documented no-op there). |
+| `ThreadedBackend()` | `using OhMyThreads` | Multithreaded CPU: parallelises the direct sum over a point set or a sphere, one-shot and plan alike; builds the FFTW (`FFTSpectralBackend`) and both NUFFT library plans on `Threads.nthreads()` threads, and on one thread under `SerialBackend()`. `NUFSHTSpectralBackend` builds its plan on the same thread count, and `FSHTSpectralBackend` runs FastTransforms at it. |
 | `GPUBackend(dev)` | `using KernelAbstractions` (+ vendor pkg) | GPU execution on the KernelAbstractions device `dev` (see the GPU table below). |
 | `DistributedBackend(inner)` | `using Distributed` | Splits work across worker processes, each running `inner` locally. Parametric, e.g. `DistributedBackend(ThreadedBackend())`. Requires `addprocs` + `@everywhere using FlowFieldSpectra`. |
 | `MPIBackend(inner)` | `using MPI` | Splits work across MPI ranks, each running `inner` locally; partials combined with `MPI.Allreduce!`. `MPIBackend(GPUBackend(dev))` targets a multi-GPU cluster. Launch under `mpiexec`. |
@@ -216,27 +230,34 @@ device (`KA.allocate` + `copyto!`), and the transform runs there:
 - **`FFTSpectralBackend`** is device-generic through `AbstractFFTs.plan_fft`, which dispatches on the
   device *array type*: CUFFT on a `CUDABackend` (`CuArray`), rocFFT on a `ROCBackend` (`ROCArray`), and
   FFTW on `KA.CPU()` (plain `Array`). Requires `using KernelAbstractions` + the FFT provider for your
-  device (`FFTW` for CPU arrays, `CUDA` for CUDA, `AMDGPU` for ROCm). This is *not* CUDA-specific.
-- **`DirectSumSpectralBackend`** uses the portable KernelAbstractions direct-sum kernels on any KA device.
-- **`FINUFFTBackend`** on a GPU uses cuFINUFFT — **CUDA-only** (FINUFFT.jl provides no portable GPU
-  NUFFT). On a non-CUDA device it raises.
-- **`NonuniformFFTsBackend`** on a GPU is **device-generic** through KernelAbstractions: it threads the
-  execution backend into `NonuniformFFTs.PlanNUFFT(…; backend=…)` and reconstructs FFS's full centered
-  spectrum with broadcasts / a KA kernel (real-input fast path included), so the same code runs on CUDA,
-  ROCm, and `KA.CPU()`. This is the portable GPU scattered-Cartesian NUFFT; `DirectSumSpectralBackend`
-  remains the ``O(N M)`` portable fallback.
-- **Spherical** (`FSHTSpectralBackend`/`NUFSHTSpectralBackend`/`DirectSumSpectralBackend`) always uses
-  the KA spherical direct-sum kernel — FastSphericalHarmonics and NUFSHT are CPU-only, so **there is no
-  fast GPU spherical-harmonic transform**.
+  device (`FFTW` for CPU arrays, `CUDA` for CUDA, `AMDGPU` for ROCm). A grid uniform in some directions
+  and stretched in others takes the hybrid composite on the device: that FFT over the uniform axes and a
+  device NUFFT along each stretched one, forward and synthesis, one-shot and through `plan_spectrum` /
+  `plan_synthesis`.
+- **`DirectSumSpectralBackend`** uses the portable KernelAbstractions direct-sum kernels on any KA device,
+  for the forward and the synthesis, one-shot and through `plan_spectrum` / `plan_synthesis`.
+- **`FTB.FINUFFTBackend`** takes `CuArray` nodes through cuFINUFFT (`using CUDA, FINUFFT`) and host
+  arrays, which `KA.CPU()` allocates, through FINUFFT's CPU library. Nodes on any other device raise.
+- **`FTB.NonuniformFFTsBackend`** is device-generic: FlowTransformBindings builds the NonuniformFFTs plan
+  on the nodes' KernelAbstractions backend, and FFS gathers the packed coefficient box with
+  KernelAbstractions kernels, so the same code runs on CUDA, ROCm and `KA.CPU()`.
+  `DirectSumSpectralBackend` is the ``O(N M)`` portable reference.
+- **Spherical**: `FSHTSpectralBackend` on a device runs its own spherical-harmonic transform and
+  synthesis on a structured sphere with longitudes uniform from 0 (a longitude FFT through AbstractFFTs
+  and a Legendre kernel), the quadrature projection the direct sum computes; `NUFSHTSpectralBackend`
+  builds NUFSHT's plan on the device; `DirectSumSpectralBackend` uses the KA spherical direct-sum kernel.
 
 | Transform | Grid | `GPUBackend(CUDABackend())` | `GPUBackend(KA.CPU())` / other KA device |
 | :--- | :--- | :--- | :--- |
 | `FFTSpectralBackend` | uniform Cartesian | CUFFT (via AbstractFFTs) | FFTW on `KA.CPU()`, rocFFT on ROCm, … (via AbstractFFTs) |
-| `FINUFFTBackend` | scattered Cartesian | **cuFINUFFT** — `using CUDA, FINUFFT` | errors (cuFINUFFT is CUDA-only) |
-| `NonuniformFFTsBackend` | scattered Cartesian | NonuniformFFTs (device-generic, via `CUDA`) | NonuniformFFTs on any KA device (`KA.CPU()`, ROCm, …) |
+| `FFTSpectralBackend` (hybrid) | uniform in some directions | CUFFT + a device NUFFT | the device's FFT + a device NUFFT |
+| `FTB.FINUFFTBackend` | scattered Cartesian | **cuFINUFFT** — `using CUDA, FINUFFT` | FINUFFT on `KA.CPU()`; raises on any other device |
+| `FTB.NonuniformFFTsBackend` | scattered Cartesian | NonuniformFFTs (device-generic, via `CUDA`) | NonuniformFFTs on any KA device (`KA.CPU()`, ROCm, …) |
 | `DirectSumSpectralBackend` | any Cartesian | KA direct-sum kernel | KA direct-sum kernel |
-| `DirectSumSpectralBackend`/`FSHTSpectralBackend`/`NUFSHTSpectralBackend` | any spherical | KA spherical direct-sum kernel | KA spherical direct-sum kernel |
+| `FSHTSpectralBackend` | structured sphere, uniform longitudes | device SHT (CUFFT + Legendre kernel) | device SHT (FFTW on `KA.CPU()`, …) |
+| `NUFSHTSpectralBackend` | any spherical | NUFSHT device plan | NUFSHT device plan |
+| `DirectSumSpectralBackend` | any spherical | KA spherical direct-sum kernel | KA spherical direct-sum kernel |
 
-The device-generic FFT, direct-sum, and NonuniformFFTs NUFFT paths are exercised on CI via
-`GPUBackend(KA.CPU())`. The CUDA-specific paths (CUFFT on `CuArray`, cuFINUFFT) are validated on real
-CUDA hardware via the package's `gpu/` project — CI has no GPU.
+The device-generic FFT, direct-sum and NUFFT paths are exercised on CI via `GPUBackend(KA.CPU())`, and the
+direct-sum kernels on a device array that refuses host scalar indexing. The CUDA-specific paths (CUFFT on
+`CuArray`, cuFINUFFT) are validated on real CUDA hardware via the package's `gpu/` project — CI has no GPU.

@@ -1,6 +1,7 @@
 module SphericalKernels
 
-export LegendreTables, legendre_tables, fill_legendre!, normalized_legendre
+export LegendreTables, legendre_tables, fill_legendre!, normalized_legendre, legendre_index, legendre_count,
+    device_legendre_table
 
 """
     LegendreTables{FT}
@@ -70,6 +71,30 @@ function fill_legendre!(Plm::AbstractMatrix{FT}, t::LegendreTables{FT}, x::FT, s
     end
     return Plm
 end
+
+"""
+    legendre_index(l, m, lmax) -> Int
+
+Row of `P̄_ℓ^m` (`0 ≤ m ≤ ℓ ≤ lmax`) in a packed Legendre table, which stores each order's degrees
+`ℓ = m:lmax` in turn: `m(lmax + 1) − m(m − 1)/2 + (ℓ − m) + 1`.
+"""
+@inline legendre_index(l::Int, m::Int, lmax::Int) = m * (lmax + 1) - (m * (m - 1)) ÷ 2 + (l - m) + 1
+
+"""
+    legendre_count(lmax) -> Int
+
+Rows of a packed Legendre table, `(lmax + 1)(lmax + 2)/2`.
+"""
+legendre_count(lmax::Int) = (lmax + 1) * (lmax + 2) ÷ 2
+
+"""
+    device_legendre_table(backend, ::Type{FT}, lmax, θ) -> AbstractMatrix{FT}
+
+The packed table `P[legendre_index(ℓ, m, lmax), j] = P̄_ℓ^m(cos θ_j)` on the KernelAbstractions device
+`backend`, one thread per order and node running the recurrence of [`fill_legendre!`](@ref) on the
+coefficients of [`legendre_tables`](@ref) staged once. The KernelAbstractions extension defines it.
+"""
+function device_legendre_table end
 
 """
     normalized_legendre(l, m, x, s) -> FT

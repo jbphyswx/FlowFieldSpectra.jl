@@ -45,8 +45,8 @@ rng = 2:findlast(<=(0.6 * maximum(k_bins_iso)), k_bins_iso)   # resolved inertia
 
 ## Transect spectrum
 
-Integrate out the second axis to get the 1D (zonal) spectrum along the first. Unlike the isotropic
-spectrum, this keeps the *signed* `kₓ` axis:
+Integrate out the second axis to get the 1D (zonal) spectrum along the first, the halved axis of a real
+field's coefficients (`kₓ ≥ 0`):
 
 ```julia
 k_red, E_red = FFS.transect_spectrum(ks, coeffs, (2,))
@@ -84,13 +84,13 @@ band = FFS.band_energy(k_bins_iso, E_k, 1.0, 8.0)
 
 ## Synthesis & spectral filtering
 
-`synthesize` is the inverse transform. Zeroing the high-wavenumber coefficients and synthesizing
-back gives a low-pass-filtered field — an exact round-trip on a uniform grid.
+`synthesize` evaluates the series at the grid's points, which on this uniform periodic grid inverts the
+transform. Zeroing the high-wavenumber coefficients and synthesizing back gives a low-pass-filtered field.
 
 ```julia
-# Low-pass: keep only |k| ≲ 4 by masking the shifted coefficient grid.
+# Low-pass: keep only |k| ≤ 4. The coefficients are the packed half, (N÷2 + 1, N, 2).
 kx, ky = ks
-mask = [sqrt(kx[i]^2 + ky[j]^2) <= 4.0 for i in 1:N, j in 1:N]
+mask = [hypot(kx[i], ky[j]) <= 4.0 for i in eachindex(kx), j in eachindex(ky)]
 cfilt = copy(coeffs)
 for c in axes(cfilt, 3)
     @views cfilt[:, :, c] .*= mask

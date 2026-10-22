@@ -1,22 +1,18 @@
-# Allocation guarantees for the real kernels, measured (not guessed) at two grid sizes: every
-# steady-state in-place / prebuilt-plan path allocates EXACTLY zero and is grid-independent (a
-# grid-dependent count would betray a per-element temporary). Each probe goes through a function
-# barrier and is warmed up before measuring. (Grid constructors + CB/SB aliases come from runtests.jl.)
+# Every steady-state in-place / prebuilt-plan path allocates exactly zero, on a 16² and a 32² grid, so no
+# count grows with the grid. Each probe goes through a function barrier and is warmed up first. (Grid
+# constructors + CB/SB aliases come from runtests.jl.)
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
 using FINUFFT: FINUFFT
-using OhMyThreads: OhMyThreads
 
 _a_iso!(Ek, kb, ks, c, nb) = @allocated FFS.isotropic_spectrum!(Ek, kb, ks, c; num_bins = nb)
 _a_sph!(El, C, l) = @allocated FFS.spherical_energy_spectrum!(El, C; lmax = l)
 _a_tr!(Er, ks, c, dims) = @allocated FFS.transect_spectrum!(Er, ks, c, dims)
 _a_planexec(out, plan, f) = @allocated FFS.calculate_spectrum!(out, plan, f)
-_a_synth!(out, plan, c, ks) = @allocated FFS.synthesize!(out, plan, c; ks = ks)
-_a_dsum!(out, g, f, ms, exec) =
-    @allocated FFS.calculate_spectrum!(out, g, f, ms; transform = SB.DirectSumSpectralBackend(), execution = exec)
+_a_synth!(out, plan, c) = @allocated FFS.synthesize!(out, plan, c)
 _a_div!(o, ks, c) = @allocated FFS.spectral_divergence!(o, ks, c)
 _a_vort!(o, ks, c) = @allocated FFS.spectral_vorticity!(o, ks, c)
 _a_welch!(Ek, kb, ks, c, nb) = @allocated FFS.welch_power_spectrum!(Ek, kb, ks, c; num_bins = nb)
@@ -52,9 +48,7 @@ function _zero_profile(N::Int)
     _a_tr!(Er, ks, c, (1,))
     tr = _a_tr!(Er, ks, c, (1,))
 
-    # Explicit SerialBackend: the zero-alloc guarantee is for the serial path. A ThreadedBackend plan
-    # (what AutoBackend resolves to under `-t≥2`) carries FFTW/FINUFFT's internal task-spawn floor — a
-    # real library cost, not a leak — so it is a bound, not `== 0`.
+    # Every plan names SerialBackend: the zero-allocation contract is the serial path's.
     pms = FTB.packed_size(ms, Val(true))                      # real fields ⇒ packed half on axis 1
 
     fplan = FFS.plan_spectrum(ug, Float64, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
@@ -62,23 +56,24 @@ function _zero_profile(N::Int)
     _a_planexec(cf, fplan, u)
     fftexec = _a_planexec(cf, fplan, u)
 
+    # A point set and a stretched grid widen the coefficient box, so their coefficients take each plan's
+    # own shape.
     nplan = FFS.plan_spectrum(sg, Float64, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend())
-    cnu = zeros(ComplexF64, pms...)
+    cnu = FFS.allocate_coefficients(nplan)
     _a_planexec(cnu, nplan, fscat)
     nuexec = _a_planexec(cnu, nplan, fscat)
 
     # The direct sum through its reusable plan, on a scattered cloud and on a stretched tensor grid: both
-    # hold their per-axis matrices, working arrays and Nyquist-twin storage, so a repeated execution
-    # allocates nothing.
-    cds = zeros(ComplexF64, pms...)
+    # hold their per-axis matrices and working arrays, so a repeated execution allocates nothing.
     dsplan = FFS.plan_spectrum(sg, Float64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    cds = FFS.allocate_coefficients(dsplan)
     _a_planexec(cds, dsplan, fscat)
     dsum = _a_planexec(cds, dsplan, fscat)
 
     nax = collect(xs) .+ (0.03 * L / N) .* sinpi.(2 .* (0:(N - 1)) ./ N)
     ng = nucg((nax, nax), (L, L))
-    cdt = zeros(ComplexF64, pms...)
     dtplan = FFS.plan_spectrum(ng, Float64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    cdt = FFS.allocate_coefficients(dtplan)
     _a_planexec(cdt, dtplan, u)
     dsum_tensor = _a_planexec(cdt, dtplan, u)
 
@@ -108,16 +103,21 @@ function _zero_profile(N::Int)
     # reused inversion writes into the caller's array and allocates nothing.
     sfft = FFS.plan_synthesis(ug, Float64, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
     offt = FFS.allocate_field(sfft)
-    _a_synth!(offt, sfft, cf, ks)
-    synth_fft = _a_synth!(offt, sfft, cf, ks)
+    _a_synth!(offt, sfft, cf)
+    synth_fft = _a_synth!(offt, sfft, cf)
 
-    cds2, ksd2 = FFS.calculate_spectrum(ng, u, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    cds2, _ = FFS.calculate_spectrum(ng, u, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
     sds = FFS.plan_synthesis(ng, Float64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
     ods = FFS.allocate_field(sds)
-    _a_synth!(ods, sds, cds2, ksd2)
-    synth_dsum = _a_synth!(ods, sds, cds2, ksd2)
+    _a_synth!(ods, sds, cds2)
+    synth_dsum = _a_synth!(ods, sds, cds2)
+    cdc = randn(ComplexF64, ms...)
+    sdc = FFS.plan_synthesis(ng, ComplexF64, ms; transform = SB.DirectSumSpectralBackend(), execution = CB.SerialBackend())
+    odc = FFS.allocate_field(sdc)
+    _a_synth!(odc, sdc, cdc)
+    synth_dsum_complex = _a_synth!(odc, sdc, cdc)
 
-    return (; iso, sph, tr, fftexec, nuexec, dsum, dsum_tensor, synth_fft, synth_dsum,
+    return (; iso, sph, tr, fftexec, nuexec, dsum, dsum_tensor, synth_fft, synth_dsum, synth_dsum_complex,
         divg, vort, welch, lomb, coh)
 end
 
@@ -126,13 +126,13 @@ Test.@testset "Allocations" begin
     p32 = _zero_profile(32)
     Test.@testset "in-place / prebuilt-plan paths allocate zero (grid-independent)" begin
         for k in (:iso, :sph, :tr, :fftexec, :nuexec, :dsum, :dsum_tensor, :synth_fft, :synth_dsum,
-                  :divg, :vort, :welch, :lomb)
+                  :synth_dsum_complex, :divg, :vort, :welch, :lomb)
             Test.@test getfield(p16, k) == 0
             Test.@test getfield(p32, k) == 0
         end
     end
     Test.@testset "coherence_spectrum! uses only O(num_bins) scratch (grid-independent)" begin
         Test.@test p16.coh == p32.coh                        # constant across grid ⇒ no per-element temp
-        Test.@test p16.coh <= 512                            # a few bins' worth, not O(N²)
+        Test.@test p16.coh <= 512                            # a few bins' worth
     end
 end

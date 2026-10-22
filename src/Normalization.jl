@@ -76,7 +76,7 @@ struct ModeAverage <: AbstractShellEstimator end
     SpectralConvention(; sided=OneSided(), scaling=DensityScaling(), estimator=ShellSum())
 
 How spectral coefficients become reported spectra: the sidedness, the scaling, and the radial-bin
-estimator. Fields are typed for compile-time dispatch.
+estimator.
 """
 struct SpectralConvention{S<:AbstractSidedness, C<:AbstractScaling, E<:AbstractShellEstimator}
     sided::S

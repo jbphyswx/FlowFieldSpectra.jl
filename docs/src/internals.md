@@ -7,10 +7,9 @@ documented here for contributors. They may change without notice.
 
 The execution-axis introspection helpers (`local_backend`, `is_distributed`, `resolve_backend`) are
 provided by [ComputationalBackends.jl](https://github.com/jbphyswx/ComputationalBackends.jl) and used
-internally and by the distribution extensions. The default `AutoBackend` is resolved locally through
-an internal `_resolve_execution` (Threaded when `OhMyThreads` is loaded and `Threads.nthreads() > 1`,
-else Serial), so precompilation never calls ComputationalBackends' `resolve_backend(::AutoBackend)`
-(which errors by design).
+internally and by the distribution extensions. The default `AutoBackend` resolves through the internal
+`_resolve_execution` (Threaded when `OhMyThreads` is loaded and `Threads.nthreads() > 1`, else Serial);
+ComputationalBackends' own `resolve_backend(::AutoBackend)` raises.
 
 ```@docs
 FlowFieldSpectra._backend_nthreads
@@ -24,8 +23,11 @@ FlowFieldSpectra.DirectSumCartesianPlan
 FlowFieldSpectra.DirectSumSphericalPlan
 FlowFieldSpectra.DirectSumSynthesisPlan
 FlowFieldSpectra.HybridPlan
+FlowFieldSpectra.RegionFFT
 FlowFieldSpectra._hybrid_plan
 FlowFieldSpectra._hybrid_derive
+FlowFieldSpectra.HybridSynthesisPlan
+FlowFieldSpectra._hybrid_synthesis_plan
 ```
 
 ### NUFFT plans
@@ -39,21 +41,25 @@ FlowFieldSpectra.NUFFTPointPlan
 FlowFieldSpectra.NUFFTSeparablePlan
 FlowFieldSpectra.NUFFTAxisPass
 FlowFieldSpectra.NUFFTSynthesisPlan
-FlowFieldSpectra.TwinGather
 FlowFieldSpectra._packed_src
+FlowFieldSpectra._oversampled_table
+FlowFieldSpectra._gather_packed!
+FlowFieldSpectra._scatter_each!
 ```
 
 ### The direct sum's setup / run split
 
 Both direct-sum plans are a setup the grid fixes plus a run over a field, and each one-shot composes the
-same pair, so the plan and the one-shot cannot drift. On a Cartesian grid the setup holds the per-axis
-dense DFT matrices, the working arrays the contraction walks through and the Nyquist-twin storage; a
-structured grid contracts axis by axis through `AxisPass`, and a point cloud sums directly.
+same pair. On a Cartesian grid the setup holds the per-axis dense DFT matrices, the working arrays the
+contraction walks through and the modes a real field's coefficient box holds at zero; a structured grid
+contracts axis by axis through `AxisPass`, and a point cloud sums directly.
 
 ```@docs
 FlowFieldSpectra.DirectSum.phase_geometry
 FlowFieldSpectra.DirectSum.cart_setup
 FlowFieldSpectra.DirectSum.cart_run!
+FlowFieldSpectra.DirectSum.synth_setup
+FlowFieldSpectra.DirectSum.native_coefficients!
 FlowFieldSpectra.DirectSum.AxisPass
 FlowFieldSpectra.DirectSum.sph_setup
 FlowFieldSpectra.DirectSum.sph_run!
@@ -85,10 +91,6 @@ FlowFieldSpectra.Grids._colatitude
 ### Spherical layout routing
 
 ```@docs
-FlowFieldSpectra.Grids.TensorSphere
-FlowFieldSpectra.Grids.RingSphere
-FlowFieldSpectra.Grids.ScatteredSphere
-FlowFieldSpectra.Grids._sph_sampling
 FlowFieldSpectra.Grids._sph_layout
 FlowFieldSpectra.Grids._ring_table
 ```
@@ -97,13 +99,15 @@ FlowFieldSpectra.Grids._ring_table
 
 ```@docs
 FlowFieldSpectra.Grids._sht_weights
+FlowFieldSpectra.Grids._sph_point_weights
 FlowFieldSpectra.Grids._sph_node_weights
 FlowFieldSpectra.Grids.quadrature_scale
 FlowFieldSpectra.quadrature_weighted
 FlowFieldSpectra.Grids._warn_bandlimit
 FlowFieldSpectra.Grids._zeroed_inactive
-FlowFieldSpectra.Grids.covered_area
-FlowFieldSpectra.Grids.sky_fraction
+FlowFieldSpectra.Grids._inactive_scale
+FlowFieldSpectra.Grids._inactive_weights
+FlowFieldSpectra.Grids._transform_nodes
 ```
 
 ## Transform selection
@@ -114,9 +118,16 @@ FlowFieldSpectra._sht_applicable
 
 ## Packed spectral layout
 
-The packed layout is FlowTransformBindings': the half a real transform publishes
-(`publish_packed!`, `packed_half_view`), and the Nyquist twins a reduction or an inverse reads alongside
-it (`NyquistTwin`, `twin_table`, `conj_twins`).
+```@docs
+FlowFieldSpectra.Grids.mode_box
+FlowFieldSpectra.Grids.series_modes
+```
+
+The packed layout and the widened axes are FlowTransformBindings' (`box_size`, `outside_modes`). The NUFFT
+and hybrid plans publish the half over the coefficient box from a library's `FFTModes` output through one
+index table ([`FlowFieldSpectra._packed_src`](@ref)) of direct and conjugate reads, and a real-data
+NonuniformFFTs plan reads its modes at `+ms_d/2` from its oversampled spectra
+([`FlowFieldSpectra._oversampled_table`](@ref)), on the host and on a device alike.
 
 ## Transform problem & layout
 
@@ -132,21 +143,22 @@ FlowFieldSpectra.Problem.stack_fields
 ## Preprocessing helpers
 
 ```@docs
+FlowFieldSpectra.Preprocessing.window_value
 FlowFieldSpectra.Preprocessing.window_function
 FlowFieldSpectra.Preprocessing.window_function!
 FlowFieldSpectra.Preprocessing.window_correction
 FlowFieldSpectra.Preprocessing.detrend!
 FlowFieldSpectra.Preprocessing.is_identity
 FlowFieldSpectra.Preprocessing.axis_taper
-FlowFieldSpectra.Preprocessing.detrend_spatial!
+FlowFieldSpectra.Preprocessing.point_window
 FlowFieldSpectra.Preprocessing.apply_window!
+FlowFieldSpectra.Preprocessing.detrend_spatial!
 ```
 
 ## Radial-bin helpers
 
 ```@docs
 FlowFieldSpectra.Reductions._shell_values!
-FlowFieldSpectra.Reductions._native_energy
 ```
 
 ## Spherical-harmonic kernels
@@ -155,5 +167,8 @@ FlowFieldSpectra.Reductions._native_energy
 FlowFieldSpectra.SphericalKernels.LegendreTables
 FlowFieldSpectra.SphericalKernels.legendre_tables
 FlowFieldSpectra.SphericalKernels.fill_legendre!
+FlowFieldSpectra.SphericalKernels.legendre_index
+FlowFieldSpectra.SphericalKernels.legendre_count
+FlowFieldSpectra.SphericalKernels.device_legendre_table
 FlowFieldSpectra.SphericalKernels.normalized_legendre
 ```

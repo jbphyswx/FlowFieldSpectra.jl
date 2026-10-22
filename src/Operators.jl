@@ -4,14 +4,14 @@ export spectral_divergence, spectral_divergence!, spectral_vorticity, spectral_v
     compensate, band_energy
 
 # =============================================================================
-# Spectral-differentiation operators. The velocity components live on the FIRST batch dim (size `D`),
-# so coefficients are `(ms…, D, extra_batch…)`; the extra trailing batch dims (levels/time/…) are
-# carried through. Output keeps `(ms…, ncomp_out, extra_batch…)`.
+# Spectral-differentiation operators. The velocity components are the first batch dim (size `D`), so
+# coefficients are `(ms…, D, extra_batch…)`; the extra trailing batch dims (levels, time, …) are carried
+# through. Output keeps `(ms…, ncomp_out, extra_batch…)`.
 # =============================================================================
 
-# Column-major linear indexing into `(ms…, ncomp, extra…)`: element `(mi, c, e)` (mode `mi ∈ 1:M`,
-# component `c`, extra-batch `e`) lives at `mi + (c-1)·M + (e-1)·M·ncomp`. Used instead of `reshape` so
-# the `!` variants allocate nothing (a `reshape` header is a per-call allocation under bounds checking).
+# Column-major linear index into `(ms…, ncomp, extra…)`: element `(mi, c, e)` (mode `mi ∈ 1:M`,
+# component `c`, extra-batch `e`) lives at `mi + (c-1)·M + (e-1)·M·ncomp`. Linear indexing keeps the `!`
+# variants allocation-free.
 @inline _lin(mi, M, c, e, ncomp) = mi + (c - 1) * M + (e - 1) * M * ncomp
 
 # Σ_d i·k_d·û_d for the divergence, folded over the heterogeneous axis tuple by recursion so `ks[d]`
@@ -27,7 +27,7 @@ end
     spectral_divergence!(out, ks_phys::Tuple, coeffs) -> out
 
 In-place [`spectral_divergence`](@ref): writes the divergence into preallocated `out` of shape
-`(ms…, 1, extra…)`. Allocation-free — reuse `out` across a batch/time loop.
+`(ms…, 1, extra…)`. Allocation-free.
 """
 function spectral_divergence!(out::AbstractArray{Complex{T}}, ks_phys::Tuple,
         coeffs::AbstractArray{Complex{T}, N}) where {T, N}

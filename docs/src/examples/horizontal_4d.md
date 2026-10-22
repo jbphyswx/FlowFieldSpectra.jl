@@ -35,12 +35,12 @@ for (it, t) in enumerate(ts), (iz, k0) in enumerate(kz)
     @. f[:, iz, it] = cos(k0 * xv + 2π * t) + 0.5 * sin((k0 + 1) * yv)
 end
 
-# ONE plan build for the fixed points; transform the whole (z, t) batch in a single exec.
+# One plan build for the fixed points; it transforms the whole (z, t) batch in a single exec.
 plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FTB.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
-coeffs = FFS.allocate_coefficients(plan)      # the packed half (N÷2+1, N, nz, nt)
+coeffs = FFS.allocate_coefficients(plan)      # the packed half (N÷2+1, N+1, nz, nt): a point set holds ±N/2
 ks = FFS.calculate_spectrum!(coeffs, plan, f)
 
-# ONE batch-preserving reduction → E(k, z, t); average over time → E(k, z).
+# One batch-preserving reduction → E(k, z, t); average over time → E(k, z).
 nbins = 18
 kbins, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = nbins)   # (nbins, nz, nt)
 Ekz = dropdims(sum(E; dims = 3); dims = 3) ./ nt                  # (nbins, nz)

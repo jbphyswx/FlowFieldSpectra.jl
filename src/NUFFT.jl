@@ -8,7 +8,6 @@
 # conjugate, applied on publish.
 
 const _FTBLibrary = Union{FTB.FINUFFTBackend, FTB.NonuniformFFTsBackend}
-const _HostExec = Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}
 
 # ---- where a plan's arrays live ----
 
@@ -22,6 +21,39 @@ _to_exec(exec, a::AbstractArray) = copyto!(_alloc(exec, eltype(a), size(a)...), 
 
 _on_device(::_HostExec) = false
 _on_device(::ComputationalBackends.AbstractGPUBackend) = true
+
+# A library tag reaches the plan catch-all only on a grid it does not apply to.
+_plan_hint(::_FTBLibrary, ::ComputationalBackends.AbstractExecutionBackend) = _NO_APPLY
+
+# ---- library plans a constructor releases when it fails ----
+
+_close!(p::FTB.AbstractNUFFTPlan) = FTB.close!(p)
+
+# `build()`, with every library plan in `held` closed if it throws. A cuFINUFFT plan holds device memory
+# that only `close!` frees.
+function _closing_on_error(build, held)
+    try
+        return build()
+    catch
+        foreach(_close!, held)
+        rethrow()
+    end
+end
+
+# `ntuple(make, n)` of axis passes built in turn; when one fails to build, those built before it are closed.
+function _axis_passes(make, n)
+    built = NUFFTAxisPass[]
+    try
+        return ntuple(n) do i
+            a = make(i)
+            push!(built, a)
+            return a
+        end
+    catch
+        foreach(_close!, built)
+        rethrow()
+    end
+end
 
 # ---- transform counts and tolerance when the caller names none ----
 
@@ -44,93 +76,170 @@ _chunk(default::Int, total::Int, ::Nothing) = clamp(default, 1, max(total, 1))
 _chunk(::Int, total::Int, bc::Integer) = bc <= 0 ? max(total, 1) : clamp(Int(bc), 1, max(total, 1))
 
 # ---- layout tables ----
+#
+# A real field's transform computes the packed half of the `ms`-mode box. Its coefficient box widens an
+# axis `d ≥ 2` to `ms_d + 1` modes (`Grids.mode_box`), and a mode at `+ms_d/2` there is the conjugate of
+# the computed mode `-k`, or zero where `-k` sits at `+ms_e/2` on another widened axis
+# (`FlowTransformBindings.outside_modes`).
 
 """
-    _packed_src(ms, ::Val{R}, dims) -> Vector{Int}
+    _packed_src(ms, box, dims, ::Val{R}; mirror = true) -> Vector{Int}
 
-For each packed coefficient, its linear index in one transform's spectrum of shape `dims` in `FFTModes`
-order: the same frequency, on axes holding at least the packed ones.
+For each coefficient of the box `box` of an `ms`-mode transform, axis 1 halved for a real field (`R`),
+where one transform's spectrum of shape `dims` in `FFTModes` order holds it: `i > 0` at entry `i`, `i < 0`
+as the conjugate of entry `-i`, `0` nowhere. A computed mode is read at its frequency, `dims` holding at
+least the computed modes on every axis. A mode at `+ms_d/2` on a widened axis is read as the conjugate at
+`-k` where `mirror` is set and `-k` is computed, `dims` then holding `-k₁` on axis 1, and is `0`
+otherwise.
 """
-function _packed_src(ms::NTuple{D, Int}, ::Val{R}, dims::NTuple{D, Int}) where {D, R}
-    pms = FTB.packed_size(ms, Val(R))
-    src = Vector{Int}(undef, prod(pms))
-    @inbounds for (i, I) in enumerate(CartesianIndices(pms))
-        lin = 1
-        stride = 1
-        for d in 1:D
-            # `0 … n₁÷2` on the halved axis 1 of a real field, `FFTModes` order elsewhere.
-            k = R && d == 1 ? I[d] - 1 : FTB.mode_frequency(FTB.FFTModes(), I[d], ms[d])
-            lin += (FTB.ovs_index(k, dims[d]) - 1) * stride
-            stride *= dims[d]
-        end
-        src[i] = lin
+function _packed_src(ms::NTuple{D, Int}, box::NTuple{D, Int}, dims::NTuple{D, Int}, ::Val{R};
+        mirror::Bool = true) where {D, R}
+    pbs = FTB.packed_size(box, Val(R))
+    src = Vector{Int}(undef, prod(pbs))
+    @inbounds for (i, I) in enumerate(CartesianIndices(pbs))
+        k = _packed_frequencies(I, box, Val(R))
+        plus, minus = _widened_edges(k, ms, box)
+        src[i] = !plus ? _spectrum_index(k, dims, 1) : (mirror && !minus) ? -_spectrum_index(k, dims, -1) : 0
     end
     return src
 end
 
+# The integer frequencies of coefficient `I` of the box `box`: `0 … box₁÷2` on the halved axis 1 of a real
+# field, `FFTModes` order elsewhere.
+@inline _packed_frequencies(I::CartesianIndex{D}, box::NTuple{D, Int}, ::Val{R}) where {D, R} =
+    ntuple(d -> R && d == 1 ? I[d] - 1 : FTB.mode_frequency(FTB.FFTModes(), I[d], box[d]), Val(D))
+
+# Whether `k` sits at `+ms_d/2` on a widened axis `d ≥ 2`, and whether at `-ms_e/2` on one.
+@inline function _widened_edges(k::NTuple{D, Int}, ms::NTuple{D, Int}, box::NTuple{D, Int}) where {D}
+    plus = false
+    minus = false
+    for d in 2:D
+        box[d] > ms[d] || continue
+        plus |= k[d] == ms[d] ÷ 2
+        minus |= k[d] == -(ms[d] ÷ 2)
+    end
+    return plus, minus
+end
+
+# The linear index of frequency `s·k` in a spectrum of shape `dims` in `FFTModes` order, `kv + 1` on a
+# halved axis.
+@inline function _spectrum_index(k::NTuple{D, Int}, dims::NTuple{D, Int}, s::Int) where {D}
+    lin = 1
+    stride = 1
+    for d in 1:D
+        lin += (FTB.ovs_index(s * k[d], dims[d]) - 1) * stride
+        stride *= dims[d]
+    end
+    return lin
+end
+
+"""
+    _oversampled_table(Tr, ms, box, ovdims, M, phis, normfactor) -> (pos, src, fac)
+
+The coefficients of a real field's packed box `box` at `+ms_d/2` on a widened axis that hold a value, read
+from the oversampled spectrum of shape `ovdims` a real-data NonuniformFFTs plan of `ms` modes over `M`
+points computed (`FlowTransformBindings.oversampled_spectra`): coefficient `pos[i]` is entry `src[i]`
+times `fac[i] = normfactor / (M Π_d phis[d])`, the factor the plan's own modes take.
+"""
+function _oversampled_table(::Type{Tr}, ms::NTuple{D, Int}, box::NTuple{D, Int}, ovdims::NTuple{D, Int},
+        M::Int, phis::Tuple, normfactor::Real) where {Tr, D}
+    pos = Int[]
+    src = Int[]
+    fac = Tr[]
+    for (i, I) in enumerate(CartesianIndices(FTB.packed_size(box, Val(true))))
+        k = _packed_frequencies(I, box, Val(true))
+        plus, minus = _widened_edges(k, ms, box)
+        (plus && !minus) || continue
+        β = Tr(normfactor) / M
+        for d in 1:D
+            β /= Tr(phis[d][FTB.even_table_index(k[d], ms[d], d == 1)])
+        end
+        push!(pos, i)
+        push!(src, _spectrum_index(k, ovdims, 1))
+        push!(fac, β)
+    end
+    return pos, src, fac
+end
+
 # ---- gathers ----
 
-# `dst[doff + i] = S(src[soff + idx[i]]) · w[i]` for `i ≤ n`, `S` the conjugate where `csrc`, the product
-# conjugated where `neg`; a number `w` scales every entry alike. The device method is the
-# KernelAbstractions extension's.
+# `dst[doff + (c-1)·n + i] = S(src[soff + (c-1)·sstride + idx[i]]) · w[i]` for `i ≤ n` and each of `ntr`
+# transforms `c`, `S` the conjugate where `csrc`, the product conjugated where `neg`; a number `w` scales
+# every entry alike. The device method is the KernelAbstractions extension's, one launch for all `ntr`.
 @inline _weight(w::AbstractArray, i::Int) = @inbounds w[i]
 @inline _weight(w::Number, ::Int) = w
 
-function _gather_scaled!(dst::AbstractArray, doff::Int, src::Array, soff::Int, idx::Array{Int},
-        w::Union{Array, Number}, n::Int, csrc::Bool, neg::Bool)
-    @inbounds for i in 1:n
-        s = src[soff + idx[i]]
-        v = (csrc ? conj(s) : s) * _weight(w, i)
-        dst[doff + i] = neg ? conj(v) : v
+function _gather_scaled!(dst::AbstractArray, doff::Int, src::Array, soff::Int, sstride::Int,
+        idx::Array{Int}, w::Union{Array, Number}, n::Int, ntr::Int, csrc::Bool, neg::Bool)
+    @inbounds for c in 1:ntr
+        so = soff + (c - 1) * sstride
+        o = doff + (c - 1) * n
+        for i in 1:n
+            s = src[so + idx[i]]
+            v = (csrc ? conj(s) : s) * _weight(w, i)
+            dst[o + i] = neg ? conj(v) : v
+        end
     end
     return dst
 end
 
-# A host plan gathers into the caller's array; a device plan gathers into its staging buffer and copies it
-# across.
-@inline _publish!(dst, doff, src, soff, idx, w, n, csrc, neg, ::Nothing) =
-    _gather_scaled!(dst, doff, src, soff, idx, w, n, csrc, neg)
-function _publish!(dst, doff, src, soff, idx, w, n, csrc, neg, stage::AbstractArray)
-    _gather_scaled!(stage, 0, src, soff, idx, w, n, csrc, neg)
-    copyto!(dst, doff + 1, stage, 1, n)
+"""
+    _gather_packed!(dst, doff, src, soff, sstride, idx, scale, n, ntr, neg)
+
+For `i ≤ n` and each of `ntr` transforms `c`, `dst[doff + (c-1)·n + i]` is `scale` times the entry
+`idx[i]` names ([`_packed_src`](@ref)) of transform `c`'s spectrum, `soff + (c-1)·sstride` into `src`, or
+zero where it names none, conjugated where `neg`. The device method is the KernelAbstractions
+extension's, one launch for all `ntr`.
+"""
+function _gather_packed!(dst::AbstractArray, doff::Int, src::Array, soff::Int, sstride::Int,
+        idx::Array{Int}, scale::Real, n::Int, ntr::Int, neg::Bool)
+    @inbounds for c in 1:ntr
+        so = soff + (c - 1) * sstride
+        o = doff + (c - 1) * n
+        for i in 1:n
+            j = idx[i]
+            v = j > 0 ? src[so + j] * scale : j < 0 ? conj(src[so - j]) * scale : zero(eltype(dst))
+            dst[o + i] = neg ? conj(v) : v
+        end
+    end
     return dst
 end
 
 """
-    TwinGather
+    _scatter_each!(dst, doff, n, srcs, ntr, pos, idx, fac, neg)
 
-One mask's `FlowTransformBindings.NyquistTwin` slice with the `FlowTransformBindings.twin_table` that
-fills it from a spectrum, a conjugate read where `csrc`.
+For each of `ntr` transforms `c`, `n` coefficients apart in `dst` from `doff`, the coefficient `pos[i]` is
+`srcs[c][idx[i]] · fac[i]`, conjugated where `neg`. The device method is the KernelAbstractions
+extension's, one launch for all `ntr`.
 """
-struct TwinGather{SL, IX, FC, ST}
-    slice::SL        # host values, `(shape…, batch…)`
-    src::IX
-    fac::FC
-    stage::ST        # device staging, or `nothing` on the host
-    n::Int
-    csrc::Bool
-end
-
-function _twin_set(exec, ::Type{Tr}, ks_phys::Tuple, ms::NTuple{D, Int}, dims::NTuple{D, Int}, M::Int,
-        batch::Tuple; conjugate::Bool, phis = nothing, normfactor::Real = 1) where {Tr, D}
-    D >= 2 || return ks_phys, ()
-    dev = _on_device(exec)
-    gs = ntuple(FTB.n_twin_slices(Val(D))) do mask
-        shape, src, fac = FTB.twin_table(Tr, ms, mask, dims, M; phis, normfactor, conjugate)
-        S = length(src)
-        TwinGather(zeros(Complex{Tr}, shape..., batch...), _to_exec(exec, S == 0 ? [1] : src),
-            _to_exec(exec, S == 0 ? [zero(Complex{Tr})] : fac),
-            dev ? _alloc(exec, Complex{Tr}, max(S, 1)) : nothing, S, conjugate)
+function _scatter_each!(dst::AbstractArray, doff::Int, n::Int, srcs::Tuple, ntr::Int, pos::Array{Int},
+        idx::Array{Int}, fac::Array, neg::Bool)
+    @inbounds for c in 1:ntr
+        s = srcs[c]
+        o = doff + (c - 1) * n
+        for i in eachindex(pos)
+            v = s[idx[i]] * fac[i]
+            dst[o + pos[i]] = neg ? conj(v) : v
+        end
     end
-    twin = FTB.NyquistTwin(map(g -> g.slice, gs))
-    return (FTB.with_twin(ks_phys[1], twin), Base.tail(ks_phys)...), gs
+    return dst
 end
 
-@inline _gather_twins!(::Tuple{}, fk, soff::Int, t::Int, neg::Bool) = nothing
-@inline function _gather_twins!(gs::Tuple, fk, soff::Int, t::Int, neg::Bool)
-    g = first(gs)
-    g.n == 0 || _publish!(g.slice, (t - 1) * g.n, fk, soff, g.src, g.fac, g.n, g.csrc, neg, g.stage)
-    return _gather_twins!(Base.tail(gs), fk, soff, t, neg)
+# Where a plan publishes `ntr` transforms of `n` coefficients that belong at offset `doff` of `dst`: there
+# on the host, and on a device the plan's staging buffer, which `_unstage!` copies across once every table
+# has written it.
+@inline _publish_target(dst, doff::Int, ::Nothing) = (dst, doff)
+@inline _publish_target(dst, doff::Int, stage::AbstractArray) = (stage, 0)
+@inline _unstage!(dst, doff::Int, ::Nothing, len::Int) = dst
+@inline _unstage!(dst, doff::Int, stage::AbstractArray, len::Int) = copyto!(dst, doff + 1, stage, 1, len)
+
+# `ntr` transforms of a spectrum, `sstride` apart, published `n` apiece into `dst` from offset `doff`
+# through the table `idx`.
+function _publish!(dst, doff::Int, src, soff::Int, sstride::Int, idx, scale::Real, n::Int, ntr::Int,
+        neg::Bool, stage)
+    t, o = _publish_target(dst, doff, stage)
+    _gather_packed!(t, o, src, soff, sstride, idx, scale, n, ntr, neg)
+    return _unstage!(dst, doff, stage, n * ntr)
 end
 
 # ---- field staging ----
@@ -174,19 +283,19 @@ _stage!(A::Array, field) = copyto!(A, field)
 _stage!(A::AbstractArray, field) = copyto!(A, eltype(field) === eltype(A) ? field : eltype(A).(field))
 
 # =============================================================================
-# Point sets: a node cloud, and a curvilinear grid's cells.
+# Point sets: a node cloud, and a curvilinear grid's cells. Every axis of a point set tells `+ms_d/2` from
+# `-ms_d/2` apart, so a real field's coefficient box widens every even axis.
 #
-# A real field on NonuniformFFTs takes a real-data plan, whose spectrum is the packed half. Its Nyquist
-# twins are computed by that transform already: the type 1 FFTs onto an oversampled grid and keeps only
-# the native box, so `+N_d/2` is there before truncation, and each twin is one oversampled entry times the
-# deconvolution the kept modes get (`FlowTransformBindings.oversampled_spectra`).
+# A real field on NonuniformFFTs takes a real-data plan, whose spectrum is the packed half of the `ms`-mode
+# box. The modes at `+ms_d/2` on an axis `d ≥ 2` are computed by that transform already: the type 1 FFTs
+# onto an oversampled grid and keeps only the `ms`-mode box, so they are there before truncation, each one
+# oversampled entry times the deconvolution the kept modes get (`FlowTransformBindings.oversampled_spectra`).
 #
 # A real field on FINUFFT takes complex strengths at `FlowTransformBindings.hermitian_request_size`, which
-# puts `±N₁/2` on axis 1; the packed half is the leading axis-1 entries and each twin a conjugate read of the
-# Hermitian spectrum.
+# puts `±ms₁/2` on axis 1; a mode at `+ms_d/2` is a conjugate read of that Hermitian spectrum.
 # =============================================================================
 
-# How a real field's point plan is built and where its twins are read.
+# How a real field's point plan is built and where its modes at `+ms_d/2` are read.
 _real_values(::FTB.NonuniformFFTsBackend) = true
 _real_values(::FTB.FINUFFTBackend) = false
 
@@ -195,25 +304,25 @@ _real_values(::FTB.FINUFFTBackend) = false
 
 Reusable type-1 NUFFT over a Cartesian point set (a node cloud or a curvilinear grid's cells): the
 FlowTransformBindings plan with `C` transforms per execution, its strength and spectrum buffers, and the
-tables that publish the packed layout and its Nyquist twins. `R` marks a real field. Execute with
+tables that publish the coefficient box. `R` marks a real field. Execute with
 `calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref) releases the library plan.
 """
-struct NUFFTPointPlan{T, D, R, NB, P, V, U, IX, ST, KS, TW, QW} <: Plans.AbstractSpectralPlan
+struct NUFFTPointPlan{T, D, R, NB, P, V, U, IX, OV, ST, KS, QW} <: Plans.AbstractSpectralPlan
     plan::P
     values::V                        # (M, C) strengths
     modes::U                         # (mode_size…, C) spectra
     scale::T                         # 1/M
-    src::IX                          # packed index → index into one transform's spectrum
+    src::IX                          # coefficient → entry of one transform's spectrum (`_packed_src`)
+    oversampled::OV                  # `_oversampled_table` on the backend, or `nothing`
     stage::ST                        # device staging for the coefficients, or `nothing` on the host
     batch::NTuple{NB, Int}
     ms::NTuple{D, Int}
-    pms::NTuple{D, Int}
+    pms::NTuple{D, Int}              # packed coefficient box
     M::Int
     B::Int                           # transforms the field carries
     C::Int                           # transforms per execution
     neg::Bool                        # real field with `iflag < 0`: conjugate the published values
     ks_phys::KS
-    twins::TW
     qw::QW                           # (M,) grid quadrature factor, or `nothing` for a constant measure
 end
 
@@ -243,45 +352,48 @@ function _point_plan(t::_FTBLibrary, exec, g, ::Type{T}, ms::NTuple{D, Int}, bat
     plan = FTB.plan_nufft(t, VT, ntuple(d -> _to_exec(exec, coords[d]), Val(D)), ns; ntrans = C,
         tol = _nufft_tol(Tr, eps), order = FTB.FFTModes(), period = Ls, origin = offsets, nthreads = nth,
         iflag = R ? -1 : -iflag)
-    dims = FTB.mode_size(plan)
-    pms = FTB.packed_size(ms, Val(R))
-    ks_phys = Grids.physical_wavenumbers(Ls, ms, Val(R))
-    ks, twins = if !R
-        ks_phys, ()
-    elseif realplan
-        us, normfactor, phis = FTB.oversampled_spectra(plan)
-        _twin_set(exec, Tr, ks_phys, ms, size(first(us)), M, batch; conjugate = false,
-            phis = map(collect, phis), normfactor)
-    else
-        _twin_set(exec, Tr, ks_phys, ms, dims, M, batch; conjugate = true)
+    return _closing_on_error((plan,)) do
+        dims = FTB.mode_size(plan)
+        mb = Grids.mode_box(g, ms, Val(R))
+        pms = FTB.packed_size(mb, Val(R))
+        ks_phys = Grids.physical_wavenumbers(Ls, mb, Val(R))
+        ovs = realplan ? _oversampled_publish(exec, Tr, ms, mb, plan, M) : nothing
+        qwh = Grids.quadrature_scale(g, Tr, M)
+        qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
+        bt = NTuple{length(batch), Int}(batch)
+        values = _alloc(exec, VT, M, C)
+        modes = _alloc(exec, Complex{Tr}, dims..., C)
+        src = _to_exec(exec, _packed_src(ms, mb, dims, Val(R); mirror = !realplan))
+        stage = dev ? _alloc(exec, Complex{Tr}, prod(pms) * C) : nothing
+        NUFFTPointPlan{Tr, D, R, length(bt), typeof(plan), typeof(values), typeof(modes),
+                typeof(src), typeof(ovs), typeof(stage), typeof(ks_phys), typeof(qw)}(
+            plan, values, modes, one(Tr) / M, src, ovs, stage, bt, ms, pms, M, B, C, R && iflag < 0,
+            ks_phys, qw)
     end
-    qwh = Grids.quadrature_scale(g, Tr, M)
-    qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
-    bt = NTuple{length(batch), Int}(batch)
-    values = _alloc(exec, VT, M, C)
-    modes = _alloc(exec, Complex{Tr}, dims..., C)
-    src = _to_exec(exec, _packed_src(ms, Val(R), dims))
-    stage = dev ? _alloc(exec, Complex{Tr}, prod(pms)) : nothing
-    return NUFFTPointPlan{Tr, D, R, length(bt), typeof(plan), typeof(values), typeof(modes),
-            typeof(src), typeof(stage), typeof(ks), typeof(twins), typeof(qw)}(
-        plan, values, modes, one(Tr) / M, src, stage, bt, ms, pms, M, B, C, R && iflag < 0, ks, twins, qw)
 end
 
-# The twins of transform `t`, the `c`-th of its execution. A real-data plan's are read from the oversampled
-# spectra, one array per transform; a complex plan's from its own spectrum.
-_point_twins!(p::NUFFTPointPlan, c::Int, t::Int) = _point_twins!(p, p.plan, c, t)
-function _point_twins!(p::NUFFTPointPlan, ::FTB.AbstractNUFFTPlan{<:Real}, c::Int, t::Int)
-    us, _, _ = FTB.oversampled_spectra(p.plan)
-    _gather_twins!(p.twins, us[c], 0, t, p.neg)
+# A real-data plan's `_oversampled_table` on the execution backend, or `nothing` where it is empty.
+function _oversampled_publish(exec, ::Type{Tr}, ms::NTuple{D, Int}, mb::NTuple{D, Int}, plan,
+        M::Int) where {Tr, D}
+    us, normfactor, phis = FTB.oversampled_spectra(plan)
+    pos, src, fac = _oversampled_table(Tr, ms, mb, size(first(us)), M, map(collect, phis), normfactor)
+    isempty(pos) && return nothing
+    return (; pos = _to_exec(exec, pos), src = _to_exec(exec, src), fac = _to_exec(exec, fac))
 end
-_point_twins!(p::NUFFTPointPlan, ::FTB.AbstractNUFFTPlan, c::Int, t::Int) =
-    _gather_twins!(p.twins, p.modes, (c - 1) * (length(p.modes) ÷ p.C), t, p.neg)
+
+# The coefficients a real-data plan reads from its oversampled spectra, for the `nvalid` transforms of an
+# execution published `n` apiece into `dst` from `off`.
+@inline _publish_oversampled!(dst, off::Int, n::Int, ::Nothing, plan, nvalid::Int, neg::Bool) = dst
+function _publish_oversampled!(dst, off::Int, n::Int, t, plan, nvalid::Int, neg::Bool)
+    us, _, _ = FTB.oversampled_spectra(plan)
+    return _scatter_each!(dst, off, n, us, nvalid, t.pos, t.src, t.fac, neg)
+end
 
 """
     calculate_spectrum!(coeffs, plan::NUFFTPointPlan, field) -> ks_phys
 
-Execute a point-set NUFFT plan in place. `field` is `(N, batch…)`; `coeffs` is the packed half
-`(ms[1]÷2+1, ms[2:D]…, batch…)` for a real field and the full native spectrum for a complex one.
+Execute a point-set NUFFT plan in place. `field` is `(N, batch…)`; `coeffs` is the packed half of the
+coefficient box (`Grids.mode_box`) for a real field and the full spectrum for a complex one.
 """
 function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTPointPlan{T, D, R},
         field) where {T, D, R}
@@ -302,11 +414,10 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTPointPla
             end
         end
         FTB.nufft_type1!(p.modes, p.plan, p.values)
-        for c in 1:nvalid
-            t = base + c
-            _publish!(coeffs, (t - 1) * Ph, p.modes, (c - 1) * Pn, p.src, p.scale, Ph, false, p.neg, p.stage)
-            R && _point_twins!(p, c, t)
-        end
+        dst, off = _publish_target(coeffs, base * Ph, p.stage)
+        _gather_packed!(dst, off, p.modes, 0, Pn, p.src, p.scale, Ph, nvalid, p.neg)
+        _publish_oversampled!(dst, off, Ph, p.oversampled, p.plan, nvalid, p.neg)
+        _unstage!(coeffs, base * Ph, p.stage, Ph * nvalid)
     end
     return p.ks_phys
 end
@@ -421,9 +532,11 @@ function _axis_pass(t::_FTBLibrary, exec, ::Type{Tr}, insize::Tuple, d::Int, axi
     C = _chunk(_line_default(t, rest, nth, dev), rest, batch_chunk)
     plan = FTB.plan_nufft(t, Complex{Tr}, (_to_exec(exec, collect(Tr, axis)),), (m,); ntrans = C,
         tol = Tr(tol), order = FTB.FFTModes(), period = Tr(rng), origin = Tr(off), nthreads = nth, iflag)
-    stage = dev ? (_alloc(exec, Complex{Tr}, Nd, rest), _alloc(exec, Complex{Tr}, m, rest)) : nothing
-    return NUFFTAxisPass(plan, _alloc(exec, Complex{Tr}, Nd, C), _alloc(exec, Complex{Tr}, m, C),
-        Vector{Int}(undef, C), Vector{Int}(undef, C), stage, Nd, m, C)
+    return _closing_on_error((plan,)) do
+        stage = dev ? (_alloc(exec, Complex{Tr}, Nd, rest), _alloc(exec, Complex{Tr}, m, rest)) : nothing
+        NUFFTAxisPass(plan, _alloc(exec, Complex{Tr}, Nd, C), _alloc(exec, Complex{Tr}, m, C),
+            Vector{Int}(undef, C), Vector{Int}(undef, C), stage, Nd, m, C)
+    end
 end
 
 # Transform axis `d` of `A` into `out`, whose dim `d` holds `ap.m` modes. On the host the lines are
@@ -476,25 +589,77 @@ function _axis_run!(out::AbstractArray, A::AbstractArray, d::Int, ap::NUFFTAxisP
     return out
 end
 
-# The hybrid composite's stretched axes (`_calculate_spectrum_hybrid`, `HybridPlan`): the `Σ e^{-ikx}`
-# sign of its FFT pass, the composite conjugating once for `iflag = -1`.
-function _axis_nufft(t::_FTBLibrary, exec::ComputationalBackends.AbstractExecutionBackend,
-        A::AbstractArray{Complex{Tr}}, d::Int, axis::AbstractVector, m::Int, rng, off, eps;
-        batch_chunk = nothing, kwargs...) where {Tr}
-    ap = _axis_pass(t, exec, Tr, size(A), d, axis, m, rng, off, eps, batch_chunk)
-    try
-        return _axis_run!(_alloc(exec, Complex{Tr}, _axis_out_size(size(A), d, m)...), A, d, ap)
-    finally
-        _close!(ap)
-    end
-end
-
+# A stretched axis of the hybrid composite, `insize` the working size on its points side and `iflag`
+# FlowTransformBindings' sign. The forward (`HybridPlan`) takes the `Σ e^{-ikx}` sign of its FFT pass and
+# conjugates once for `iflag = -1`; the synthesis (`HybridSynthesisPlan`) passes its own.
 _axis_nufft_plan(t::_FTBLibrary, exec::ComputationalBackends.AbstractExecutionBackend, ::Type{Tr},
         insize::Tuple, d::Int, axis::AbstractVector, m::Int, rng, off, eps; batch_chunk = nothing,
-        kwargs...) where {Tr} =
-    _axis_pass(t, exec, Tr, insize, d, axis, m, rng, off, eps, batch_chunk)
+        iflag::Int = -1, kwargs...) where {Tr} =
+    _axis_pass(t, exec, Tr, insize, d, axis, m, rng, off, eps, batch_chunk; iflag)
 
-_axis_nufft_exec!(out::AbstractArray, ap::NUFFTAxisPass, A::AbstractArray, d::Int) = _axis_run!(out, A, d, ap)
+# The hybrid composite's stretched axes in turn, pass `i` along dim `sdims[i]` reading the previous one's
+# output and writing `work[i]`: the forward's type 1, points to modes.
+@inline _run_stretched!(W, ::Tuple{}, ::Tuple{}, ::Tuple{}) = W
+@inline _run_stretched!(W, work::Tuple, axes::Tuple, sdims::Tuple) =
+    _run_stretched!(_axis_run!(first(work), W, first(sdims), first(axes)), Base.tail(work), Base.tail(axes),
+        Base.tail(sdims))
+
+# The same walk for the synthesis's type 2, modes to points.
+@inline _run_stretched_synthesis!(W, ::Tuple{}, ::Tuple{}, ::Tuple{}) = W
+@inline _run_stretched_synthesis!(W, work::Tuple, axes::Tuple, sdims::Tuple) =
+    _run_stretched_synthesis!(_axis_synth!(first(work), W, first(sdims), first(axes)), Base.tail(work),
+        Base.tail(axes), Base.tail(sdims))
+
+# The type 2 along axis `d`: `A` holds `ap.m` modes there and `out` its `ap.Nd` points. On the host the
+# lines are gathered straight out of `A` and scattered straight into `out`. The line offsets are the
+# forward's, `inoff` on the points side and `outoff` on the modes side.
+function _axis_synth!(out::Array, A::Array, d::Int, ap::NUFFTAxisPass)
+    pre, Nd, post = _axis_layout(size(out), d)
+    Nd == ap.Nd || throw(DimensionMismatch("axis $d: field length $Nd ≠ this plan's grid axis length $(ap.Nd)"))
+    m, C = ap.m, ap.C
+    V, U = ap.values, ap.modes
+    rest = pre * post
+    for base in 0:C:(rest - 1)
+        nvalid = min(C, rest - base)
+        _axis_chunk_offsets!(ap.inoff, ap.outoff, base, nvalid, pre, Nd, m)
+        @inbounds for j in 1:m
+            s = (j - 1) * pre
+            for c in 1:nvalid
+                U[j, c] = A[ap.outoff[c] + s]
+            end
+            for c in (nvalid + 1):C
+                U[j, c] = zero(eltype(U))
+            end
+        end
+        FTB.nufft_type2!(V, ap.plan, U)
+        @inbounds for i in 1:Nd
+            s = (i - 1) * pre
+            for c in 1:nvalid
+                out[ap.inoff[c] + s] = V[i, c]
+            end
+        end
+    end
+    return out
+end
+
+# On a device the axis moves to the front, so each line is a contiguous column of the staging array.
+function _axis_synth!(out::AbstractArray, A::AbstractArray, d::Int, ap::NUFFTAxisPass)
+    pin, pfk = ap.stage
+    nd = ndims(A)
+    perm = _axis_perm(nd, d)
+    Nd, m, C = ap.Nd, ap.m, ap.C
+    rest = size(pfk, 2)
+    permutedims!(reshape(pfk, ntuple(i -> size(A, perm[i]), nd)), A, perm)
+    for base in 0:C:(rest - 1)
+        nvalid = min(C, rest - base)
+        copyto!(ap.modes, 1, pfk, base * m + 1, nvalid * m)
+        nvalid < C && fill!(view(ap.modes, :, (nvalid + 1):C), zero(eltype(ap.modes)))
+        FTB.nufft_type2!(ap.values, ap.plan, ap.modes)
+        copyto!(pin, base * Nd + 1, ap.values, 1, nvalid * Nd)
+    end
+    permutedims!(out, reshape(pin, ntuple(i -> size(out, perm[i]), nd)), invperm(collect(perm)))
+    return out
+end
 
 @inline _run_axes!(work::Tuple, ::Tuple{}, d::Int) = nothing
 @inline function _run_axes!(work::Tuple, axes::Tuple, d::Int)
@@ -504,33 +669,32 @@ end
 
 # =============================================================================
 # Separable transform for a nonuniform tensor-product (structured) Cartesian grid: `D` successive 1-D
-# passes, so no `∏N_d` coordinate cloud is built and spreading costs `D·2m` per point in place of `(2m)^D`.
-# Every pass is complex, so a real field's result is the full spectrum at `hermitian_request_size`, whose
-# packed half is its leading axis-1 entries and whose Nyquist twins are conjugate reads.
+# passes, spreading `D·2m` per point over the axes alone. Every pass is complex, so a real field's result
+# is the full spectrum at `hermitian_request_size`, whose leading axis-1 entries are the computed modes
+# and whose conjugate reads give the modes at `+ms_d/2` of a widened axis.
 # =============================================================================
 
 """
     NUFFTSeparablePlan{T,D,R}
 
 Reusable separable NUFFT over a nonuniform tensor-product Cartesian grid: one [`NUFFTAxisPass`](@ref)
-per axis, the working arrays the passes write through, and the publish and twin tables. Execute with
-`calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref) releases the library plans.
+per axis, the working arrays the passes write through, and the table that publishes the coefficient box.
+Execute with `calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref) releases the library plans.
 """
-struct NUFFTSeparablePlan{T, D, R, NB, AP, W, IX, ST, KS, TW, QW} <: Plans.AbstractSpectralPlan
+struct NUFFTSeparablePlan{T, D, R, NB, AP, W, IX, ST, KS, QW} <: Plans.AbstractSpectralPlan
     axes::AP                         # D × NUFFTAxisPass
     work::W                          # D+1 working arrays; `work[1]` takes the field
     scale::T                         # 1/∏N_d
-    src::IX
+    src::IX                          # coefficient → entry of one transform's spectrum (`_packed_src`)
     stage::ST
     batch::NTuple{NB, Int}
     ms::NTuple{D, Int}
     ns::NTuple{D, Int}               # mode counts the passes produce
-    pms::NTuple{D, Int}
+    pms::NTuple{D, Int}              # packed coefficient box
     npts::Int
     ntrans::Int
     neg::Bool                        # real field with `iflag < 0`: conjugate the published values
     ks_phys::KS
-    twins::TW
     qw::QW
 end
 
@@ -559,26 +723,30 @@ function Plans.plan_spectrum(t::_FTBLibrary,
     tol = _nufft_tol(Tr, eps)
     sgn = R ? -1 : -iflag
     work = ntuple(d -> _alloc(exec, Complex{Tr}, _axis_work_shape(Ns, ns, d, batch)...), Val(D + 1))
-    axes = ntuple(d -> _axis_pass(t, exec, Tr, size(work[d]), d, axs[d], ns[d], ranges[d], offsets[d], tol,
-        batch_chunk; iflag = sgn), Val(D))
-    pms = FTB.packed_size(ms, Val(R))
-    ks_phys = Grids.physical_wavenumbers(ranges, ms, Val(R))
-    ks, twins = R ? _twin_set(exec, Tr, ks_phys, ms, ns, npts, batch; conjugate = true) : (ks_phys, ())
-    qwh = Grids.quadrature_scale(g, Tr, npts)
-    qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
-    src = _to_exec(exec, _packed_src(ms, Val(R), ns))
-    stage = _on_device(exec) ? _alloc(exec, Complex{Tr}, prod(pms)) : nothing
-    bt = NTuple{length(batch), Int}(batch)
-    return NUFFTSeparablePlan{Tr, D, R, length(bt), typeof(axes), typeof(work), typeof(src),
-            typeof(stage), typeof(ks), typeof(twins), typeof(qw)}(
-        axes, work, one(Tr) / npts, src, stage, bt, ms, ns, pms, npts, ntrans, R && iflag < 0, ks, twins, qw)
+    axes = _axis_passes(Val(D)) do d
+        _axis_pass(t, exec, Tr, size(work[d]), d, axs[d], ns[d], ranges[d], offsets[d], tol, batch_chunk;
+            iflag = sgn)
+    end
+    return _closing_on_error(axes) do
+        mb = Grids.mode_box(g, ms, Val(R))
+        pms = FTB.packed_size(mb, Val(R))
+        ks_phys = Grids.physical_wavenumbers(ranges, mb, Val(R))
+        qwh = Grids.quadrature_scale(g, Tr, npts)
+        qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
+        src = _to_exec(exec, _packed_src(ms, mb, ns, Val(R)))
+        stage = _on_device(exec) ? _alloc(exec, Complex{Tr}, prod(pms) * ntrans) : nothing
+        bt = NTuple{length(batch), Int}(batch)
+        NUFFTSeparablePlan{Tr, D, R, length(bt), typeof(axes), typeof(work), typeof(src),
+                typeof(stage), typeof(ks_phys), typeof(qw)}(
+            axes, work, one(Tr) / npts, src, stage, bt, ms, ns, pms, npts, ntrans, R && iflag < 0, ks_phys, qw)
+    end
 end
 
 """
     calculate_spectrum!(coeffs, plan::NUFFTSeparablePlan, field) -> ks_phys
 
 Execute a separable structured plan in place. `field` is `(N₁…N_D, batch…)`; `coeffs` is the packed half
-for a real field and the full native spectrum for a complex one.
+of the coefficient box (`Grids.mode_box`) for a real field and the full spectrum for a complex one.
 """
 function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTSeparablePlan{T, D, R},
         field) where {T, D, R}
@@ -593,78 +761,35 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::NUFFTSeparabl
     F = p.work[D + 1]
     Pn = prod(p.ns)
     Ph = prod(p.pms)
-    for t in 1:p.ntrans
-        _publish!(coeffs, (t - 1) * Ph, F, (t - 1) * Pn, p.src, p.scale, Ph, false, p.neg, p.stage)
-        _gather_twins!(p.twins, F, (t - 1) * Pn, t, p.neg)
-    end
+    _publish!(coeffs, 0, F, 0, Pn, p.src, p.scale, Ph, p.ntrans, p.neg, p.stage)
     return p.ks_phys
 end
 
 # =============================================================================
-# The hybrid composite on a device: the FFT over the uniform axes from the GPU FFT extension, each stretched
-# axis a device `NUFFTAxisPass`, and the publish and twins as device gathers. The host composite lives with the
-# rest of the hybrid in the package root.
-# =============================================================================
-
-function _calculate_spectrum_hybrid(t::_FTBLibrary, exec::ComputationalBackends.AbstractGPUBackend,
-        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        field::AbstractArray, ms::NTuple{D, Int}, umask::NTuple{D, Bool}; iflag::Int = 1, eps = nothing,
-        batch_chunk = nothing, kwargs...) where {D}
-    Tr = real(float(eltype(g)))
-    R = eltype(field) <: Real
-    batch = ntuple(i -> size(field, D + i), ndims(field) - D)
-    ntrans = prod(batch; init = 1)
-    h = _hybrid_derive(g, Tr, ms, umask, R, iflag, eps, batch)
-    W = _region_fft(exec, quadrature_weighted(g, field), h.udims, h.halve, !R && h.neg)
-    for d in h.sdims
-        W = _axis_nufft(t, exec, W, d, h.axs[d], ms[d], h.ranges[d], h.offs_all[d], h.epsv;
-            batch_chunk = batch_chunk)
-    end
-    Pn = prod(h.nsx)
-    if R
-        pms = h.pms
-        Ph = prod(pms)
-        coeffs = Array{Complex{Tr}}(undef, pms..., batch...)
-        src = _to_exec(exec, _packed_src(ms, Val(true), h.nsx))
-        stage = _alloc(exec, Complex{Tr}, Ph)
-        ks, twins = h.need_twin ?
-            _twin_set(exec, Tr, h.ks_phys, ms, h.nsx, h.npts, batch; conjugate = true) : (h.ks_phys, ())
-        for k in 1:ntrans
-            _publish!(coeffs, (k - 1) * Ph, W, (k - 1) * Pn, src, h.scale, Ph, false, h.neg, stage)
-            _gather_twins!(twins, W, (k - 1) * Pn, k, h.neg)
-        end
-        return coeffs, ks
-    end
-    h.neg && (W .= conj.(W))                     # closes the conjugation applied to the input
-    W .*= h.scale
-    coeffs = Array{Complex{Tr}}(undef, ms..., batch...)
-    copyto!(coeffs, W)
-    return coeffs, h.ks
-end
-
-# =============================================================================
-# Synthesis: a complex type 2 on the full native spectrum. A real field's packed half is first completed by
-# `FlowTransformBindings.unpacked!` with its Nyquist twin, and the real part taken. The forward publishes `C = fk / M`
-# measured from each direction's origin, the point positions `y` the type 2 folds, so it evaluates
-# `Σ C e^{+iflag·ik·y}` as given.
+# Synthesis: a complex type 2 on the modes of `Grids.series_modes`. A real field's packed half is first
+# written as that series' coefficients (`DirectSum.native_coefficients!`), and the real part taken. The
+# forward publishes `C = fk / M` measured from each direction's origin, the point positions `y` the type 2
+# folds, so it evaluates `Σ C e^{+iflag·ik·y}` as given.
 # =============================================================================
 
 """
     NUFFTSynthesisPlan{T,D,R}
 
-Reusable type-2 NUFFT inverse onto a Cartesian grid's points: the plan with `C` transforms per execution,
-its spectrum and strength buffers (with host staging on a device), and the native cube a packed half
-expands into. Execute with `synthesize!(out, plan, coeffs; ks)`; [`close!`](@ref) releases the library
-plan.
+Reusable type-2 NUFFT synthesis onto a Cartesian grid's points: the plan with `C` transforms per execution,
+its spectrum and strength buffers (with host staging on a device), and for a real field the host series a
+packed half is written into. Execute with `synthesize!(out, plan, coeffs)`; [`close!`](@ref) releases the
+library plan.
 """
 struct NUFFTSynthesisPlan{T, D, R, NB, P, U, V, HU, HV, FB, SP} <: Plans.AbstractSynthesisPlan
     plan::P
-    modes::U                         # (ms…, C)
+    modes::U                         # (ns…, C)
     values::V                        # (M, C)
     hmodes::HU                       # host staging for `modes`, or `modes` itself on the host
     hvalues::HV                      # host staging for `values`, or `values` itself on the host
-    full::FB                         # host (ms…, ntrans)
+    full::FB                         # host (ns…, ntrans) for a real field, `nothing` for a complex one
     ms::NTuple{D, Int}
+    box::NTuple{D, Int}              # coefficient box
+    ns::NTuple{D, Int}               # mode counts of the series
     spatial::SP
     batch::NTuple{NB, Int}
     ntrans::Int
@@ -684,51 +809,51 @@ function Plans.plan_synthesis(t::_FTBLibrary,
         g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
                  Grids.PointwiseCartesian},
         ::Type{TT}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, eps = nothing,
-        batch_chunk::Union{Nothing, Integer} = nothing, kwargs...) where {TT, D}
+        batch_chunk::Union{Nothing, Integer} = nothing, box = nothing, kwargs...) where {TT, D}
     T = real(float(TT))
     R = TT <: Real
     coords, spatial = Grids.point_coordinates(T, g, D)
-    Ls = ntuple(d -> Grids.axis_range(T, g, d), Val(D))
+    # The forward's origins and Fourier lengths, `box`'s where `g` is part of a larger grid.
+    offsets, Ls = Grids.axis_geometry(T, g, D, box)
     M = length(coords[1])
-    offsets = ntuple(d -> T(minimum(coords[d])), Val(D))
     bt = NTuple{length(batch), Int}(batch)
     ntrans = prod(bt; init = 1)
     nth = _backend_nthreads(exec)
     dev = _on_device(exec)
     C = _chunk(_batch_default(t, ntrans, nth, dev), ntrans, batch_chunk)
+    mb = Grids.mode_box(g, ms, Val(R))
+    ns = Grids.series_modes(g, ms, Val(R))
     # The type 2 evaluates `Σ û e^{+iflag·ik·y}`, FlowTransformBindings' `-iflag` convention.
-    plan = FTB.plan_nufft(t, Complex{T}, ntuple(d -> _to_exec(exec, coords[d]), Val(D)), ms; ntrans = C,
+    plan = FTB.plan_nufft(t, Complex{T}, ntuple(d -> _to_exec(exec, coords[d]), Val(D)), ns; ntrans = C,
         tol = _nufft_tol(T, eps), order = FTB.FFTModes(), period = Ls, origin = offsets, nthreads = nth,
         iflag = -iflag)
-    modes = _alloc(exec, Complex{T}, ms..., C)
-    values = _alloc(exec, Complex{T}, M, C)
-    hmodes = dev ? Array{Complex{T}}(undef, ms..., C) : modes
-    hvalues = dev ? Array{Complex{T}}(undef, M, C) : values
-    full = Array{Complex{T}}(undef, ms..., ntrans)
-    return NUFFTSynthesisPlan{T, D, R, length(bt), typeof(plan), typeof(modes), typeof(values), typeof(hmodes),
-            typeof(hvalues), typeof(full), typeof(spatial)}(
-        plan, modes, values, hmodes, hvalues, full, ms, spatial, bt, ntrans, M, C)
+    return _closing_on_error((plan,)) do
+        modes = _alloc(exec, Complex{T}, ns..., C)
+        values = _alloc(exec, Complex{T}, M, C)
+        hmodes = dev ? Array{Complex{T}}(undef, ns..., C) : modes
+        hvalues = dev ? Array{Complex{T}}(undef, M, C) : values
+        full = R ? Array{Complex{T}}(undef, ns..., ntrans) : nothing
+        NUFFTSynthesisPlan{T, D, R, length(bt), typeof(plan), typeof(modes), typeof(values), typeof(hmodes),
+                typeof(hvalues), typeof(full), typeof(spatial)}(
+            plan, modes, values, hmodes, hvalues, full, ms, mb, ns, spatial, bt, ntrans, M, C)
+    end
 end
 
-function Plans.synthesize!(out::AbstractArray, p::NUFFTSynthesisPlan{T, D, R}, coeffs::AbstractArray;
-        ks = nothing) where {T, D, R}
+function Plans.synthesize!(out::AbstractArray, p::NUFFTSynthesisPlan{T, D, R},
+        coeffs::AbstractArray) where {T, D, R}
     size(out) == Plans.field_size(p) || throw(DimensionMismatch(
         "out is $(size(out)); this plan writes $(Plans.field_size(p))"))
-    sz = FTB.packed_size(p.ms, Val(R))
+    sz = FTB.packed_size(p.box, Val(R))
     size(coeffs)[1:D] == sz || throw(DimensionMismatch(
         "this plan expects $(sz) on the spectral dims; got $(size(coeffs)[1:D])"))
-    full = if R
-        FTB.unpacked!(p.full, reshape(coeffs, sz..., p.ntrans), p.ms, ks)
-        p.full
-    else
+    full = R ? DirectSum.native_coefficients!(p.full, reshape(coeffs, sz..., p.ntrans), p.ms, p.box) :
         reshape(coeffs, p.ms..., p.ntrans)
-    end
     _synthesis_run!(out, p, full)
     return out
 end
 
 function _synthesis_run!(out::AbstractArray{Z}, p::NUFFTSynthesisPlan, full) where {Z}
-    Pm = prod(p.ms)
+    Pm = prod(p.ns)
     M, C = p.M, p.C
     fk, cj = p.hmodes, p.hvalues
     @inbounds for base in 0:C:(p.ntrans - 1)
@@ -764,15 +889,15 @@ function _synthesize(t::_FTBLibrary, exec::Union{_HostExec, ComputationalBackend
         g::Union{FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
                  Grids.PointwiseCartesian},
         coeffs::AbstractArray{Complex{Tr}}, ms::NTuple{D, Int}; real_output::Bool = true, iflag::Int = 1,
-        ks = nothing, eps = nothing, batch_chunk = nothing, kwargs...) where {Tr <: Real, D}
-    sz = FTB.packed_size(ms, Val(real_output))
+        eps = nothing, batch_chunk = nothing, kwargs...) where {Tr <: Real, D}
+    sz = FTB.packed_size(Grids.mode_box(g, ms, Val(real_output)), Val(real_output))
     size(coeffs)[1:D] == sz || throw(DimensionMismatch(
         "real_output=$(real_output) expects $(sz) on the spectral dims; got $(size(coeffs)[1:D])."))
     batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
     plan = Plans.plan_synthesis(t, exec, g, real_output ? Tr : Complex{Tr}, ms; batch, iflag, eps,
         batch_chunk)
     try
-        return Plans.synthesize!(Plans.allocate_field(plan), plan, coeffs; ks)
+        return Plans.synthesize!(Plans.allocate_field(plan), plan, coeffs)
     finally
         Plans.close!(plan)
     end

@@ -12,7 +12,7 @@ using FlowGeometries: FlowGeometries as FG
 Horizontal spectra of a 4D field `f(x, y, z, t)` on a **fixed, non-uniform** horizontal grid — the
 bread-and-butter geophysical workflow. The field is a real `(Npts, nz, nt)` tensor: the horizontal
 points never move, so the FINUFFT plan is built **once** and the entire `(z, t)` batch transforms in a
-single `ntrans` execution. Then ONE batch-preserving `isotropic_spectrum` call returns `E(k, z, t)` —
+single `ntrans` execution. Then one batch-preserving `isotropic_spectrum` call returns `E(k, z, t)` —
 no per-slice reshape loop.
 """
 function run_horizontal_spectra_4d_example()
@@ -39,13 +39,12 @@ function run_horizontal_spectra_4d_example()
         @. f[:, iz, it] = cos(k0 * xv + 2π * t) + 0.5 * sin((k0 + 1) * yv)
     end
 
-    # Build the plan ONCE for the fixed points; transform the whole (z, t) batch in one exec.
+    # The plan is built once for the fixed points; it transforms the whole (z, t) batch in one exec.
     plan = FFS.plan_spectrum(hgrid, Float64, ms; transform = FTB.FINUFFTBackend(), batch = (nz, nt), eps = 1e-9)
-    pms = FTB.packed_size(ms, Val(true))              # real field ⇒ axis 1 halved to k₁ ≥ 0
-    coeffs = zeros(ComplexF64, pms..., nz, nt)        # (N÷2+1, N, nz, nt)
+    coeffs = FFS.allocate_coefficients(plan)          # (N÷2+1, N+1, nz, nt): a point set holds ±N/2
     ks = FFS.calculate_spectrum!(coeffs, plan, f)
 
-    # ONE reduction → E(k, z, t), batch dims preserved. Average over time → E(k, z).
+    # One reduction → E(k, z, t), batch dims preserved. Average over time → E(k, z).
     nbins = 18
     kbins, E = FFS.isotropic_spectrum(ks, coeffs; num_bins = nbins)   # (nbins, nz, nt)
     Ekz = dropdims(sum(E; dims = 3); dims = 3) ./ nt                  # (nbins, nz)

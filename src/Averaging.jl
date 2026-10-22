@@ -20,7 +20,7 @@ export welch_power_spectrum, welch_power_spectrum!, coherence_spectrum, coherenc
                           convention=SpectralConvention()) -> nothing
 
 In-place, allocation-free [`welch_power_spectrum`](@ref): fills preallocated `E_k` and `k_bins` (both
-length `num_bins`). Reusable across a loop with zero steady-state heap traffic.
+length `num_bins`).
 """
 function welch_power_spectrum!(E_k::AbstractVector{T}, k_bins::AbstractVector{T}, ks_phys::Tuple,
         coeffs::AbstractArray{Complex{T}, N}; num_bins::Int = 0, cutoff::Bool = true,
@@ -43,21 +43,21 @@ function _fill_welch!(E_k::AbstractVector{T}, k_bins::AbstractVector{T}, ks_phys
     nb, dk, k_top = Reductions._radial_extent(ks_phys, req, T, cut)
     fill!(E_k, zero(T))
     fill!(k_bins, zero(T))
-    twin = FTB.axis_twin(first(ks_phys))
+    k1 = first(ks_phys)
+    rest = CartesianIndices(ntuple(d -> size(coeffs, d + 1), Val(D - 1)))
     real_idx = CartesianIndices(ntuple(i -> size(coeffs, D + i), Val(N - D)))
-    nreal = length(real_idx)
-    @inbounds for I in CartesianIndices(ntuple(d -> size(coeffs, d), Val(D)))
-        kmag = sqrt(Reductions.ksq(T, ks_phys, I))
-        C && kmag > k_top && continue
-        n = T(FTB.mode_fold(ks_phys, I))
-        p = zero(T)
-        for Ir in real_idx
-            J = CartesianIndex(I, Ir)
-            p += C ? n * abs2(coeffs[J]) : Reductions._native_energy(ks_phys, coeffs, J, twin)
+    s = T(0.5) / length(real_idx)
+    # Memory order, axis 1 fastest: each realization's coefficients are read contiguously.
+    @inbounds for (r, Ir) in enumerate(real_idx), Irest in rest
+        krest = Reductions.ksq(T, Base.tail(ks_phys), Irest)
+        for i1 in 1:size(coeffs, 1)
+            kmag = sqrt(T(k1[i1])^2 + krest)
+            C && kmag > k_top && continue
+            bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
+            w = T(FTB.fold_weight(k1, i1))
+            r == 1 && (k_bins[bin] += w)
+            E_k[bin] += s * w * abs2(coeffs[CartesianIndex(i1, Tuple(Irest)..., Tuple(Ir)...)])
         end
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
-        k_bins[bin] += n
-        E_k[bin] += T(0.5) * p / nreal
     end
     Reductions._shell_values!(E_k, k_bins, dk, ks_phys, convention.estimator)
     Reductions._scale_bins!(E_k, dk, convention.scaling)
@@ -110,31 +110,31 @@ function coherence_spectrum!(coherence²::AbstractVector{T}, phase::AbstractVect
     @inbounds for i in 1:nb
         k_bins[i] = T(0.5) * ((i - 1) * dk + i * dk)
     end
-    # `coherence²`/`phase` double as the Sff/Sgg real accumulators; the complex cross-spectrum Sfg needs
-    # its own accumulator (the only allocation — O(num_bins)).
+    # `coherence²` and `phase` accumulate Sff and Sgg; the complex Sfg has its own buffer.
     fill!(coherence², zero(T))
     fill!(phase, zero(T))
     Sfg = zeros(Complex{T}, nb)
-    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
-        kmag = sqrt(Reductions.ksq(T, ks_phys, I))
-        kmag > k_max && continue
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
-        sff = zero(T)
-        sgg = zero(T)
-        sfg = zero(Complex{T})
-        for e in 1:nreal
-            a = cf[mi + (e - 1) * M]
-            b = cg[mi + (e - 1) * M]
-            sff += abs2(a)
-            sgg += abs2(b)
-            sfg += a * conj(b)
+    k1 = first(ks_phys)
+    rest = CartesianIndices(ntuple(d -> ms[d + 1], Val(D - 1)))
+    # Memory order, axis 1 fastest: each realization's coefficients are read contiguously.
+    mi = 0
+    @inbounds for _ in 1:nreal, Irest in rest
+        krest = Reductions.ksq(T, Base.tail(ks_phys), Irest)
+        for i1 in 1:ms[1]
+            mi += 1
+            kmag = sqrt(T(k1[i1])^2 + krest)
+            kmag > k_max && continue
+            bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
+            a = cf[mi]
+            b = cg[mi]
+            # Fold the missing negative half: the auto-spectra double on interior halved modes, the cross
+            # spectrum takes its conjugate partner (`X+conj(X)`). Inert on a full layout (`w==1`).
+            w = T(FTB.fold_weight(k1, i1))
+            x = a * conj(b)
+            coherence²[bin] += w * abs2(a)
+            phase[bin] += w * abs2(b)
+            Sfg[bin] += x + (w - one(w)) * conj(x)
         end
-        # Fold the missing negative half: the auto-spectra double on interior halved modes, the cross
-        # spectrum takes its conjugate partner (`X+conj(X)`). Inert on a full layout (`w==1`).
-        w = FTB.mode_fold(ks_phys, I)
-        coherence²[bin] += w * sff
-        phase[bin] += w * sgg
-        Sfg[bin] += sfg + (w - one(w)) * conj(sfg)
     end
     @inbounds for i in 1:nb
         denom = coherence²[i] * phase[i]                       # Sff · Sgg

@@ -1,20 +1,20 @@
 module FlowFieldSpectraKernelAbstractionsExt
 
-# `@index` and `@Const` are imported UNQUALIFIED on purpose: they are `@kernel` DSL keywords that the
-# KernelAbstractions `@kernel` macro only recognizes by their bare names inside a kernel body (a
-# qualified `KA.@index` is not rewritten and expands to the wrong `__index_*` call). Everything else
-# stays module-qualified via `KA.`.
+# `@index` and `@Const` are imported by bare name: the `@kernel` macro recognizes these DSL keywords
+# only unqualified inside a kernel body, and `KA.@index` expands to the wrong `__index_*` call.
 using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FlowTransformBindings: FlowTransformBindings as FTB
 using ComputationalBackends: ComputationalBackends
+using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
 
 # =============================================================================
-# GPUBackend execution of the DirectSum transform on ANY KernelAbstractions device (incl. `KA.CPU()`
-# for CI parity, `CUDABackend()`, …). One thread per spectral mode, so each thread exclusively owns its
-# coefficient rows — no atomics. Tensor grids decode a spatial point's coordinate from the 1-D axes on
-# device (`axes[d][decode(p)[d]]`) — NO ∏N_d coordinate blob is staged. The batch is the inner loop.
+# GPUBackend execution of the DirectSum transform and its synthesis on any KernelAbstractions device
+# (`KA.CPU()`, `CUDABackend()`, …). The forward runs one thread per spectral mode, which owns that mode's
+# coefficient rows; the synthesis runs one thread per point, which owns that point's values. Neither needs
+# atomics. A tensor grid's point coordinates decode from its 1-D axes on device (`axes[d][decode(p)[d]]`).
+# The batch is the inner loop. The one-shots build a plan and execute it once.
 # =============================================================================
 
 # Is `a` resident on `backend`? Only a strided array can be, and `KA.get_backend` answers for a host
@@ -36,12 +36,12 @@ function _dev_vec(backend::KA.Backend, v, ::Type{FT}) where {FT}
     return d
 end
 
-# Stage a field `(spatial…, batch…)` as a device `(Npts, B)` array; `copyto!` converts and transfers in
-# one step (`reshape` is a view, so no `(Npts, B)` host temp), and only widens when the type differs.
-function _dev_field(backend::KA.Backend, field, Npts::Int, B::Int, ::Type{FT}) where {FT}
-    d = KA.allocate(backend, FT, Npts, B)
-    copyto!(d, reshape(eltype(field) === FT ? field : FT.(field), Npts, B))
-    return d
+# A field `(spatial…, batch…)`, host or device, into the device `(N, B)` buffer `fld`, weighted by the
+# per-node quadrature factor `qw` (`nothing` for a constant measure).
+function _stage_field!(fld, field, qw)
+    copyto!(fld, eltype(field) === eltype(fld) ? field : eltype(fld).(field))
+    qw === nothing || (fld .*= qw)
+    return fld
 end
 
 # =============================================================================
@@ -51,22 +51,73 @@ end
 FFS._alloc(exec::ComputationalBackends.GPUBackend{<:KA.Backend}, ::Type{T}, dims::Integer...) where {T} =
     KA.allocate(exec.backend, T, dims...)
 
-# `w` is an array of per-entry weights or one number for every entry (`FFS._weight`).
-KA.@kernel function _gather_scaled_kernel!(dst, doff::Int, @Const(src), soff::Int, @Const(idx), w,
-        csrc::Bool, neg::Bool)
-    i = @index(Global)
+# One thread per entry of every transform: entry `i` of transform `c` reads `src` at `soff + c·sstride +
+# idx[i]` and writes `dst` at `doff + c·n + i`. `w` is an array of per-entry weights or one number for
+# every entry (`FFS._weight`).
+KA.@kernel function _gather_scaled_kernel!(dst, doff::Int, @Const(src), soff::Int, sstride::Int, @Const(idx),
+        w, n::Int, csrc::Bool, neg::Bool)
+    k = @index(Global)
+    i = (k - 1) % n + 1
+    c = (k - 1) ÷ n
     @inbounds begin
-        s = src[soff + idx[i]]
+        s = src[soff + c * sstride + idx[i]]
         v = (csrc ? conj(s) : s) * FFS._weight(w, i)
-        dst[doff + i] = neg ? conj(v) : v
+        dst[doff + c * n + i] = neg ? conj(v) : v
     end
 end
 
-function FFS._gather_scaled!(dst::AbstractArray, doff::Int, src::AbstractArray, soff::Int,
-        idx::AbstractArray{Int}, w::Union{AbstractArray, Number}, n::Int, csrc::Bool, neg::Bool)
-    n == 0 && return dst
+function FFS._gather_scaled!(dst::AbstractArray, doff::Int, src::AbstractArray, soff::Int, sstride::Int,
+        idx::AbstractArray{Int}, w::Union{AbstractArray, Number}, n::Int, ntr::Int, csrc::Bool, neg::Bool)
+    n * ntr == 0 && return dst
     backend = KA.get_backend(src)
-    _gather_scaled_kernel!(backend)(dst, doff, src, soff, idx, w, csrc, neg; ndrange = n)
+    _gather_scaled_kernel!(backend)(dst, doff, src, soff, sstride, idx, w, n, csrc, neg; ndrange = n * ntr)
+    KA.synchronize(backend)
+    return dst
+end
+
+# One thread per coefficient of every transform: coefficient `i` of transform `c` is `scale` times entry
+# `idx[i]` of that transform's spectrum, its conjugate at `-idx[i]` where negative, zero at `0`.
+KA.@kernel function _gather_packed_kernel!(dst, doff::Int, @Const(src), soff::Int, sstride::Int, @Const(idx),
+        scale, n::Int, neg::Bool)
+    k = @index(Global)
+    i = (k - 1) % n + 1
+    c = (k - 1) ÷ n
+    @inbounds begin
+        j = idx[i]
+        so = soff + c * sstride
+        v = j > 0 ? src[so + j] * scale : j < 0 ? conj(src[so - j]) * scale : zero(eltype(dst))
+        dst[doff + c * n + i] = neg ? conj(v) : v
+    end
+end
+
+function FFS._gather_packed!(dst::AbstractArray, doff::Int, src::AbstractArray, soff::Int, sstride::Int,
+        idx::AbstractArray{Int}, scale::Real, n::Int, ntr::Int, neg::Bool)
+    n * ntr == 0 && return dst
+    backend = KA.get_backend(src)
+    _gather_packed_kernel!(backend)(dst, doff, src, soff, sstride, idx, scale, n, neg; ndrange = n * ntr)
+    KA.synchronize(backend)
+    return dst
+end
+
+# One thread per listed coefficient of every transform: coefficient `pos[i]` of transform `c`, `n` apart
+# from `doff`, is entry `idx[i]` of `srcs[c]` times `fac[i]`.
+KA.@kernel function _scatter_each_kernel!(dst, doff::Int, n::Int, srcs, @Const(pos), @Const(idx), @Const(fac),
+        S::Int, neg::Bool)
+    k = @index(Global)
+    i = (k - 1) % S + 1
+    c = (k - 1) ÷ S
+    @inbounds begin
+        v = srcs[c + 1][idx[i]] * fac[i]
+        dst[doff + c * n + pos[i]] = neg ? conj(v) : v
+    end
+end
+
+function FFS._scatter_each!(dst::AbstractArray, doff::Int, n::Int, srcs::Tuple, ntr::Int,
+        pos::AbstractArray{Int}, idx::AbstractArray{Int}, fac::AbstractArray, neg::Bool)
+    S = length(pos)
+    S * ntr == 0 && return dst
+    backend = KA.get_backend(dst)
+    _scatter_each_kernel!(backend)(dst, doff, n, srcs, pos, idx, fac, S, neg; ndrange = S * ntr)
     KA.synchronize(backend)
     return dst
 end
@@ -87,80 +138,27 @@ end
 # Cartesian direct sum
 # =============================================================================
 
-function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.AbstractGPUBackend,
-        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int, box = nothing) where {D}
-    FT = eltype(g)
-    backend = exec.backend
-    ss = size(g)
-    Npts = prod(ss)
-    R = eltype(field) <: Real
-    xs, ks_cpu = FFS.DirectSum.phase_geometry(g, FT, ms, Val(R), box)
-    pms = FTB.packed_size(ms, Val(R))
-    M = prod(pms)
-    B = length(field) ÷ Npts
-    ksd = ntuple(d -> _dev_vec(backend, collect(ks_cpu[d]), FT), D)
-    ET = eltype(field) <: Real ? FT : Complex{FT}          # stage the field in its own float type
-    fieldd = _dev_field(backend, field, Npts, B, ET)
-    coeffs_dev = KA.zeros(backend, Complex{FT}, M, B)
-    _launch_cartesian!(coeffs_dev, backend, g, xs, fieldd, ksd, ss, pms, Npts, M, B, iflag)
-    KA.synchronize(backend)
-    coeffs_dev ./= Npts
-    tw = _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms, iflag, ss, Npts, B, FT)
-    ks_out = tw === nothing ? ks_cpu : (FTB.with_twin(ks_cpu[1], tw), Base.tail(ks_cpu)...)
-    return reshape(FFS._to_host(coeffs_dev), pms..., FFS.Grids.field_batch_shape(g, field)...), ks_out
-end
+# The positions `x − x₀` a kernel reads: one vector per axis on a tensor grid, and one value per point per
+# direction otherwise, a curvilinear grid's coordinate arrays flattened.
+_stage_positions(backend, ::FFS.DirectSum.TensorCartesian, xs::Tuple, ::Type{FT}) where {FT} =
+    map(x -> _dev_vec(backend, collect(x), FT), xs)
+_stage_positions(backend, ::FFS.DirectSum.CloudCartesian, xs::Tuple, ::Type{FT}) where {FT} =
+    map(x -> _dev_vec(backend, vec(collect(x)), FT), xs)
 
-# The twin the packed half needs where index negation misses `+N_d/2`, evaluated on device by rerunning
-# the forward kernel over each masked mode set: the mask shape replaces `pms` and the masked wavenumbers
-# replace `ks`. `nothing` when negation already reaches every partner.
-function _gpu_nyquist_twin(backend, g, xs, ks_cpu, field, fieldd, ms::NTuple{D, Int}, iflag::Int, ss, Npts,
-        B, ::Type{FT}) where {FT, D}
-    (D >= 2 && eltype(field) <: Real && !FlowGeometries.Grids.isuniform(g)) || return nothing
-    batch = FFS.Grids.field_batch_shape(g, field)
-    slices = ntuple(FTB.n_twin_slices(Val(D))) do mask
-        sl = FTB.twin_slice_shape(ms, mask)
-        S = prod(sl)
-        out = KA.zeros(backend, Complex{FT}, S, B)
-        if S > 0
-            kaxd = ntuple(d -> _dev_vec(backend, FFS.DirectSum._twin_kaxis(FT, ks_cpu, ms, mask, d, sl[d]), FT), D)
-            _launch_cartesian!(out, backend, g, xs, fieldd, kaxd, ss, sl, Npts, S, B, iflag)
-            KA.synchronize(backend)
-            out ./= Npts
-        end
-        return reshape(FFS._to_host(out), sl..., batch...)
-    end
-    return FTB.NyquistTwin(slices)
-end
-
-# Structured (tensor-product) grid: stage the D axes of positions `xs` (`DirectSum.phase_geometry`) and
-# decode point coordinates on device. `pms` is the packed mode count per axis (axis 1 halved for a real
-# field).
-function _launch_cartesian!(coeffs_dev, backend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        xs::Tuple, fieldd, ksd, ss::NTuple{D, Int}, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
-    FT = real(eltype(coeffs_dev))
-    axesd = ntuple(d -> _dev_vec(backend, collect(xs[d]), FT), D)
-    kernel! = _cart_tensor_kernel!(backend)
-    kernel!(coeffs_dev, fieldd, axesd, ksd, ss, pms, Npts, M, B, D, iflag; ndrange = M)
-    return coeffs_dev
-end
-
-# Pointwise grid: stage the D per-point position arrays. The ambient dimension D is `length(pms)`; `ss`
-# is the grid's own spatial shape and is unused here. A curvilinear grid holds one coordinate value per
-# cell in an N-D array, so `vec` gives the point list the kernel indexes.
-function _launch_cartesian!(coeffs_dev, backend, g::FFS.Grids.PointwiseCartesian,
-        xs::Tuple, fieldd, ksd, ss, pms::NTuple{D, Int}, Npts, M, B, iflag) where {D}
-    FT = real(eltype(coeffs_dev))
-    coordsd = ntuple(d -> _dev_vec(backend, vec(collect(xs[d])), FT), D)
-    kernel! = _cart_scattered_kernel!(backend)
-    kernel!(coeffs_dev, fieldd, coordsd, ksd, pms, Npts, M, B, D, iflag; ndrange = M)
-    return coeffs_dev
-end
+# `coeffs[k, b] += Σ_p field[p, b] e^{-iflag·i·k·x_p}` over the modes `live` (linear indices into the mode
+# set `pms`), wavenumber axes `ksd`.
+_run_cartesian!(coeffs, backend, ::FFS.DirectSum.TensorCartesian, xsd, field, ksd, ss, pms, live, N, L, B,
+    iflag) = _cart_tensor_kernel!(backend)(coeffs, field, xsd, ksd, ss, pms, live, N, L, B, length(pms), iflag;
+    ndrange = L)
+_run_cartesian!(coeffs, backend, ::FFS.DirectSum.CloudCartesian, xsd, field, ksd, ss, pms, live, N, L, B,
+    iflag) = _cart_scattered_kernel!(backend)(coeffs, field, xsd, ksd, pms, live, N, L, B, length(pms), iflag;
+    ndrange = L)
 
 KA.@kernel function _cart_tensor_kernel!(coeffs, @Const(field), @Const(axesd), @Const(ksd),
-        @Const(ss), @Const(pms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
-    mi = @index(Global)
-    if mi <= M
+        @Const(ss), @Const(pms), @Const(live), N::Int, L::Int, B::Int, D::Int, iflag::Int)
+    t = @index(Global)
+    if t <= L
+        mi = live[t]
         I = _ka_decode(mi, pms)
         FT = eltype(axesd[1])
         @inbounds for p in 1:N
@@ -178,9 +176,10 @@ KA.@kernel function _cart_tensor_kernel!(coeffs, @Const(field), @Const(axesd), @
 end
 
 KA.@kernel function _cart_scattered_kernel!(coeffs, @Const(field), @Const(coordsd), @Const(ksd),
-        @Const(pms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
-    mi = @index(Global)
-    if mi <= M
+        @Const(pms), @Const(live), N::Int, L::Int, B::Int, D::Int, iflag::Int)
+    t = @index(Global)
+    if t <= L
+        mi = live[t]
         I = _ka_decode(mi, pms)
         FT = eltype(coordsd[1])
         @inbounds for p in 1:N
@@ -196,36 +195,348 @@ KA.@kernel function _cart_scattered_kernel!(coeffs, @Const(field), @Const(coords
     end
 end
 
-# =============================================================================
-# Spherical direct sum — one thread per (row, col) coefficient slot (owns it across batch, no atomics)
-# =============================================================================
+"""
+    DirectSumGPUCartesianPlan{FT,R}
 
-function FFS._gpu_directsum_spherical(exec::ComputationalBackends.AbstractGPUBackend,
-        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
-        field::AbstractArray, lmax::Int; sampling = nothing, weights = nothing)
-    FT = eltype(g)
-    backend = exec.backend
-    θpt, φpt, wpt = FFS.DirectSum._sph_point_data(g, FT; sampling = sampling, weights = weights)
-    N = length(θpt)
-    Nθc = lmax + 1
-    Nφc = 2 * lmax + 1
-    B = length(field) ÷ N
-    θd = _dev_vec(backend, θpt, FT)
-    φd = _dev_vec(backend, φpt, FT)
-    wd = _dev_vec(backend, wpt, FT)
-    ET = eltype(field) <: Real ? FT : Complex{FT}          # stage the field in its own float type
-    fieldd = _dev_field(backend, field, N, B, ET)
-    # The kernel accumulates in `eltype(coeffs)`, so a real field's coefficients stay real on device.
-    coeffs_dev = KA.zeros(backend, FFS.sph_coeff_type(eltype(field), FT), Nθc, Nφc, B)
-    kernel! = _spherical_kernel!(backend)
-    kernel!(coeffs_dev, θd, φd, fieldd, wd, lmax, N, B; ndrange = Nθc * Nφc)
-    KA.synchronize(backend)
-    batch = FFS.Grids.field_batch_shape(g, field)
-    return reshape(FFS._to_host(coeffs_dev), Nθc, Nφc, batch...), (0:lmax, -lmax:lmax)
+Reusable Cartesian direct sum on a KernelAbstractions device: the positions `x − x₀` and the wavenumber
+axes of the coefficient box staged once, the modes it computes (a real field's box holds zero at the rest,
+`FlowTransformBindings.outside_modes`), the device field and coefficient buffers, and the per-node
+quadrature factor. `R` marks a real field. Execute with `calculate_spectrum!(coeffs, plan, field)`,
+`field` and `coeffs` on the host or the device.
+"""
+struct DirectSumGPUCartesianPlan{FT, R, NB, BK, L, X, K, LV, FB, CB, QW, KS, SS, PS} <: FFS.AbstractSpectralPlan
+    backend::BK
+    layout::L                     # TensorCartesian / CloudCartesian
+    xs::X                         # device positions
+    ks::K                         # device wavenumber axes
+    live::LV                      # device linear indices of the computed modes
+    fld::FB                       # device (Npts, B) field
+    cd::CB                        # device (M, B) coefficients
+    qw::QW                        # device (Npts,) quadrature factor, `nothing` where the measure is constant
+    ss::SS                        # the grid's shape
+    pms::PS                       # packed coefficient box
+    Npts::Int
+    M::Int
+    B::Int
+    iflag::Int
+    batch::NTuple{NB, Int}
+    ks_phys::KS                   # host wavenumber axes
 end
 
-KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(field), @Const(w),
-        lmax::Int, N::Int, B::Int)
+Base.show(io::IO, p::DirectSumGPUCartesianPlan{FT, R}) where {FT, R} =
+    print(io, "DirectSumGPUCartesianPlan{", FT, "}(", R ? "real" : "complex", ", ",
+        nameof(typeof(p.layout)), ", B=", p.B, ")")
+
+FFS.Plans.coefficient_size(p::DirectSumGPUCartesianPlan) = (p.pms..., p.batch...)
+FFS.Plans.coefficient_type(::DirectSumGPUCartesianPlan{FT}) where {FT} = Complex{FT}
+FFS.Plans.wavenumbers(p::DirectSumGPUCartesianPlan) = p.ks_phys
+
+function FFS.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
+        exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, box = nothing,
+        kwargs...) where {T, D}
+    FT = real(float(T))
+    R = T <: Real
+    backend = exec.backend
+    layout = FFS.DirectSum._cart_layout(g)
+    ss = size(g)
+    Npts = prod(ss)
+    bt = NTuple{length(batch), Int}(batch)
+    B = prod(bt; init = 1)
+    xs, ks_phys = FFS.DirectSum.phase_geometry(g, FT, ms, Val(R), box)
+    pms = map(length, ks_phys)
+    M = prod(pms)
+    outside = R ? FTB.outside_modes(ms, FFS.Grids.mode_box(g, ms, Val(true))) : Int[]
+    live = _dev_vec(backend, setdiff(1:M, outside), Int)
+    xsd = _stage_positions(backend, layout, xs, FT)
+    ksd = map(k -> _dev_vec(backend, collect(k), FT), ks_phys)
+    fld = KA.allocate(backend, R ? FT : Complex{FT}, Npts, B)
+    cd = KA.allocate(backend, Complex{FT}, M, B)
+    qwh = FFS.Grids.quadrature_scale(g, FT, Npts)
+    qw = qwh === nothing ? nothing : _dev_vec(backend, qwh, FT)
+    return DirectSumGPUCartesianPlan{FT, R, length(bt), typeof(backend), typeof(layout), typeof(xsd),
+            typeof(ksd), typeof(live), typeof(fld), typeof(cd), typeof(qw), typeof(ks_phys), typeof(ss),
+            typeof(pms)}(
+        backend, layout, xsd, ksd, live, fld, cd, qw, ss, pms, Npts, M, B, iflag, bt, ks_phys)
+end
+
+"""
+    calculate_spectrum!(coeffs, plan::DirectSumGPUCartesianPlan, field) -> ks
+
+Fill `coeffs` (the packed half of the coefficient box for a real field, the full native spectrum for a
+complex one) with the direct sum of `field` `(spatial…, batch…)` on the plan's device, and return the
+wavenumber axes.
+"""
+function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{FT}}, p::DirectSumGPUCartesianPlan{FT, R},
+        field) where {FT, R}
+    FFS.Plans._check_coefficients(coeffs, p)
+    length(field) == p.Npts * p.B || throw(DimensionMismatch(
+        "field holds $(length(field)) values; this plan transforms $(p.B) field(s) of $(p.Npts) points — " *
+        "pass the matching `batch=` to plan_spectrum"))
+    (R && eltype(field) <: Complex) && throw(ArgumentError(
+        "this plan was built for a real field; build one for $(eltype(field)) to transform a complex field"))
+    _stage_field!(p.fld, field, p.qw)
+    fill!(p.cd, zero(eltype(p.cd)))
+    L = length(p.live)
+    if L > 0
+        _run_cartesian!(p.cd, p.backend, p.layout, p.xs, p.fld, p.ks, p.ss, p.pms, p.live, p.Npts, L, p.B,
+            p.iflag)
+        KA.synchronize(p.backend)
+        p.cd ./= p.Npts
+    end
+    copyto!(coeffs, p.cd)
+    return p.ks_phys
+end
+
+function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        field::AbstractArray, ms::NTuple{D, Int}, iflag::Int, box = nothing) where {D}
+    FT = eltype(g)
+    p = FFS.plan_spectrum(SpectralBackends.DirectSumSpectralBackend(), exec, g,
+        eltype(field) <: Real ? FT : Complex{FT}, ms; batch = FFS.Grids.field_batch_shape(g, field),
+        iflag = iflag, box = box)
+    coeffs = FFS.allocate_coefficients(p)
+    return coeffs, FFS.calculate_spectrum!(coeffs, p, field)
+end
+
+# =============================================================================
+# Cartesian direct-sum synthesis: `f_p = Σ_k C_k e^{+iflag·i·k·x_p}` over the native spectrum. A real field's
+# packed half is written on the host as the series of `Grids.series_modes` whose real part is its series
+# over the coefficient box (`DirectSum.native_coefficients!`), and the device sum keeps the real part of
+# each term.
+# =============================================================================
+
+@inline _part(::Type{<:Real}, z) = real(z)
+@inline _part(::Type{<:Complex}, z) = z
+
+_run_synthesis!(out, backend, ::FFS.DirectSum.TensorCartesian, xsd, C, ksd, ss, ms, N, M, B, iflag) =
+    _cart_synth_tensor_kernel!(backend)(out, C, xsd, ksd, ss, ms, N, M, B, length(ms), iflag; ndrange = N)
+_run_synthesis!(out, backend, ::FFS.DirectSum.CloudCartesian, xsd, C, ksd, ss, ms, N, M, B, iflag) =
+    _cart_synth_scattered_kernel!(backend)(out, C, xsd, ksd, ms, N, M, B, length(ms), iflag; ndrange = N)
+
+KA.@kernel function _cart_synth_tensor_kernel!(out, @Const(C), @Const(axesd), @Const(ksd), @Const(ss),
+        @Const(ms), N::Int, M::Int, B::Int, D::Int, iflag::Int)
+    p = @index(Global)
+    if p <= N
+        P = _ka_decode(p, ss)
+        FT = eltype(axesd[1])
+        @inbounds for mi in 1:M
+            I = _ka_decode(mi, ms)
+            phi = zero(FT)
+            for d in 1:D
+                phi += ksd[d][I[d]] * axesd[d][P[d]]
+            end
+            W = cis(iflag * phi)
+            for b in 1:B
+                out[p, b] += _part(eltype(out), C[mi, b] * W)
+            end
+        end
+    end
+end
+
+KA.@kernel function _cart_synth_scattered_kernel!(out, @Const(C), @Const(coordsd), @Const(ksd), @Const(ms),
+        N::Int, M::Int, B::Int, D::Int, iflag::Int)
+    p = @index(Global)
+    if p <= N
+        FT = eltype(coordsd[1])
+        @inbounds for mi in 1:M
+            I = _ka_decode(mi, ms)
+            phi = zero(FT)
+            for d in 1:D
+                phi += ksd[d][I[d]] * coordsd[d][p]
+            end
+            W = cis(iflag * phi)
+            for b in 1:B
+                out[p, b] += _part(eltype(out), C[mi, b] * W)
+            end
+        end
+    end
+end
+
+"""
+    DirectSumGPUSynthesisPlan{FT,R}
+
+Reusable Cartesian direct-sum synthesis on a KernelAbstractions device: the positions `x − x₀` and the
+wavenumber axes of the series staged once, the device spectrum and field buffers, and for a real field the
+host buffers its packed half is written through. `R` marks a real field. Execute with
+`synthesize!(out, plan, coeffs)`.
+"""
+struct DirectSumGPUSynthesisPlan{FT, R, NB, BK, L, X, K, CB, OB, HB, FB, SS, MS} <: FFS.AbstractSynthesisPlan
+    backend::BK
+    layout::L                     # TensorCartesian / CloudCartesian
+    xs::X                         # device positions
+    ks::K                         # device wavenumber axes of the series
+    cd::CB                        # device (M, B) series coefficients
+    out::OB                       # device (Npts, B) field
+    hc::HB                        # host packed half, `nothing` for a complex field
+    full::FB                      # host series coefficients it is written into, `nothing` for a complex field
+    ss::SS                        # the grid's shape, which the field takes
+    ms::MS
+    box::MS                       # coefficient box
+    ns::MS                        # mode counts of the series
+    Npts::Int
+    M::Int
+    B::Int
+    iflag::Int
+    batch::NTuple{NB, Int}
+end
+
+Base.show(io::IO, p::DirectSumGPUSynthesisPlan{FT, R}) where {FT, R} =
+    print(io, "DirectSumGPUSynthesisPlan{", FT, "}(", R ? "real" : "complex", ", ms=", p.ms, ")")
+
+FFS.Plans.field_size(p::DirectSumGPUSynthesisPlan) = (p.ss..., p.batch...)
+FFS.Plans.field_type(::DirectSumGPUSynthesisPlan{FT, R}) where {FT, R} = R ? FT : Complex{FT}
+
+function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractDirectSumSpectralBackend,
+        exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, box = nothing,
+        kwargs...) where {T, D}
+    FT = real(float(eltype(g)))
+    R = T <: Real
+    backend = exec.backend
+    layout = FFS.DirectSum._cart_layout(g)
+    ss = size(g)
+    Npts = prod(ss)
+    bt = NTuple{length(batch), Int}(batch)
+    B = prod(bt; init = 1)
+    offs, ranges = FFS.Grids.axis_geometry(FT, g, D, box)
+    xsd = _stage_positions(backend, layout, FFS.Grids.relative_coordinates(g, offs), FT)
+    mb = FFS.Grids.mode_box(g, ms, Val(R))
+    ns = FFS.Grids.series_modes(g, ms, Val(R))
+    ksd = map(k -> _dev_vec(backend, collect(k), FT), FFS.Grids.physical_wavenumbers(ranges, ns, Val(false)))
+    M = prod(ns)
+    cd = KA.allocate(backend, Complex{FT}, M, B)
+    out = KA.allocate(backend, R ? FT : Complex{FT}, Npts, B)
+    hc = R ? Array{Complex{FT}}(undef, FTB.packed_size(mb, Val(true))..., B) : nothing
+    full = R ? Array{Complex{FT}}(undef, ns..., B) : nothing
+    return DirectSumGPUSynthesisPlan{FT, R, length(bt), typeof(backend), typeof(layout), typeof(xsd), typeof(ksd),
+            typeof(cd), typeof(out), typeof(hc), typeof(full), typeof(ss), typeof(ms)}(
+        backend, layout, xsd, ksd, cd, out, hc, full, ss, ms, mb, ns, Npts, M, B, iflag, bt)
+end
+
+"""
+    synthesize!(out, plan::DirectSumGPUSynthesisPlan, coeffs) -> out
+
+Evaluate the series `coeffs` (the packed half of the coefficient box for a real field, the full native
+spectrum for a complex one) at the grid's points on the plan's device, into `out` on the host or the
+device.
+"""
+function FFS.Plans.synthesize!(out::AbstractArray, p::DirectSumGPUSynthesisPlan{FT, R},
+        coeffs::AbstractArray) where {FT, R}
+    size(out) == FFS.Plans.field_size(p) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(p))"))
+    want = (FTB.packed_size(p.box, Val(R))..., p.batch...)
+    size(coeffs) == want || throw(DimensionMismatch("coeffs is $(size(coeffs)); this plan reads $want"))
+    if R
+        copyto!(p.hc, coeffs)
+        FFS.DirectSum.native_coefficients!(p.full, p.hc, p.ms, p.box)
+        copyto!(p.cd, p.full)
+    else
+        copyto!(p.cd, coeffs)
+    end
+    fill!(p.out, zero(eltype(p.out)))
+    _run_synthesis!(p.out, p.backend, p.layout, p.xs, p.cd, p.ks, p.ss, p.ns, p.Npts, p.M, p.B, p.iflag)
+    KA.synchronize(p.backend)
+    copyto!(out, p.out)
+    return out
+end
+
+# =============================================================================
+# Normalized associated Legendre values on the device: the packed table
+# `P[legendre_index(ℓ, m, lmax), j] = P̄_ℓ^m(cos θ_j)`, one thread per (order, node), each running the
+# recurrence `SphericalKernels.fill_legendre!` runs, on the coefficients `legendre_tables` builds, staged
+# once. The spherical kernels read values from it and evaluate none.
+# =============================================================================
+
+function FFS.SphericalKernels.device_legendre_table(backend::KA.Backend, ::Type{FT}, lmax::Int,
+        θ::AbstractVector) where {FT}
+    t = FFS.SphericalKernels.legendre_tables(FT, lmax)
+    n = length(θ)
+    P = KA.allocate(backend, FT, FFS.SphericalKernels.legendre_count(lmax), n)
+    n == 0 && return P
+    θh = FT.(collect(θ))
+    a = KA.allocate(backend, FT, size(t.a)...)
+    copyto!(a, t.a)
+    b = KA.allocate(backend, FT, size(t.b)...)
+    copyto!(b, t.b)
+    _legendre_table_kernel!(backend)(P, _dev_vec(backend, cos.(θh), FT), _dev_vec(backend, sin.(θh), FT),
+        _dev_vec(backend, t.c, FT), _dev_vec(backend, t.d, FT), a, b, t.P00, lmax, n;
+        ndrange = (lmax + 1) * n)
+    KA.synchronize(backend)
+    return P
+end
+
+KA.@kernel function _legendre_table_kernel!(P, @Const(x), @Const(s), @Const(c), @Const(d), @Const(a),
+        @Const(b), P00, lmax::Int, n::Int)
+    idx = @index(Global)
+    if idx <= (lmax + 1) * n
+        m = (idx - 1) % (lmax + 1)
+        j = (idx - 1) ÷ (lmax + 1) + 1
+        @inbounds begin
+            xj = x[j]
+            sj = s[j]
+            Pl = P00
+            for k in 1:m
+                Pl *= c[k] * sj
+            end
+            r = FFS.SphericalKernels.legendre_index(m, m, lmax)
+            P[r, j] = Pl
+            if m < lmax
+                Pprev = Pl
+                Pl = xj * d[m + 1] * Pl
+                P[r + 1, j] = Pl
+                for l in (m + 2):lmax
+                    Pprev, Pl = Pl, xj * a[l + 1, m + 1] * Pl - b[l + 1, m + 1] * Pprev
+                    P[r + l - m, j] = Pl
+                end
+            end
+        end
+    end
+end
+
+# =============================================================================
+# Spherical direct sum and synthesis — the projection runs one thread per (row, col) coefficient slot (owns
+# it across batch, no atomics), the synthesis one thread per node, both reading the Legendre values and
+# each node's longitude factor from tables. The tables hold one column per node, so the nodes are taken in
+# chunks whose tables stay within `_SPH_TABLE_ENTRIES` entries each.
+# =============================================================================
+
+const _SPH_TABLE_ENTRIES = 1 << 24
+
+_sph_chunk(lmax::Int, N::Int) =
+    clamp(_SPH_TABLE_ENTRIES ÷ max(FFS.SphericalKernels.legendre_count(lmax), 2 * lmax + 1), 1, max(N, 1))
+
+# `Y[col, p] = w_p · s(m) · (m ≥ 0 ? cos(mφ_p) : sin(|m|φ_p))`, the order-`m` factor of the real
+# spherical harmonic (FastSphericalHarmonics convention) times the node's quadrature weight, or times one
+# for `w = nothing`.
+function _weighted_trig(::Type{FT}, φ, w, lmax::Int) where {FT}
+    Y = Matrix{FT}(undef, 2 * lmax + 1, length(φ))
+    r2 = sqrt(FT(2))
+    @inbounds for p in eachindex(φ), col in 1:(2 * lmax + 1)
+        m = col == 1 ? 0 : (iseven(col) ? -(col ÷ 2) : (col - 1) ÷ 2)
+        am = abs(m)
+        sfac = m == 0 ? one(FT) : (isodd(am) ? -r2 : r2)
+        Y[col, p] = _node_weight(FT, w, p) * sfac * (m >= 0 ? cos(m * FT(φ[p])) : sin(am * FT(φ[p])))
+    end
+    return Y
+end
+
+@inline _node_weight(::Type{FT}, ::Nothing, p::Int) where {FT} = one(FT)
+@inline _node_weight(::Type{FT}, w, p::Int) where {FT} = FT(w[p])
+
+# The tables of the nodes `pts`: the Legendre values on the device, the longitude factors from the host.
+function _node_tables(backend, ::Type{FT}, θ, φ, w, pts, lmax::Int) where {FT}
+    P = FFS.SphericalKernels.device_legendre_table(backend, FT, lmax, view(θ, pts))
+    Y = KA.allocate(backend, FT, 2 * lmax + 1, length(pts))
+    copyto!(Y, _weighted_trig(FT, view(φ, pts), w === nothing ? nothing : view(w, pts), lmax))
+    return P, Y
+end
+
+# Points `p0 + 1 … p0 + n`, whose table columns are `1 … n`.
+KA.@kernel function _spherical_kernel!(coeffs, @Const(P), @Const(Y), @Const(field), @Const(w),
+        lmax::Int, p0::Int, n::Int, B::Int)
     idx = @index(Global)
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
@@ -236,19 +547,13 @@ KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(fi
         abs_m = abs(m)
         l = row - 1 + abs_m
         if l <= lmax
-            FT = eltype(θ)
             CT = eltype(coeffs)
-            sfac = m == 0 ? one(FT) : (isodd(abs_m) ? -sqrt(FT(2)) : sqrt(FT(2)))
-            @inbounds for p in 1:N
-                wp = w[p]
-                # A node of zero weight contributes nothing, and skipping it keeps a masked cell's value
-                # out of the sum entirely: masked data is commonly NaN, and `0 * NaN` is NaN.
-                iszero(wp) && continue
-                xj = cos(θ[p])
-                sj = sin(θ[p])
-                P = _ka_normalized_legendre(l, abs_m, xj, sj)
-                Ylm = sfac * P * (m >= 0 ? cos(m * φ[p]) : sin(abs_m * φ[p]))   # real SH (FSH convention)
-                gw = Ylm * wp
+            r = FFS.SphericalKernels.legendre_index(l, abs_m, lmax)
+            @inbounds for q in 1:n
+                p = p0 + q
+                # A zero-weight node is skipped, so a masked cell's datum (commonly NaN) never enters.
+                iszero(w[p]) && continue
+                gw = P[r, q] * Y[col, q]
                 for b in 1:B
                     coeffs[row, col, b] += CT(field[p, b] * gw)
                 end
@@ -257,22 +562,195 @@ KA.@kernel function _spherical_kernel!(coeffs, @Const(θ), @Const(φ), @Const(fi
     end
 end
 
-@inline function _ka_normalized_legendre(l::Int, m::Int, x::FT, s::FT)::FT where {FT}
-    m > l && return zero(FT)
-    P_mm = one(FT) / sqrt(FT(4π))
-    for mm in 1:m
-        P_mm *= -sqrt(FT(2mm + 1) / (2mm)) * s
+# The series at nodes `p0 + 1 … p0 + n`, whose table columns are `1 … n`.
+KA.@kernel function _spherical_synth_kernel!(out, @Const(P), @Const(Y), @Const(C), lmax::Int, p0::Int, n::Int,
+        B::Int)
+    q = @index(Global)
+    if q <= n
+        @inbounds for b in 1:B
+            acc = zero(eltype(out))
+            for l in 0:lmax
+                for m in (-l):l
+                    am = abs(m)
+                    col = m == 0 ? 1 : (m < 0 ? 2 * am : 2 * m + 1)
+                    r = FFS.SphericalKernels.legendre_index(l, am, lmax)
+                    acc += C[l - am + 1, col, b] * (P[r, q] * Y[col, q])
+                end
+            end
+            out[p0 + q, b] = acc
+        end
     end
-    l == m && return P_mm
-    P_lm = x * sqrt(FT(2m + 3)) * P_mm
-    P_lminus1_m = P_mm
-    l == m + 1 && return P_lm
-    for ll in (m+2):l
-        coeff1 = sqrt(FT(4ll^2 - 1) / (ll^2 - m^2))
-        coeff2 = sqrt(FT(2ll + 1) * ((ll - 1)^2 - m^2) / ((2ll - 3) * (ll^2 - m^2)))
-        P_lminus1_m, P_lm = P_lm, x * coeff1 * P_lm - coeff2 * P_lminus1_m
+end
+
+"""
+    DirectSumGPUSphericalPlan{FT,CT}
+
+Reusable spherical direct sum on a KernelAbstractions device: each node's colatitude, longitude and
+quadrature weight, read from the grid once, with the device weights, field and coefficient buffers. Each
+execution builds the Legendre and longitude tables of one chunk of nodes at a time. `CT` is the coefficient
+element type, real for a real field. Execute with `calculate_spectrum!(coeffs, plan, field)`.
+"""
+struct DirectSumGPUSphericalPlan{FT, CT, NB, BK, V, W, FB, CB, KS} <: FFS.AbstractSpectralPlan
+    backend::BK
+    θ::V                          # host colatitude per node
+    φ::V                          # host longitude per node
+    w::V                          # host quadrature weight per node, an inactive node at zero
+    wd::W                         # device weights
+    fld::FB                       # device (N, B) field
+    cd::CB                        # device (lmax + 1, 2lmax + 1, B) coefficients
+    lmax::Int
+    N::Int
+    chunk::Int
+    batch::NTuple{NB, Int}
+    B::Int
+    ks::KS
+end
+
+Base.show(io::IO, p::DirectSumGPUSphericalPlan{FT, CT}) where {FT, CT} =
+    print(io, "DirectSumGPUSphericalPlan{", FT, "}(lmax=", p.lmax, ", ", CT <: Real ? "real" : "complex",
+        ", B=", p.B, ")")
+
+FFS.Plans.coefficient_size(p::DirectSumGPUSphericalPlan) = (p.lmax + 1, 2 * p.lmax + 1, p.batch...)
+FFS.Plans.coefficient_type(::DirectSumGPUSphericalPlan{FT, CT}) where {FT, CT} = CT
+FFS.Plans.wavenumbers(p::DirectSumGPUSphericalPlan) = p.ks
+
+function FFS.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
+        exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
+        ::Type{T}, ms::Tuple; batch::Tuple = (), sampling = nothing, weights = nothing,
+        inactive::FFS.AbstractInactiveCells = FFS.ZeroFill(), kwargs...) where {T}
+    FT = real(float(T))
+    lmax = ms[1] - 1
+    lmax >= 0 || throw(ArgumentError("ms[1] must be ≥ 1 (lmax = ms[1] - 1); got $(ms[1])"))
+    backend = exec.backend
+    θ, φ, wpt = FFS.DirectSum._sph_point_data(g, FT; sampling = sampling,
+        weights = FFS.Grids._inactive_weights(inactive, g, FT; sampling, weights))
+    w = collect(FT, wpt)
+    N = length(θ)
+    bt = NTuple{length(batch), Int}(batch)
+    B = prod(bt; init = 1)
+    CT = FFS.sph_coeff_type(T, FT)
+    wd = _dev_vec(backend, w, FT)
+    fld = KA.allocate(backend, CT <: Real ? FT : Complex{FT}, N, B)
+    cd = KA.allocate(backend, CT, lmax + 1, 2 * lmax + 1, B)
+    ks = (0:lmax, -lmax:lmax)
+    return DirectSumGPUSphericalPlan{FT, CT, length(bt), typeof(backend), Vector{FT}, typeof(wd), typeof(fld),
+            typeof(cd), typeof(ks)}(backend, θ, φ, w, wd, fld, cd, lmax, N, _sph_chunk(lmax, N), bt, B, ks)
+end
+
+"""
+    calculate_spectrum!(coeffs, plan::DirectSumGPUSphericalPlan, field) -> ks
+
+Fill `coeffs` `(lmax + 1, 2lmax + 1, batch…)` with the quadrature projection of `field` `(spatial…,
+batch…)` onto the real spherical harmonics, on the plan's device.
+"""
+function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, p::DirectSumGPUSphericalPlan{FT, CT},
+        field) where {FT, CT}
+    FFS.Plans._check_coefficients(coeffs, p)
+    length(field) == p.N * p.B || throw(DimensionMismatch(
+        "field holds $(length(field)) values; this plan transforms $(p.B) field(s) of $(p.N) points — " *
+        "pass the matching `batch=` to plan_spectrum"))
+    (CT <: Real && eltype(field) <: Complex) && throw(ArgumentError(
+        "this plan was built for a real field, whose coefficients are real; build one for " *
+        "$(eltype(field)) to transform a complex field"))
+    _stage_field!(p.fld, field, nothing)
+    fill!(p.cd, zero(CT))
+    for lo in 1:p.chunk:p.N
+        pts = lo:min(p.N, lo + p.chunk - 1)
+        P, Y = _node_tables(p.backend, FT, p.θ, p.φ, p.w, pts, p.lmax)
+        _spherical_kernel!(p.backend)(p.cd, P, Y, p.fld, p.wd, p.lmax, lo - 1, length(pts), p.B;
+            ndrange = (p.lmax + 1) * (2 * p.lmax + 1))
+        KA.synchronize(p.backend)
     end
-    return P_lm
+    copyto!(coeffs, p.cd)
+    return p.ks
+end
+
+function FFS._gpu_directsum_spherical(exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
+        field::AbstractArray, lmax::Int; sampling = nothing, weights = nothing,
+        inactive::FFS.AbstractInactiveCells = FFS.ZeroFill())
+    FT = eltype(g)
+    p = FFS.plan_spectrum(SpectralBackends.DirectSumSpectralBackend(), exec, g,
+        eltype(field) <: Real ? FT : Complex{FT}, (lmax + 1, 2 * lmax + 1);
+        batch = FFS.Grids.field_batch_shape(g, field), sampling, weights, inactive)
+    coeffs = FFS.allocate_coefficients(p)
+    return coeffs, FFS.calculate_spectrum!(coeffs, p, field)
+end
+
+"""
+    DirectSumGPUSphericalSynthesisPlan{FT,OT}
+
+Reusable spherical direct-sum synthesis on a KernelAbstractions device: each node's colatitude and
+longitude, read from the grid once, with the device coefficient and field buffers. `OT` is the field's
+element type. Execute with `synthesize!(out, plan, coeffs)`.
+"""
+struct DirectSumGPUSphericalSynthesisPlan{FT, OT, NB, BK, V, CB, OB, SP <: Tuple} <: FFS.AbstractSynthesisPlan
+    backend::BK
+    θ::V                          # host colatitude per node
+    φ::V                          # host longitude per node
+    cd::CB                        # device (lmax + 1, 2lmax + 1, B) coefficients of element type `OT`
+    out::OB                       # device (N, B) field
+    lmax::Int
+    N::Int
+    chunk::Int
+    spatial::SP
+    batch::NTuple{NB, Int}
+    B::Int
+end
+
+Base.show(io::IO, p::DirectSumGPUSphericalSynthesisPlan{FT, OT}) where {FT, OT} =
+    print(io, "DirectSumGPUSphericalSynthesisPlan{", FT, "}(lmax=", p.lmax, ", ",
+        OT <: Real ? "real" : "complex", ", B=", p.B, ")")
+
+FFS.Plans.field_size(p::DirectSumGPUSphericalSynthesisPlan) = (p.spatial..., p.batch...)
+FFS.Plans.field_type(::DirectSumGPUSphericalSynthesisPlan{FT, OT}) where {FT, OT} = OT
+
+function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractDirectSumSpectralBackend,
+        exec::ComputationalBackends.GPUBackend{<:KA.Backend},
+        g::FlowGeometries.Grids.AbstractGrid{<:FFS.Grids.SphericalHarmonicGeometry},
+        ::Type{T}, ms::NTuple{2, Int}; batch::Tuple = (), kwargs...) where {T}
+    FT = real(float(eltype(g)))
+    OT = T <: Real ? FT : Complex{FT}
+    lmax = ms[1] - 1
+    lmax >= 0 || throw(ArgumentError("ms[1] must be ≥ 1 (lmax = ms[1] - 1); got $(ms[1])"))
+    backend = exec.backend
+    θraw, φraw = FFS.Grids._sph_points(g)
+    θ = collect(FT, θraw)
+    φ = collect(FT, φraw)
+    N = length(θ)
+    bt = NTuple{length(batch), Int}(batch)
+    B = prod(bt; init = 1)
+    cd = KA.allocate(backend, OT, lmax + 1, 2 * lmax + 1, B)
+    out = KA.allocate(backend, OT, N, B)
+    sp = size(g)
+    return DirectSumGPUSphericalSynthesisPlan{FT, OT, length(bt), typeof(backend), Vector{FT}, typeof(cd),
+            typeof(out), typeof(sp)}(backend, θ, φ, cd, out, lmax, N, _sph_chunk(lmax, N), sp, bt, B)
+end
+
+"""
+    synthesize!(out, plan::DirectSumGPUSphericalSynthesisPlan, coeffs) -> out
+
+Evaluate the real spherical-harmonic series `coeffs` `(lmax + 1, 2lmax + 1, batch…)` at the grid's nodes on
+the plan's device, into `out` on the host or the device. A real-field plan reads the real part of complex
+coefficients.
+"""
+function FFS.Plans.synthesize!(out::AbstractArray, p::DirectSumGPUSphericalSynthesisPlan{FT, OT},
+        coeffs::AbstractArray) where {FT, OT}
+    size(out) == FFS.Plans.field_size(p) || throw(DimensionMismatch(
+        "out is $(size(out)); this plan writes $(FFS.Plans.field_size(p))"))
+    want = (p.lmax + 1, 2 * p.lmax + 1, p.batch...)
+    size(coeffs) == want || throw(DimensionMismatch("coeffs is $(size(coeffs)); this plan reads $want"))
+    copyto!(p.cd, (OT <: Real && eltype(coeffs) <: Complex) ? real.(coeffs) : coeffs)
+    for lo in 1:p.chunk:p.N
+        pts = lo:min(p.N, lo + p.chunk - 1)
+        P, Y = _node_tables(p.backend, FT, p.θ, p.φ, nothing, pts, p.lmax)
+        _spherical_synth_kernel!(p.backend)(p.out, P, Y, p.cd, p.lmax, lo - 1, length(pts), p.B;
+            ndrange = length(pts))
+        KA.synchronize(p.backend)
+    end
+    copyto!(out, p.out)
+    return out
 end
 
 end # module FlowFieldSpectraKernelAbstractionsExt

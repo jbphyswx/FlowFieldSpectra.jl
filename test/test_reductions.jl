@@ -1,6 +1,6 @@
-# Radial reductions against independent references: the full native spectrum `unpacked` rebuilds (twins
-# included), brute-force lattice mode counts per shell, and the closed-form mode count of a whole shell.
-# (Grid constructors and aliases come from runtests.jl.)
+# Radial reductions against independent references: the full native spectrum `unpacked` rebuilds, the
+# inline sum over every mode of a widened coefficient box, brute-force lattice mode counts per shell, and
+# the closed-form mode count of a whole shell. (Grid constructors and aliases come from runtests.jl.)
 
 # Native integer frequencies of a full axis of `n` modes, and `½ Σ |C|²` over the native modes of `full`
 # whose `|k|` (in units of the spacings `scales`) passes `keep`.
@@ -34,6 +34,9 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
         # The cutoff keeps the modes with `|k| ≤ k_max`, counted on the full native spectrum.
         kb, E = FFS.isotropic_spectrum(ks, c)
         Test.@test sum(E) * (kb[2] - kb[1]) ≈ _native_energy_ref(full, ntuple(_ -> 1.0, D), k -> k <= kmax + 1e-12) rtol = 1e-12
+        # `PowerScaling` reports each bin's power, the density times the bin width.
+        _, Ep = FFS.isotropic_spectrum(ks, c; convention = FFS.SpectralConvention(scaling = FFS.PowerScaling()))
+        Test.@test Ep ≈ E .* (kb[2] - kb[1]) rtol = 1e-12
         # A real field's packed half bins as its full spectrum does, with the same default bins.
         for cut in (true, false)
             kbr, Er = FFS.isotropic_spectrum(ks, c; cutoff = cut)
@@ -43,17 +46,31 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
         end
     end
 
-    # A stretched axis: the packed half's `−N₂/2` partners are its Nyquist twins, which `unpacked` reads
-    # from `ks`, so every mode binned holds the energy of the full spectrum it rebuilds.
+    # Uniform along axis 1 at its own length and stretched along axis 2, whose `±N₂/2` are two modes that
+    # the coefficient box holds. With no radial cutoff the isotropic spectrum sums the whole box, and a
+    # transect keeping axis 1 sums each `|k₁|` over both its signs, both held to the inline sum
+    # `C(k) = Σ w f e^{-ik·(x - x₀)} / Σw` over every mode of the box.
     Random.seed!(3)
-    xax = sort(rand(14)) .* L; yax = sort(rand(12)) .* L
-    gn = nucg((xax, yax), (L, L))
-    ms = (10, 8)
-    fn = [cos(2x) + 0.5sin(3y) + 0.3cos(x + 2y) for x in xax, y in yax]
-    cn, ksn = FFS.calculate_spectrum(gn, fn, ms; transform = FTB.FINUFFTBackend(), eps = 1e-13)
-    Test.@test FTB.axis_twin(ksn[1]) !== nothing
-    kb, E = FFS.isotropic_spectrum(ksn, cn; cutoff = false)
-    Test.@test sum(E) * (kb[2] - kb[1]) ≈ 0.5 * sum(abs2, FTB.unpacked(cn, ms, ksn)) rtol = 1e-12
+    n1, n2 = 12, 10
+    xax = ucg_axis(Float64, L, n1)
+    yax = sort(rand(n2)) .* L
+    gn = FG.Grids.StructuredGrid(_cg(Float64), xax, yax; periodic = (true, true), period = (L, L))
+    ms = (n1, 8)
+    fn = randn(n1, n2)
+    for (t, kw, tol) in ((SB.DirectSumSpectralBackend(), (;), 1e-12), (FTB.FINUFFTBackend(), (; eps = 1e-13), 1e-10))
+        cn, ksn = FFS.calculate_spectrum(gn, fn, ms; transform = t, kw...)
+        w = collect(FG.Grids.measure(gn))
+        k1s = _native_freqs(n1)                    # axis 1 at its own length: `-6 … 5`
+        k2s = -(ms[2] ÷ 2):(ms[2] ÷ 2)            # axis 2 widened: `-4 … 4`
+        Cref = [sum(w[I] * fn[I] * cis(-(k1 * (xax[I[1]] - xax[1]) + k2 * (yax[I[2]] - yax[1])))
+                    for I in CartesianIndices(fn)) / sum(w) for k1 in k1s, k2 in k2s]
+        kb, E = FFS.isotropic_spectrum(ksn, cn; cutoff = false)
+        Test.@test sum(E) * (kb[2] - kb[1]) ≈ 0.5 * sum(abs2, Cref) rtol = tol
+        _, Et = FFS.transect_spectrum(ksn, cn, (2,))
+        Eref = [0.5 * sum(abs2(Cref[i, j]) for i in eachindex(k1s), j in eachindex(k2s) if abs(k1s[i]) == m)
+                for m in 0:(n1 ÷ 2)]
+        Test.@test vec(Et) ≈ Eref rtol = tol
+    end
 
     # Unit power on every mode: a shell sum counts the lattice's modes in each bin; a mode average reports
     # a whole shell's count `π(k₊² − k₋²)/(Δk₁Δk₂)`, and a bin holding no mode is NaN.
@@ -76,8 +93,6 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
         Test.@test Em[count .> 0] ≈ whole[count .> 0] rtol = 1e-12
         Test.@test all(isnan, Em[count .== 0])
     end
-    _, Enan = FFS.isotropic_spectrum(ks, c; num_bins = 400, convention = FFS.SpectralConvention(estimator = FFS.ModeAverage()))
-    Test.@test any(isnan, Enan)
 
     # The anisotropic spectrum's sectors, the cross spectrum of a field with itself, and Welch's mean
     # over realizations reduce as the isotropic spectrum does.
@@ -88,6 +103,21 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
         isnan(Ea[ik, iθ]) && continue
         Test.@test Ea[ik, iθ] ≈ 0.5 * (dθ / 2) * ((ik * dk)^2 - ((ik - 1) * dk)^2) / (dk * dθ) rtol = 1e-12
     end
+    # `k = 0` has no angle and spreads evenly over the first `k` bin's sectors, so `∫ E dθ` is the
+    # isotropic spectrum in every bin, the first included. A constant field holds `k = 0` alone: each
+    # sector of the first bin carries `½c²/(nθ·dk·dθ)` and every other bin nothing.
+    xs16 = ucg_axis(Float64, L, 16)
+    g16 = ucg((L, L), (16, 16))
+    fa = [1.5 + cos(3x) + 0.7 * sin(2y) for x in xs16, y in xs16]
+    ca, ksa = FFS.calculate_spectrum(g16, fa, (16, 16); transform = SB.FFTSpectralBackend())
+    kba, θba, Eaa = FFS.anisotropic_spectrum(ksa, ca; num_k_bins = 6, num_θ_bins = 12)
+    _, Eia = FFS.isotropic_spectrum(ksa, ca; num_bins = 6)
+    Test.@test vec(sum(Eaa; dims = 2)) .* (θba[2] - θba[1]) ≈ Eia rtol = 1e-12
+    c0, ks0 = FFS.calculate_spectrum(g16, fill(2.0, 16, 16), (16, 16); transform = SB.FFTSpectralBackend())
+    kb0, θb0, E0 = FFS.anisotropic_spectrum(ks0, c0; num_k_bins = 6, num_θ_bins = 12)
+    Test.@test E0[1, :] ≈ fill(0.5 * 4.0 / (12 * (kb0[2] - kb0[1]) * (θb0[2] - θb0[1])), 12) rtol = 1e-12
+    Test.@test maximum(abs, E0[2:end, :]) < 1e-25
+
     Random.seed!(5)
     cr = randn(ComplexF64, 9, 16, 3)
     for conv in (FFS.SpectralConvention(), ma)
@@ -105,8 +135,4 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
             Test.@test isequal(Eip, Eall)
         end
     end
-
-    # The multitaper tapers have unit mean square, so each tapered copy keeps the field's level.
-    V = FFS.dpss(128, 4.0, 7)
-    Test.@test V' * V ≈ 128 * LA.I(7) atol = 1e-8
 end

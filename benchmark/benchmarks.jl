@@ -130,9 +130,9 @@ end
 # FFTW's plan, a NUFFT's point sorting, a spherical grid's nodes and quadrature. `BenchmarkTools` records
 # the allocations alongside the time, which is the quantity a time loop actually feels.
 #
-# CAVEAT, observed: a group's TIMING can differ several-fold between a whole-suite run and that group run
-# alone — the NUFSHT plan measured 5.5 ms in a multi-group run against 0.32 ms alone and 0.14 ms outside
-# the suite entirely, while its MEMORY was identical in all three. FFTW's thread count is process-global
+# A group's timing can differ several-fold between a whole-suite run and that group run alone — the
+# NUFSHT plan measured 5.5 ms in a multi-group run against 0.32 ms alone and 0.14 ms outside the suite
+# entirely, while its memory was identical in all three. FFTW's thread count is process-global
 # and every group here holds live FFTW/FINUFFT plans; which of those carries across was not established.
 # Re-run a single group before believing a surprising time from it.
 # =============================================================================
@@ -164,7 +164,7 @@ for N in [64, 128, 256]
     f = randn(N, N)
     ms = (N, N)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.FFTSpectralBackend())
-    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
+    buf = FFS.allocate_coefficients(p)
     SUITE["plans"]["hybrid_N=$N"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.FFTSpectralBackend())
     SUITE["plans"]["hybrid_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -182,15 +182,14 @@ for M in [10_000, 100_000]
         periodic = (true, true), period = (L, L))
     f = randn(M)
     p = FFS.plan_spectrum(g, Float64, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
-    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
+    buf = FFS.allocate_coefficients(p)
     SUITE["plans"]["nufft_M=$M"]["one_shot"] = @benchmarkable FFS.calculate_spectrum($g, $f, $ms;
         transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
     SUITE["plans"]["nufft_M=$M"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
 end
 
-# Cartesian direct sum: the plan holds the per-axis DFT matrices, the contraction's working arrays and
-# the Nyquist-twin storage. A stretched grid takes the factorized tensor path and carries a twin; a
-# scattered cloud takes the direct sum.
+# Cartesian direct sum: the plan holds the per-axis DFT matrices and the contraction's working arrays. A
+# stretched grid takes the factorized tensor path; a scattered cloud takes the direct sum.
 for N in [32, 64, 128]
     SUITE["plans"]["directsum_N=$N"] = BenchmarkGroup()
     L = 2π
@@ -200,7 +199,7 @@ for N in [32, 64, 128]
     f = randn(N, N)
     ms = (N, N)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
-    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
+    buf = FFS.allocate_coefficients(p)
     SUITE["plans"]["directsum_N=$N"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
     SUITE["plans"]["directsum_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -217,7 +216,7 @@ for M in [2_000, 8_000]
         periodic = (true, true), period = (L, L))
     f = randn(M)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
-    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
+    buf = FFS.allocate_coefficients(p)
     SUITE["plans"]["directsum_cloud_M=$M"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.DirectSumSpectralBackend())
     SUITE["plans"]["directsum_cloud_M=$M"]["plan_exec"] =

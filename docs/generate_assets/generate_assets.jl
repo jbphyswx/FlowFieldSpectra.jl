@@ -400,7 +400,7 @@ function generate_estimation_figure()
     K = 6
     V = FFS.dpss(Nx, 4.0, K)
     grid = FG.Grids.StructuredGrid(CART, x; periodic = (true,), period = (L,))
-    C = zeros(ComplexF64, Nx, K)
+    C = zeros(ComplexF64, Nx ÷ 2 + 1, K)          # a real field's packed half
     ks = nothing
     for k in 1:K
         c, ksk = FFS.calculate_spectrum(grid, V[:, k] .* sig, (Nx,); transform = SB.FFTSpectralBackend())
@@ -429,10 +429,10 @@ end
 
 # ─── Figure: execution-axis invariance (two orthogonal backend axes) ────────
 
-# The `execution=` axis says only WHERE/HOW a transform runs; it never changes the result. Here one
+# The `execution=` axis says only where and how a transform runs; it never changes the result. Here one
 # FFT transform is run under three execution backends — Serial, Threaded (OhMyThreads), and
-# GPUBackend(KA.CPU()) (the device-generic GPU FFT, which uses FFTW on the KA.CPU() host array
-# exactly as it would use CUFFT on a CUDA CuArray) — and the recovered spectra coincide to machine ε.
+# GPUBackend(KA.CPU()) (the device-generic GPU FFT, which takes FFTW on the KA.CPU() host array and CUFFT
+# on a CUDA CuArray) — and the recovered spectra coincide to machine ε.
 function generate_execution_figure()
     L = 2π
     N = 96

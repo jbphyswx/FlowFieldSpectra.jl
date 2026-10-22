@@ -8,14 +8,10 @@ using ..SphericalKernels: SphericalKernels
 
 export sph_mode_index
 
-# The dependency-free transform selected by `DirectSumSpectralBackend()`.
-# It reads a field tensor `(spatial…, batch…)` and writes coefficients in
-# the packed layout `(spectral…, batch…)` (a real Cartesian field halves axis 1 to `k₁ ≥ 0`). A
-# structured tensor-product grid factorizes into `D` successive 1-D DFTs (`O(D · n^{D+1})`, one dense
-# matrix per axis, BLAS-backed), uniform or nonuniform. A scattered point cloud does not factorize, so
-# it is the `O(∏ms · Npts)` direct sum, still computing only the packed half for a real field. Structured
-# grids read coordinates through their 1-D axes (no per-point coordinate blob); unstructured grids read
-# their per-node vectors.
+# The dependency-free transform `DirectSumSpectralBackend()` selects. It reads a field `(spatial…,
+# batch…)` and writes coefficients in the packed layout `(spectral…, batch…)` (a real Cartesian field
+# halves axis 1 to `k₁ ≥ 0`). A tensor-product grid, uniform or not, factorizes into `D` successive 1-D
+# DFTs, one dense matrix per axis (`O(D · n^{D+1})`); a point cloud is the `O(∏ms · Npts)` direct sum.
 
 """
     sph_mode_index(l, m) -> CartesianIndex
@@ -28,17 +24,25 @@ export sph_mode_index
     return CartesianIndex(row, col)
 end
 
-# Phase argument Σ_d ks[d][K[d]] · x_d. `ks` mixes axis types, so its terms come from `map` over the
-# tuples, which types each term by its own axis; indexing `ks` at a loop variable, or at a closure
-# argument the compiler declines to inline, boxes the axis on every call.
-@inline _phase_terms(ks::Tuple, axes::Tuple, K::CartesianIndex, P::CartesianIndex, ::Type{FT}) where {FT} =
-    map((k, x, i, p) -> FT(k[i]) * FT(x[p]), ks, axes, Tuple(K), Tuple(P))
-@inline _phase_terms(ks::Tuple, coords::Tuple, K::CartesianIndex, j::Int, ::Type{FT}) where {FT} =
-    map((k, x, i) -> FT(k[i]) * FT(x[j]), ks, coords, Tuple(K))
-@inline _phase_tensor(ks::Tuple, axes::Tuple, K::CartesianIndex{D}, P::CartesianIndex{D}, ::Type{FT}) where {D, FT} =
-    sum(_phase_terms(ks, axes, K, P, FT))
-@inline _phase_scattered(ks::Tuple, coords::Tuple, K::CartesianIndex{D}, j::Int, ::Type{FT}) where {D, FT} =
-    sum(_phase_terms(ks, coords, K, j, FT))
+# A point set's phase separates by axis, `e^{is k·x_j} = Πᵈ e^{is k_d x_{j,d}}`, so a point fills one table
+# per axis, `E[d][a] = e^{is ks[d][a] x_{j,d}}` over the indices `rngs[d]`, and a mode's exponential is a
+# product of one entry per axis. `ks` mixes axis types, so the tables fill by `map` over the tuples;
+# indexing `ks` at a loop variable boxes the axis.
+@inline function _axis_tables!(E::Tuple, ks::Tuple, coords::Tuple, j::Int, s::FT, rngs::Tuple) where {FT}
+    map(E, ks, coords, rngs) do e, k, x, rng
+        xj = FT(x[j])
+        @inbounds for a in rng
+            e[a] = cis(s * FT(k[a]) * xj)
+        end
+        return e
+    end
+    return E
+end
+
+@inline _mode_phase(E::Tuple, I::CartesianIndex) = prod(map((e, a) -> @inbounds(e[a]), E, Tuple(I)))
+
+# One table per axis, `m[d]` entries each.
+_axis_scratch(::Type{FT}, m::Tuple) where {FT} = map(n -> Vector{Complex{FT}}(undef, n), m)
 
 # One axis's dense 1-D DFT matrix `Wₐₚ = exp(−iflag·i·k_a·x_p)`, `(m × n)` with `m` the packed mode count
 # along this axis and `n` the point count. Uniform or nonuniform `xaxis`.
@@ -57,10 +61,8 @@ end
     AxisPass{FT, ND, M, A}
 
 One axis's contraction: its dense DFT matrix, the two matrix aliases the matmul reads and writes, and —
-for an axis past the first — the staging buffers and the permutation bringing it to the front and back.
-
-Every alias and permutation is built once, so a pass reshapes nothing and inverts no permutation per
-call. Run it with `_axis_pass!`.
+for an axis past the first — the staging buffers and the permutation bringing it to the front and back,
+all built once. Run it with `_axis_pass!`.
 """
 struct AxisPass{FT, ND, M <: AbstractMatrix{Complex{FT}}, A <: AbstractArray{Complex{FT}, ND}}
     W::M
@@ -86,14 +88,12 @@ end
 end
 
 # =============================================================================
-# Cartesian setup / run split. `cart_setup` reads the grid — its per-axis DFT matrices, the contraction
-# chain's working arrays, the wavenumber axes and the Nyquist-twin storage — and `cart_run!` transforms a
+# Cartesian setup / run split. `cart_setup` reads the grid (the per-axis DFT matrices, the contraction
+# chain's working arrays, the wavenumber axes and the modes held at zero) and `cart_run!` transforms a
 # field against what it returns. The one-shot composes the two and `DirectSumCartesianPlan` holds the
-# setup, so the two paths cannot drift and a repeated caller rebuilds none of it: the matrices depend only
-# on the grid, `ms` and `iflag`, and every buffer only on the shapes. The field arrives already scaled by
-# the grid's quadrature factor, as it does on every other entry.
+# setup. The field arrives already scaled by the grid's quadrature factor.
 #
-# `TensorCartesian` / `CloudCartesian` name the two algorithms, mirroring the spherical layout markers.
+# `TensorCartesian` and `CloudCartesian` name the two algorithms.
 # =============================================================================
 
 struct TensorCartesian end
@@ -111,9 +111,10 @@ _chain_shapes(ss::NTuple{D, Int}, outs::NTuple{D, Int}, batch::Tuple) where {D} 
 # The permutation bringing axis `d` of a rank-`nd` array to the front.
 _perm_front(nd::Int, d::Int) = (d, ntuple(i -> i < d ? i : i + 1, nd - 1)...)
 
-# One axis-by-axis contraction from point counts `ss` to mode counts `outs`, the batch dims riding along:
-# the per-axis dense DFT matrices and every working array it walks through. Shared by the forward and by
-# the structured Nyquist twin, which is the same contraction on the masked wavenumbers.
+# One axis-by-axis contraction from extents `ss` to extents `outs`, the batch dims riding along: the
+# per-axis dense matrices `W_d[a, p] = exp(-iflag·i·kaxes[d][a]·axes[d][p])` and every working array it
+# walks through. The forward contracts points to modes (`kaxes` the wavenumbers, `axes` the positions);
+# the synthesis contracts modes to points, with the two swapped and `iflag` negated.
 function _contraction(::Type{FT}, kaxes::Tuple, axes::Tuple, ss::NTuple{D, Int}, outs::NTuple{D, Int},
         batch::Tuple, iflag::Int) where {FT, D}
     shapes = _chain_shapes(ss, outs, batch)
@@ -137,45 +138,51 @@ function _contraction(::Type{FT}, kaxes::Tuple, axes::Tuple, ss::NTuple{D, Int},
     return (; passes, chain)
 end
 
-# `(n, length(a) ÷ n)` matrix alias of `a`, sharing its memory. An empty leading extent leaves an empty
-# alias, which a mask touching an odd axis produces and `_run_contraction!` skips.
+# `(n, length(a) ÷ n)` matrix alias of `a`, sharing its memory; an empty leading extent leaves an empty
+# alias.
 _mat(a::Array{T}, n::Int) where {T} = n == 0 ? reshape(a, 0, 0) : reshape(a, n, length(a) ÷ n)
 
 # `dest = (1/npts) · W_D ⋯ W_1 · field`, through the contraction's own buffers.
 function _run_contraction!(dest::AbstractArray, c, field::AbstractArray, npts::Int)
-    isempty(dest) && return dest       # a mask touching an odd axis has no `+N_d/2` mode to compute
-    D = length(c.passes)
+    isempty(dest) && return dest
     copyto!(c.chain[1], field)
-    for d in 1:D
-        _axis_pass!(c.chain[d + 1], c.passes[d], c.chain[d])
-    end
-    copyto!(dest, c.chain[D + 1])
+    _run_chain!(c)
+    copyto!(dest, last(c.chain))
     dest ./= npts
     return dest
+end
+
+# `chain[D+1] = W_D ⋯ W_1 · chain[1]`.
+function _run_chain!(c)
+    for d in eachindex(c.passes)
+        _axis_pass!(c.chain[d + 1], c.passes[d], c.chain[d])
+    end
+    return last(c.chain)
 end
 
 """
     phase_geometry(grid, ::Type{FT}, ms, ::Val{R}, box = nothing) -> (xs, ks)
 
-The positions `x - x₀` and the wavenumber axes a Cartesian direct sum over `grid` reads, the layout
-halved for a real field (`R`). `box` holds a whole grid's origins and Fourier lengths when `grid` is
-part of it (see `Grids.axis_geometry`).
+The positions `x - x₀` and the wavenumber axes a Cartesian direct sum over `grid` reads, over the
+coefficient box of an `ms`-mode transform (`Grids.mode_box`), halved for a real field (`R`). `box` holds a
+whole grid's origins and Fourier lengths when `grid` is part of it (see `Grids.axis_geometry`).
 """
 function phase_geometry(g, ::Type{FT}, ms::NTuple{D, Int}, ::Val{R}, box = nothing) where {FT, D, R}
     offs, ranges = Grids.axis_geometry(FT, g, D, box)
-    return Grids.relative_coordinates(g, offs), Grids.physical_wavenumbers(ranges, ms, Val(R))
+    return Grids.relative_coordinates(g, offs),
+        Grids.physical_wavenumbers(ranges, Grids.mode_box(g, ms, Val(R)), Val(R))
 end
 
 """
     cart_setup(layout, grid, T, ms, batch, iflag; box = nothing) -> NamedTuple
 
-Everything a Cartesian direct sum reads from `grid`: the wavenumber axes, and for a tensor layout the
-per-axis DFT matrices and the working arrays their contraction walks through, plus the Nyquist-twin
-storage. `T` is the field's element type, whose realness fixes the packed layout; `box` is as in
-[`phase_geometry`](@ref).
+Everything a Cartesian direct sum reads from `grid`: the wavenumber axes of the coefficient box, the
+modes of a real field's packed half that hold zero (`FlowTransformBindings.outside_modes`), and for a
+tensor layout the per-axis DFT matrices and the working arrays their contraction walks through. `T` is the
+field's element type, whose realness fixes the packed layout; `box` is as in [`phase_geometry`](@ref).
 
-Run it against a field with [`cart_run!`](@ref). The result depends on the grid, `ms`, `iflag` and the
-batch shape alone, so `DirectSumCartesianPlan` holds it across executions.
+Run it against a field with [`cart_run!`](@ref), or the threaded run of the OhMyThreads extension;
+`DirectSumCartesianPlan` holds it across executions.
 """
 function cart_setup(::TensorCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple,
         iflag::Int; box = nothing) where {T, D}
@@ -183,10 +190,9 @@ function cart_setup(::TensorCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::
     R = T <: Real
     ss = size(g)
     xs, ks = phase_geometry(g, FT, ms, Val(R), box)
-    pms = FTB.packed_size(ms, Val(R))
-    return (; ks, pms, Npts = prod(ss), iflag,
-        fwd = _contraction(FT, ks, xs, ss, pms, batch, iflag),
-        twin = _twin_setup(TensorCartesian(), g, xs, T, ms, ks, batch, iflag, FT))
+    pms = map(length, ks)
+    return (; ks, pms, Npts = prod(ss), iflag, outside = _outside(ms, Grids.mode_box(g, ms, Val(R)), Val(R)),
+        fwd = _contraction(FT, ks, xs, ss, pms, batch, iflag))
 end
 
 function cart_setup(::CloudCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple,
@@ -194,248 +200,200 @@ function cart_setup(::CloudCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::T
     FT = real(float(T))
     R = T <: Real
     coords, ks = phase_geometry(g, FT, ms, Val(R), box)
-    pms = FTB.packed_size(ms, Val(R))
-    return (; ks, pms, coords, N = length(coords[1]), iflag,
-        twin = _twin_setup(CloudCartesian(), g, coords, T, ms, ks, batch, iflag, FT))
+    pms = map(length, ks)
+    return (; ks, pms, coords, N = length(coords[1]), iflag, E = _axis_scratch(FT, pms),
+        outside = _outside(ms, Grids.mode_box(g, ms, Val(R)), Val(R)))
 end
+
+# The packed-half modes outside the computed box and its mirror, which a real field's transform leaves at
+# zero; a complex field's box is the computed one.
+_outside(ms::Tuple, bs::Tuple, ::Val{true}) = FTB.outside_modes(ms, bs)
+_outside(ms::Tuple, bs::Tuple, ::Val{false}) = Int[]
 
 """
     cart_run!(coeffs, layout, setup, field) -> ks
 
-Fill `coeffs` with the Cartesian spectrum of `field` against a [`cart_setup`](@ref) result, and return the
-wavenumber axes, the halved axis carrying a Nyquist twin where one is required.
+Fill `coeffs` with the Cartesian spectrum of `field` against a [`cart_setup`](@ref) result, the modes
+outside the computed box and its mirror at zero, and return the wavenumber axes.
 
 `field` arrives already scaled by the grid's quadrature factor. A tensor layout contracts axis by axis, a
 point cloud sums directly, and both write only into `coeffs` and the setup's own buffers.
 """
-function cart_run!(coeffs::AbstractArray{Complex{FT}}, l::TensorCartesian, s,
+function cart_run!(coeffs::AbstractArray{Complex{FT}}, ::TensorCartesian, s,
         field::AbstractArray) where {FT}
     _run_contraction!(coeffs, s.fwd, field, s.Npts)
-    return _attach_twin(s.twin, l, s, field)
+    _zero_outside!(coeffs, s.outside, prod(s.pms))
+    return s.ks
 end
 
-function cart_run!(coeffs::AbstractArray{Complex{FT}}, l::CloudCartesian, s,
+function cart_run!(coeffs::AbstractArray{Complex{FT}}, ::CloudCartesian, s,
         field::AbstractArray) where {FT}
-    _cloud_sum!(coeffs, s.ks, s.coords, s.pms, s.N, s.iflag, field, FT)
-    return _attach_twin(s.twin, l, s, field)
+    _cloud_sum!(coeffs, s.ks, s.coords, s.pms, s.N, s.iflag, field, s.E)
+    _zero_outside!(coeffs, s.outside, prod(s.pms))
+    return s.ks
 end
 
-# `C[k, b] = (1/N) Σ_j f[j, b] · exp(-iflag · i · k·x_j)` over a mode set `pms` with wavenumber axes
-# `kaxes`. The forward passes the packed mode set; the twin passes its masked one.
+# Zero the modes `outside` (linear indices into one field's `P` coefficients) of every field in `coeffs`.
+function _zero_outside!(coeffs::AbstractArray, outside::AbstractVector{Int}, P::Int)
+    isempty(outside) && return coeffs
+    @inbounds for b in 1:(length(coeffs) ÷ P), i in outside
+        coeffs[i + (b - 1) * P] = zero(eltype(coeffs))
+    end
+    return coeffs
+end
+
+# `C[k, b] = (1/N) Σ_j f[j, b] · exp(-iflag · i · k·x_j)` over the mode set `pms` with wavenumber axes
+# `kaxes`, `E` the per-axis tables (`_axis_tables!`).
 function _cloud_sum!(dest::AbstractArray{Complex{FT}}, kaxes::Tuple, coords::Tuple,
-        pms::NTuple{D, Int}, N::Int, iflag::Int, field::AbstractArray, ::Type{FT}) where {FT, D}
-    M = prod(pms)
-    B = M == 0 ? 0 : length(dest) ÷ M
+        pms::NTuple{D, Int}, N::Int, iflag::Int, field::AbstractArray, E::Tuple) where {FT, D}
     fill!(dest, zero(Complex{FT}))
-    @inbounds for (mi, I) in enumerate(CartesianIndices(pms))
-        for j in 1:N
-            phi = _phase_scattered(kaxes, coords, I, j, FT)
-            W = cis(-iflag * phi)
+    prod(pms) == 0 && return dest
+    _cloud_block!(dest, kaxes, coords, pms, N, FT(-iflag), field, E, 1:pms[D])
+    dest ./= N
+    return dest
+end
+
+# The modes whose last index lies in `blk`, each accumulating every point in order, so a split of the
+# last axis into blocks gives the sums one pass does.
+function _cloud_block!(dest::AbstractArray{Complex{FT}}, kaxes::Tuple, coords::Tuple,
+        pms::NTuple{D, Int}, N::Int, s::FT, field::AbstractArray, E::Tuple, blk) where {FT, D}
+    M = prod(pms)
+    B = length(dest) ÷ M
+    rngs = ntuple(d -> d == D ? blk : Base.OneTo(pms[d]), Val(D))
+    lin = LinearIndices(pms)
+    @inbounds for j in 1:N
+        _axis_tables!(E, kaxes, coords, j, s, rngs)
+        for I in CartesianIndices(rngs)
+            W = _mode_phase(E, I)
+            mi = lin[I]
             for b in 1:B
                 dest[mi + (b - 1) * M] += field[j + (b - 1) * N] * W
             end
         end
     end
-    B == 0 || (dest ./= N)
     return dest
 end
 
 # =============================================================================
-# Cartesian forward (analysis):  C[k, b] = (1/Npts) Σ_p f[p, b] · exp(-iflag · i · k·(x_p - x₀)), `x₀` each
-# direction's smallest coordinate (`phase_geometry`)
-# =============================================================================
-
-# A structured tensor-product grid (uniform or nonuniform) separates into `D` successive 1-D transforms,
-# one dense matrix per axis; a point cloud does not separate, so the direct sum stands. A real field
-# halves axis 1 to `k₁ ≥ 0` either way and the batch dims ride along. `ms` may differ from the grid size
-# (the per-axis matrices are rectangular `pms[d] × ss[d]`).
+# Cartesian inverse (synthesis) from the packed half, writing a real field.
 #
-# One-shot: set up against this grid, then run. A repeated caller holds the setup in a
-# `DirectSumCartesianPlan`.
-function _calculate_spectrum_cartesian_direct!(
-    coeffs::AbstractArray{Complex{FT}},
-    g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-    field::AbstractArray,
-    ms::NTuple{D, Int},
-    iflag::Int,
-    box = nothing,
-) where {FT, D}
-    layout = _cart_layout(g)
-    T = eltype(field) <: Real ? FT : Complex{FT}
-    batch = Grids.field_batch_shape(g, field)
-    return cart_run!(coeffs, layout, cart_setup(layout, g, T, ms, batch, iflag; box), field)
-end
-
-# =============================================================================
-# Nyquist twins: the coefficients at `+N_d/2` that a packed half's index negation misses (it sends an
-# even axis's `−N_d/2` back to itself). `transect_spectrum` integrates the halved axis with no radial
-# cutoff, so it reaches those modes and reads the twin for the `k₁ < 0` rows. One slice per nonempty
-# subset of the axes `2:D`, each with its subset's axes collapsed, so the whole object costs a
-# hyperplane.
+# The series of a real field's packed half over the coefficient box is `f[p] = Σ_κ C[κ] · exp(+iflag·i·κ·x_p)`
+# over the whole box, the `k₁ < 0` half read as `C[κ] = conj(C[−κ])`. Each stored row `k₁ > 0` stands for
+# itself and its mirror, so the sum is the stored modes' real parts weighted by `fold_weight`; the
+# imaginary parts cancel. A tensor grid contracts the complex series of `Grids.series_modes` whose real
+# part this is (`native_coefficients!`) axis by axis; a point set sums the stored modes directly at each
+# point.
 # =============================================================================
 
-# Axis `d`'s wavenumbers under `mask`, length `m`: the single `+N_d/2` when masked, `k₁` as stored on
-# axis 1, and `−k_d` elsewhere. The stored `−N_d/2` sits at index `n÷2+1`, so its negative is `+N_d/2`.
-# The axis is materialized once per `(mask, d)`: reading `ks[d]` per MODE instead boxes the mixed
-# `RFFTAxis`/`FFTAxis` tuple at a runtime `d`, which costs more than the vector it saves.
-function _twin_kaxis(::Type{FT}, ks::Tuple, ms::NTuple{D, Int}, mask::Int, d::Int, m::Int) where {FT, D}
-    v = Vector{FT}(undef, m)
-    kd = ks[d]
-    if FTB.in_nyquist_mask(mask, d)
-        m == 1 && (v[1] = -FT(kd[ms[d] ÷ 2 + 1]))
-    else
-        s = d == 1 ? one(FT) : -one(FT)
-        @inbounds for a in 1:m
-            v[a] = s * FT(kd[a])
+"""
+    native_coefficients!(full, half, ms, box) -> full
+
+The coefficients `full` `(box[1], ms[2:D]…, batch…)` of the complex series in FFT order whose real part is
+the series of the real field's packed half `half` over `box`, the coefficient box of an `ms`-mode
+transform (`Grids.mode_box`). Mode `k` is read off the half, by conjugation for `k₁ < 0`, and doubled where
+`-k` is not a mode of `full`: `k_d = -ms[d]/2` on an axis `d ≥ 2` that `box` widens. The real part then
+sums `k` and `-k` alike.
+"""
+function native_coefficients!(full::AbstractArray{Complex{FT}}, half::AbstractArray, ms::NTuple{D, Int},
+        box::NTuple{D, Int}) where {FT, D}
+    ns = (box[1], Base.tail(ms)...)
+    pbs = FTB.packed_size(box, Val(true))
+    M = prod(ns)
+    Mp = prod(pbs)
+    B = length(full) ÷ M
+    Lp = LinearIndices(pbs)
+    @inbounds for b in 1:B
+        off = (b - 1) * Mp
+        for (fi, I) in enumerate(CartesianIndices(ns))
+            k = ntuple(d -> FTB.mode_frequency(FTB.FFTModes(), I[d], ns[d]), Val(D))
+            neg = k[1] < 0
+            idx = ntuple(d -> FTB.ovs_index(neg ? -k[d] : k[d], d == 1 ? 0 : box[d]), Val(D))
+            v = half[Lp[idx...] + off]
+            w = _mirror_missing(k, ms, box) ? 2 : 1
+            full[fi + (b - 1) * M] = w * Complex{FT}(neg ? conj(v) : v)
         end
     end
-    return v
+    return full
 end
 
-# Twin storage, built once: one slice per mask, that mask's wavenumber axes, the `NyquistTwin` wrapper,
-# the `ks` tuple carrying it, and — on a structured grid — the masked contraction that fills it. A run
-# then writes into the slices and hands back the same objects.
-#
-# `nothing` where no twin is required: a complex field's full native spectrum stores every partner
-# outright, `D == 1`'s twins are conjugates so the mirror is already exact, and uniform sampling makes
-# `exp(±i(N_d/2)x_j)` the same vector, so a uniform grid's twins equal their negated-index partners.
-# `isuniform` reads the axis types, so that branch resolves at compile time.
-_twin_setup(l, g, xs, ::Type{T}, ms, ks, batch, iflag::Int, ::Type{FT}) where {T, FT} = nothing
-function _twin_setup(l, g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        xs::Tuple, ::Type{T}, ms::NTuple{D, Int}, ks::Tuple, batch::Tuple, iflag::Int,
-        ::Type{FT}) where {T <: Real, FT, D}
-    (D >= 2 && !FlowGeometries.Grids.isuniform(g)) || return nothing
-    nm = FTB.n_twin_slices(Val(D))
-    shapes = ntuple(mask -> FTB.twin_slice_shape(ms, mask), nm)
-    kax = ntuple(mask -> ntuple(d -> _twin_kaxis(FT, ks, ms, mask, d, shapes[mask][d]), Val(D)), nm)
-    slices = ntuple(mask -> zeros(Complex{FT}, shapes[mask]..., batch...), nm)
-    tw = FTB.NyquistTwin(slices)
-    return (; slices, kax, shapes,
-        ks = (FTB.with_twin(ks[1], tw), Base.tail(ks)...),
-        contractions = _twin_contractions(l, xs, size(g), shapes, kax, batch, iflag, FT))
-end
-
-# The structured twin separates the same way the forward does, on the masked wavenumbers, over the same
-# positions `xs`. A point cloud sums directly and needs no contraction.
-_twin_contractions(::CloudCartesian, xs, ss, shapes, kax, batch, iflag::Int, ::Type{FT}) where {FT} = nothing
-_twin_contractions(::TensorCartesian, xs::Tuple, ss::Tuple, shapes::NTuple{NM}, kax, batch, iflag::Int,
-        ::Type{FT}) where {NM, FT} =
-    ntuple(mask -> _contraction(FT, kax[mask], xs, ss, shapes[mask], batch, iflag), NM)
-
-# Fill the twin from this field and hand back the `ks` carrying it; with no twin required, `ks` as built.
-@inline _attach_twin(::Nothing, l, s, field) = s.ks
-function _attach_twin(t, l, s, field)
-    _fill_twin!(t, l, s, field)
-    return t.ks
-end
-
-function _fill_twin!(t, ::TensorCartesian, s, field::AbstractArray)
-    for mask in eachindex(t.slices)
-        _run_contraction!(t.slices[mask], t.contractions[mask], field, s.Npts)
+# Whether `-k` is missing from the series `native_coefficients!` writes: `k` at `-ms_d/2` on an axis
+# `d ≥ 2` the box widens.
+@inline function _mirror_missing(k::NTuple{D, Int}, ms::NTuple{D, Int}, box::NTuple{D, Int}) where {D}
+    for d in 2:D
+        box[d] > ms[d] && k[d] == -(ms[d] ÷ 2) && return true
     end
-    return t
+    return false
 end
 
-function _fill_twin!(t, ::CloudCartesian, s, field::AbstractArray)
-    FT = real(eltype(t.slices[1]))
-    for mask in eachindex(t.slices)
-        _cloud_sum!(t.slices[mask], t.kax[mask], s.coords, t.shapes[mask], s.N, s.iflag, field, FT)
-    end
-    return t
-end
-
-# =============================================================================
-# Cartesian inverse (synthesis) from the packed half, writing a REAL field directly.
-#
-# The native sum is `f[p] = Σ_{κ native} C_full[κ] · exp(+iflag·i·κ·x_p)`, and the packed half stores
-# `k₁ ∈ [0, N₁/2]` against every native `k_·`. Two passes over the store cover the native set exactly:
-#
-#   pass 1 — native `κ₁ ≥ 0` rows, which the store holds outright. At even `N₁` the stored `+N₁/2` is
-#            not one of them (native carries `−N₁/2` at that magnitude), so that row is skipped here.
-#   pass 2 — native `κ₁ = −k₁(I) < 0` rows at the same `κ_· = k_·(I)`, whose value is
-#            `conj(C[k₁(I), −κ_·])`. Index negation supplies `−κ_·` except where an even axis `d ≥ 2`
-#            sits at `−N_d/2`, since `+N_d/2` is off the native axis; the axis's `NyquistTwin` holds
-#            exactly that value. This is the same two-pass structure `transect_spectrum!` uses, for the
-#            same reason.
-#
-# `out` is real, so each term contributes its real part; the imaginary parts cancel over the native set.
-# One sweep of the stored half replaces a full-cube inverse, with no unpacked buffer.
-# =============================================================================
-
-# Phase of native mode `(−k₁(I), k_·(I))` at a tensor-grid point / a scattered point: axis 1 negated,
-# the rest as stored.
-@inline _negate_first(t::Tuple) = (-first(t), Base.tail(t)...)
-@inline _phase_tensor_neg(ks::Tuple, axes::Tuple, K::CartesianIndex{D}, P::CartesianIndex{D}, ::Type{FT}) where {D, FT} =
-    sum(_negate_first(_phase_terms(ks, axes, K, P, FT)))
-@inline _phase_scattered_neg(ks::Tuple, coords::Tuple, K::CartesianIndex{D}, j::Int, ::Type{FT}) where {D, FT} =
-    sum(_negate_first(_phase_terms(ks, coords, K, j, FT)))
-
-# Value of native mode `(−k₁(I), k_·(I))`: `conj` of the store at `(k₁(I), −k_·)`, read from the twin
-# where index negation lands off the native axis.
-@inline function _neg_row_value(coeffs, ks::Tuple, twin, I::CartesianIndex{D}, off::Int,
-        pms::NTuple{D, Int}, b::Int) where {D}
-    q = twin === nothing ? 0 : FTB.nyquist_mask(ks, I)
-    q != 0 && return conj(FTB.twin_at(twin, q, I, b))
-    idx = (I[1], map(FTB.neg_index, Base.tail(ks), Base.tail(Tuple(I)))...)
-    lin = 1
-    stride = 1
-    @inbounds for d in 1:D
-        lin += (idx[d] - 1) * stride
-        stride *= pms[d]
-    end
-    return conj(coeffs[lin + off])
-end
-
+# A tensor grid separates: the series is `f = E_D ⋯ E_1 · C`, with one `n_d × m_d` table
+# `E_d[p, a] = exp(+iflag·i·k_a·x_p)` per axis, so a call is `D` matrix products. A real field's packed
+# half is turned into that series first (`native_coefficients!`), and the real part of the result is the
+# field.
 function _synthesize_packed_direct!(
     out::AbstractArray{FT},
     g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing,
+    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, geo = nothing,
 ) where {FT, D}
-    axes, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(true)) : geo
-    ss = size(g)
-    Npts = prod(ss)
-    pms = FTB.packed_size(ms, Val(true))
-    M = prod(pms)
-    B = length(out) ÷ Npts
-    fill!(out, zero(FT))
-    @inbounds for (pj, P) in enumerate(CartesianIndices(ss))
-        for (mi, I) in enumerate(CartesianIndices(pms))
-            nyq = FTB.is_nyquist(ks[1], I[1])
-            W = nyq ? zero(Complex{FT}) : cis(iflag * _phase_tensor(ks, axes, I, P, FT))
-            Wn = I[1] > 1 ? cis(iflag * _phase_tensor_neg(ks, axes, I, P, FT)) : zero(Complex{FT})
-            for b in 1:B
-                off = (b - 1) * M
-                acc = nyq ? zero(FT) : real(coeffs[mi + off] * W)
-                I[1] > 1 && (acc += real(_neg_row_value(coeffs, ks, twin, I, off, pms, b) * Wn))
-                out[pj + (b - 1) * Npts] += acc
-            end
-        end
-    end
+    s = geo === nothing ?
+        synth_setup(TensorCartesian(), g, FT, ms, Grids.field_batch_shape(g, out), iflag) : geo
+    native_coefficients!(first(s.chain.chain), coeffs, ms, s.box)
+    out .= real.(_run_chain!(s.chain))
     return out
+end
+
+"""
+    synth_setup(layout, grid, T, ms, batch, iflag; box = nothing)
+
+Everything a Cartesian direct-sum synthesis over `grid` reads, for a field of element type `T`. On a
+tensor grid, the coefficient box of a real field's packed half, and the per-axis tables
+`E_d[p, a] = exp(+iflag·i·k_a·x_p)` with the working arrays their contraction walks through from the
+series of `Grids.series_modes` `(…, batch…)` to the field `(size(grid)…, batch…)`. On a point set, the
+positions and the wavenumbers of the coefficient box its direct sum reads (`phase_geometry`). `box` is as
+in [`phase_geometry`](@ref).
+"""
+function synth_setup(::TensorCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple, iflag::Int;
+        box = nothing) where {T, D}
+    FT = real(float(T))
+    R = T <: Real
+    offs, ranges = Grids.axis_geometry(FT, g, D, box)
+    xs = Grids.relative_coordinates(g, offs)
+    ns = Grids.series_modes(g, ms, Val(R))
+    ks = Grids.physical_wavenumbers(ranges, ns, Val(false))
+    return (; box = Grids.mode_box(g, ms, Val(R)), chain = _contraction(FT, xs, ks, ns, size(g), batch, -iflag))
+end
+
+function synth_setup(::CloudCartesian, g, ::Type{T}, ms::NTuple{D, Int}, batch::Tuple, iflag::Int;
+        box = nothing) where {T, D}
+    FT = real(float(T))
+    xs, ks = phase_geometry(g, FT, ms, Val(T <: Real), box)
+    return (; xs, ks, E = _axis_scratch(FT, map(length, ks)))
 end
 
 function _synthesize_packed_direct!(
     out::AbstractArray{FT},
     g::Grids.PointwiseCartesian,
-    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, twin, geo = nothing,
+    coeffs::AbstractArray, ms::NTuple{D, Int}, iflag::Int, geo = nothing,
 ) where {FT, D}
-    coords, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(true)) : geo
-    N = length(coords[1])
-    pms = FTB.packed_size(ms, Val(true))
-    M = prod(pms)
+    s = geo === nothing ? synth_setup(CloudCartesian(), g, FT, ms, (), iflag) : geo
+    N = length(s.xs[1])
     B = length(out) ÷ N
     fill!(out, zero(FT))
     @inbounds for j in 1:N
-        for (mi, I) in enumerate(CartesianIndices(pms))
-            nyq = FTB.is_nyquist(ks[1], I[1])
-            W = nyq ? zero(Complex{FT}) : cis(iflag * _phase_scattered(ks, coords, I, j, FT))
-            Wn = I[1] > 1 ? cis(iflag * _phase_scattered_neg(ks, coords, I, j, FT)) : zero(Complex{FT})
-            for b in 1:B
-                off = (b - 1) * M
-                acc = nyq ? zero(FT) : real(coeffs[mi + off] * W)
-                I[1] > 1 && (acc += real(_neg_row_value(coeffs, ks, twin, I, off, pms, b) * Wn))
-                out[j + (b - 1) * N] += acc
-            end
+        _packed_point!(out, coeffs, s.E, s.ks, s.xs, map(length, s.ks), j, FT(iflag), N, B)
+    end
+    return out
+end
+
+# Point `j` of a real field from the packed half: each stored mode's real part, weighted by the count of
+# box modes it stands for, off the point's tables.
+@inline function _packed_point!(out::AbstractArray{FT}, coeffs, E::Tuple, ks::Tuple, xs::Tuple,
+        pms::NTuple{D, Int}, j::Int, s::FT, N::Int, B::Int) where {FT, D}
+    _axis_tables!(E, ks, xs, j, s, map(Base.OneTo, pms))
+    M = prod(pms)
+    @inbounds for (mi, I) in enumerate(CartesianIndices(pms))
+        W = FT(FTB.fold_weight(ks[1], I[1])) * _mode_phase(E, I)
+        for b in 1:B
+            out[j + (b - 1) * N] += real(coeffs[mi + (b - 1) * M] * W)
         end
     end
     return out
@@ -445,6 +403,7 @@ end
 # Cartesian inverse (synthesis):  f[p, b] = Σ_k C[k, b] · exp(+iflag · i · k·(x_p - x₀))
 # =============================================================================
 
+# The native spectrum, in the forward's order, through the per-axis tables of `synth_setup`.
 function _synthesize_cartesian_direct!(
     out::AbstractArray{Complex{FT}},
     g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
@@ -453,23 +412,10 @@ function _synthesize_cartesian_direct!(
     iflag::Int,
     geo = nothing,
 ) where {FT, D}
-    # Native order, matching the forward's output.
-    axes, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(false)) : geo
-    ss = size(g)
-    Npts = prod(ss)
-    M = prod(ms)
-    B = length(out) ÷ Npts
-    fill!(out, zero(Complex{FT}))
-    spat = CartesianIndices(ss)
-    @inbounds for (pj, P) in enumerate(spat)
-        for (mi, I) in enumerate(CartesianIndices(ms))
-            phi = _phase_tensor(ks, axes, I, P, FT)
-            W = cis(iflag * phi)
-            for b in 1:B
-                out[pj + (b - 1) * Npts] += coeffs[mi + (b - 1) * M] * W
-            end
-        end
-    end
+    s = geo === nothing ?
+        synth_setup(TensorCartesian(), g, Complex{FT}, ms, Grids.field_batch_shape(g, out), iflag) : geo
+    copyto!(first(s.chain.chain), coeffs)
+    copyto!(out, _run_chain!(s.chain))
     return out
 end
 
@@ -481,70 +427,47 @@ function _synthesize_cartesian_direct!(
     iflag::Int,
     geo = nothing,
 ) where {FT, D}
-    coords, ks = geo === nothing ? phase_geometry(g, FT, ms, Val(false)) : geo
-    N = length(coords[1])
-    M = prod(ms)
+    s = geo === nothing ? synth_setup(CloudCartesian(), g, Complex{FT}, ms, (), iflag) : geo
+    N = length(s.xs[1])
     B = length(out) ÷ N
     fill!(out, zero(Complex{FT}))
     @inbounds for j in 1:N
-        for (mi, I) in enumerate(CartesianIndices(ms))
-            phi = _phase_scattered(ks, coords, I, j, FT)
-            W = cis(iflag * phi)
-            for b in 1:B
-                out[j + (b - 1) * N] += coeffs[mi + (b - 1) * M] * W
-            end
+        _native_point!(out, coeffs, s.E, s.ks, s.xs, ms, j, FT(iflag), N, B)
+    end
+    return out
+end
+
+# Point `j` of a complex field from its native spectrum, off the point's tables.
+@inline function _native_point!(out::AbstractArray{Complex{FT}}, coeffs, E::Tuple, ks::Tuple, xs::Tuple,
+        ms::NTuple{D, Int}, j::Int, s::FT, N::Int, B::Int) where {FT, D}
+    _axis_tables!(E, ks, xs, j, s, map(Base.OneTo, ms))
+    M = prod(ms)
+    @inbounds for (mi, I) in enumerate(CartesianIndices(ms))
+        W = _mode_phase(E, I)
+        for b in 1:B
+            out[j + (b - 1) * N] += coeffs[mi + (b - 1) * M] * W
         end
     end
     return out
 end
 
 # =============================================================================
-# Spherical forward / inverse (SHT projection / synthesis).
-# Spherical grids are small (N = nlon·nlat or the scattered count), so per-point (θ, φ, weight) lists
-# are materialized once — this is NOT the ∏N_d Cartesian blob, just a modest point list. θ/φ come from
-# the FlowGeometries adapter's convention bridge (θ = colatitude, φ = longitude).
+# Spherical forward / inverse (SHT projection / synthesis). θ/φ come from `Grids._sph_points`
+# (θ = colatitude, φ = longitude); a per-point (θ, φ, weight) list is materialized once per setup.
 # =============================================================================
 
-# Structured `(nlon, nlat)` SPHERE: point p = iλ + (jφ-1)·nlon (longitude fastest, matching the field
-# layout), weight w_lat[jφ]·(2π/nlon) from the sampling's latitude quadrature. A structured SPHEROID grid
-# takes the per-node method below instead: a sampling states its latitude rule for a sphere's
-# colatitudes, and a spheroid's directions are the geocentric ones, so its rule is its own cell measure.
-function _sph_point_data(
-    g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
-    ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
-    θpt, φpt = Grids._sph_points(g)
-    nlon = length(FlowGeometries.Grids.coordinates(g, 1))
-    nlat = length(FlowGeometries.Grids.coordinates(g, 2))
-    N = nlon * nlat
-    wlat = Grids._sht_weights(g, nlat; sampling = sampling, weights = weights)
-    dλ = FT(2π) / nlon
-    wpt = Vector{FT}(undef, N)
-    # An inactive cell gets weight zero, so a per-point consumer of this data (the device kernel reaches
-    # a structured grid through here) drops it from the quadrature. Point `p` is `iλ + (jφ-1)·nlon`,
-    # which is the mask's own linear order.
-    mask = FlowGeometries.Grids.mask(g)
-    @inbounds for p in 1:N
-        jφ = ((p - 1) ÷ nlon) + 1
-        wpt[p] = mask[p] ? FT(wlat[jφ]) * dλ : zero(FT)
-    end
-    return FT.(θpt), FT.(φpt), wpt
-end
-
-# Every other spherical architecture — scattered nodes, and the pixelizations (HEALPix, cubed-sphere,
-# icosahedral, ring, Yin-Yang), which carry no separable `(nlon, nlat)` axes: per-node (θ, φ) and the
-# grid's own per-node quadrature weights (see `Grids._sph_node_weights`), overridden by `weights`.
+# Per-point colatitude, longitude and quadrature weight (`Grids._sph_point_weights`), an inactive point
+# at weight zero, in the field's column-major order.
 function _sph_point_data(
     g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
     ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
     θpt, φpt = Grids._sph_points(g)
-    N = length(θpt)
-    return FT.(θpt), FT.(φpt), Grids._sph_node_weights(g, FT, N, weights)
+    return FT.(θpt), FT.(φpt), Grids._sph_point_weights(g, FT; sampling = sampling, weights = weights)
 end
 
-# Real spherical harmonic value in the FastSphericalHarmonics convention (verified to match
-# `FSH.sph_evaluate` to round-off): Y_lm = s(m)·P̄_l^|m|·trig, with s(0)=1, s(m≠0)=(-1)^|m|√2, and
-# trig = cos(mφ) for m≥0, sin(|m|φ) for m<0. `Plm` holds the normalized associated Legendre
-# P̄_l^|m|(cosθ). Coefficients are real (stored in the complex array with zero imaginary part).
+# Real spherical harmonic in the FastSphericalHarmonics convention (`FSH.sph_evaluate`):
+# Y_lm = s(m)·P̄_l^|m|·trig, with s(0)=1, s(m≠0)=(-1)^|m|√2, and trig = cos(mφ) for m≥0, sin(|m|φ) for
+# m<0. `Plm` holds the normalized associated Legendre P̄_l^|m|(cosθ).
 @inline function _real_sph(Plm::AbstractMatrix{FT}, l::Int, m::Int, φ::FT) where {FT}
     abs_m = abs(m)
     P = Plm[l+1, abs_m+1]
@@ -553,8 +476,27 @@ end
     return s * P * (m > 0 ? cos(m * φ) : sin(abs_m * φ))
 end
 
-# Structured spherical factorization, shared by the serial and threaded paths. `_sph_structured_setup`
-# reads the grid's `(λ, θ)` axes + latitude quadrature; `_sph_longitude_dft` is the once-per-`(θ, m)`
+# A point's `cos(mφ)` and `sin(mφ)` for `m = 0…lmax`, so its `(lmax+1)²` harmonics read `2(lmax+1)` values
+# in place of a trigonometric pair each; `_real_sph_tab` is `_real_sph` off them.
+@inline function _lon_trig!(cs::AbstractVector{FT}, sn::AbstractVector{FT}, φ::FT, lmax::Int) where {FT}
+    @inbounds for m in 0:lmax
+        sn[m + 1], cs[m + 1] = sincos(m * φ)
+    end
+    return nothing
+end
+
+@inline function _real_sph_tab(Plm::AbstractMatrix{FT}, l::Int, m::Int, cs, sn) where {FT}
+    abs_m = abs(m)
+    P = @inbounds Plm[l + 1, abs_m + 1]
+    m == 0 && return P
+    s = isodd(abs_m) ? -sqrt(FT(2)) : sqrt(FT(2))
+    return s * P * @inbounds(m > 0 ? cs[m + 1] : sn[abs_m + 1])
+end
+
+_lon_scratch(::Type{FT}, lmax::Int) where {FT} = (Vector{FT}(undef, lmax + 1), Vector{FT}(undef, lmax + 1))
+
+# Structured spherical factorization, shared by the serial and threaded runs. `_sph_structured_setup`
+# reads the grid's `(λ, θ)` axes + latitude quadrature; `_sph_longitude_dft!` is the once-per-`(θ, m)`
 # longitude DFT (dense matmul, dependency-free); `_sph_theta_accumulate!` runs the θ-Legendre contraction
 # over a set of latitudes. Same normalized-Legendre / factor / m↔col convention as `_real_sph`; `φc` reads
 # the |m| longitude bin (Re for `m ≥ 0`, −Im for `m < 0`).
@@ -564,6 +506,7 @@ function _sph_structured_setup(g, ::Type{FT}; sampling, weights, lmax = nothing)
     nlon = length(λ)
     nlat = length(φlat)
     N = nlon * nlat
+    lmax === nothing || Grids._warn_longitude_bandlimit(nlon, lmax)
     wlat = Grids._sht_weights(g, nlat; sampling = sampling, weights = weights, lmax = lmax)
     wθ = FT.(wlat) .* (FT(2π) / nlon)
     # The colatitude of each latitude row's direction, which the grid's geometry defines.
@@ -586,9 +529,9 @@ end
 
 # A real spherical harmonic reads `Σ_φ f cos(mλ)` and `Σ_φ f sin(mλ)`. Written with the longitude DFT
 # `g[a] = Σ_φ f exp(-i(a-1)λ)` and its partner `ĝ[a] = Σ_φ f exp(+i(a-1)λ)`, those are `(g+ĝ)/2` and
-# `i(g-ĝ)/2`. A REAL field satisfies `ĝ = conj(g)`, collapsing them to `real(g)` and `-imag(g)`, and the
-# partner transform is not built. A COMPLEX field's `ĝ` is an independent sum, so it is, and `nothing`
-# marks its absence throughout this file.
+# `i(g-ĝ)/2`. A real field has `ĝ = conj(g)`, so they collapse to `real(g)` and `-imag(g)` and the
+# partner transform is not built (`nothing` throughout this file). A complex field's `ĝ` is an
+# independent sum.
 @inline _phi_bin(m::Int, g, ::Nothing) = m >= 0 ? real(g) : -imag(g)
 @inline _phi_bin(m::Int, g, ĝ) = m >= 0 ? (g + ĝ) / 2 : im * (g - ĝ) / 2
 
@@ -601,39 +544,33 @@ _partner_buffer(::Type{<:Real}, ::Type{FT}, dims::Int...) where {FT} = nothing
 @inline _partner_at(::Nothing, a::Int, i::Int, b::Int) = nothing
 Base.@propagate_inbounds _partner_at(f, a::Int, i::Int, b::Int) = f[a, i, b]
 
-# Longitude DFT of every latitude row, and the partner transform a complex field needs. `T` is the
-# coefficient element type, whose realness is the field's.
-function _sph_longitude_dft(::Type{T}, λ, field, lmax::Int, nlon::Int, nlat::Int, B::Int) where {T}
-    FT = real(float(T))
-    Wφ = _sph_longitude_matrix(FT, λ, lmax, nlon)
-    F = reshape(field, nlon, nlat * B)
-    return reshape(Wφ * F, lmax + 1, nlat, B), _partner_dft(_partner_matrix(T, Wφ), F, lmax, nlat, B)
-end
-_partner_dft(::Nothing, F, lmax::Int, nlat::Int, B::Int) = nothing
-_partner_dft(Wc, F, lmax::Int, nlat::Int, B::Int) = reshape(Wc * F, lmax + 1, nlat, B)
-
-# The same contraction into a held buffer, so a reused plan allocates neither the matrix nor the result.
+# Longitude DFT of every latitude row into a held buffer, `Wφ` the setup's matrix or its partner; a real
+# field's partner is `nothing`.
 function _sph_longitude_dft!(fhat, Wφ, field, nlon::Int, nlat::Int, B::Int)
     LA.mul!(reshape(fhat, size(Wφ, 1), nlat * B), Wφ, reshape(field, nlon, nlat * B))
     return fhat
 end
 _sph_longitude_dft!(::Nothing, ::Nothing, field, nlon::Int, nlat::Int, B::Int) = nothing
 
-# Longitude sum for a set of rings, accumulated into `fh[a, jr, b]` with `jr` enumerating `rows`. The exact
-# discrete sum over each ring's own longitudes, so the ring transform is the per-point projection
-# reassociated. Shared by the serial and threaded ring paths, which differ only in how `rows` is split.
+# Weighted longitude sum for a set of rings, `fh[a, jr, b] = Σ_p w_p f_p e^{-i(a-1)λ_p}` over the points of
+# ring `rows[jr]`. The exact discrete sum over each ring's own longitudes and weights, so the ring
+# transform is the per-point projection reassociated. Shared by the serial and threaded ring paths, which
+# differ only in how `rows` is split.
 function _sph_ring_longitude!(fh, fh2, F, rt, rows, lmax::Int, B::Int, ::Type{FT}) where {FT}
-    mask = rt.mask
+    wpt = rt.wpt
     @inbounds for (jr, r) in enumerate(rows)
         for p in rt.ranges[r]
-            mask[p] || continue            # an inactive cell carries no data to integrate
+            wp = FT(wpt[p])
+            # A point of zero weight is skipped, so a masked cell's datum (commonly NaN) never enters.
+            iszero(wp) && continue
             λp = rt.λ[p]
             for a in 1:(lmax + 1)
                 e = cis(-FT(a - 1) * λp)
+                we = wp * e
                 for b in 1:B
-                    fh[a, jr, b] += F[p, b] * e
+                    fh[a, jr, b] += F[p, b] * we
                 end
-                _ring_partner!(fh2, a, jr, B, F, p, conj(e))
+                _ring_partner!(fh2, a, jr, B, F, p, wp * conj(e))
             end
         end
     end
@@ -648,11 +585,16 @@ Base.@propagate_inbounds function _ring_partner!(fh2, a::Int, jr::Int, B::Int, F
     return nothing
 end
 
+# The θ-Legendre contraction over `rows`, each row's longitude sum scaled by `wθ[row]`. `wθ = nothing`
+# reads a longitude sum that already carries its points' weights, as the ring path's does.
+@inline _row_weight(::Nothing, ::Type{FT}, i::Int) where {FT} = one(FT)
+Base.@propagate_inbounds _row_weight(wθ, ::Type{FT}, i::Int) where {FT} = FT(wθ[i])
+
 function _sph_theta_accumulate!(C, fhat, fhat2, θ::AbstractVector{FT}, wθ, tables, rows, lmax::Int,
         B::Int, Plm::AbstractMatrix{FT}) where {FT}
     @inbounds for iθ in rows
         SphericalKernels.fill_legendre!(Plm, tables, cos(θ[iθ]), sin(θ[iθ]), lmax)
-        w = wθ[iθ]
+        w = _row_weight(wθ, FT, iθ)
         for l in 0:lmax
             for m in -l:l
                 abs_m = abs(m)
@@ -669,23 +611,11 @@ function _sph_theta_accumulate!(C, fhat, fhat2, θ::AbstractVector{FT}, wθ, tab
     return C
 end
 
-# The spherical forward routes on the grid's declared layout (`Grids._sph_layout`): a tensor product
-# factorizes over its shared longitude axis, an iso-latitude ring layout over each ring's own longitudes,
-# and a point cloud has neither.
-_calculate_spectrum_spherical_direct!(
-    coeffs::AbstractArray{<:Number},
-    g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
-    field::AbstractArray, lmax::Int; kwargs...,
-) = _sph_direct!(Grids._sph_layout(g), coeffs, g, field, lmax; kwargs...)
-
 # =============================================================================
-# Setup / run split. `sph_setup` reads the grid — `materialize`, the latitude quadrature (a Gauss–Legendre
-# root solve), the ring table, the longitude DFT matrix, the Legendre tables — and `sph_run!` transforms a
-# field against what it returns. The one-shot below composes the two, and a reusable plan holds the setup,
-# whose share of the transform is a minority of the time and ~3/4 of the allocations.
-#
-# Buffers sized by the batch live in the setup, so a plan built for a batch shape reuses them; the
-# one-shot reads the batch from `coeffs`.
+# Spherical setup / run split. `sph_setup` reads the grid (`materialize`, the latitude quadrature, the
+# ring table, the longitude DFT matrix, the Legendre tables) and `sph_run!` transforms a field against
+# what it returns. The one-shot composes the two and `DirectSumSphericalPlan` holds the setup. Buffers
+# sized by the batch live in the setup; the one-shot reads the batch from `coeffs`.
 # =============================================================================
 
 """
@@ -698,7 +628,7 @@ partner transform.
 
 Run it against a field with [`sph_run!`](@ref). `DirectSumSphericalPlan` holds it across executions.
 """
-function sph_setup(::Grids.TensorSphere, g, ::Type{T}, lmax::Int, B::Int;
+function sph_setup(::FlowGeometries.Grids.TensorRings, g, ::Type{T}, lmax::Int, B::Int;
         sampling = nothing, weights = nothing) where {T}
     FT = real(float(T))
     λ, θ, wθ, nlon, nlat, _ = _sph_structured_setup(g, FT; sampling = sampling, weights = weights,
@@ -711,10 +641,10 @@ function sph_setup(::Grids.TensorSphere, g, ::Type{T}, lmax::Int, B::Int;
         Plm = Matrix{FT}(undef, lmax + 1, lmax + 1))
 end
 
-function sph_setup(::Grids.RingSphere, g, ::Type{T}, lmax::Int, B::Int;
+function sph_setup(::FlowGeometries.Grids.IsoLatitudeRings, g, ::Type{T}, lmax::Int, B::Int;
         sampling = nothing, weights = nothing) where {T}
     FT = real(float(T))
-    rt = Grids._ring_table(g, FT; lmax = lmax)
+    rt = Grids._ring_table(g, FT; lmax = lmax, sampling = sampling, weights = weights)
     nr = length(rt.ranges)
     return (; rt, nr, N = length(rt.λ),
         fhat = zeros(Complex{FT}, lmax + 1, nr, B),
@@ -723,17 +653,15 @@ function sph_setup(::Grids.RingSphere, g, ::Type{T}, lmax::Int, B::Int;
         Plm = Matrix{FT}(undef, lmax + 1, lmax + 1))
 end
 
-function sph_setup(::Grids.ScatteredSphere, g, ::Type{T}, lmax::Int, B::Int;
+function sph_setup(::FlowGeometries.Grids.NoRings, g, ::Type{T}, lmax::Int, B::Int;
         sampling = nothing, weights = nothing) where {T}
     FT = real(float(T))
     θpt, φpt, wpt = _sph_point_data(g, FT; sampling = sampling, weights = weights)
     return (; θpt, φpt, wpt, N = length(θpt),
         tables = SphericalKernels.legendre_tables(FT, lmax),
-        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1))
+        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1), trig = _lon_scratch(FT, lmax))
 end
 
-# Structured `(nlon, nlat)` grid with uniform longitude: `O(nlat · L²)` in place of the per-point
-# `O(N · L²)`.
 """
     sph_run!(coeffs, layout, setup, field, lmax, B) -> ks
 
@@ -743,7 +671,7 @@ Fill `coeffs` `(lmax+1, 2lmax+1, B)` with the spherical spectrum of `field` agai
 A tensor layout runs one longitude DFT for every latitude, a ring layout one per ring, and a point cloud
 projects per node; all three then contract over θ against the Legendre tables.
 """
-function sph_run!(coeffs::AbstractArray{C}, ::Grids.TensorSphere, s, field::AbstractArray,
+function sph_run!(coeffs::AbstractArray{C}, ::FlowGeometries.Grids.TensorRings, s, field::AbstractArray,
         lmax::Int, B::Int) where {C <: Number}
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1
@@ -755,13 +683,10 @@ function sph_run!(coeffs::AbstractArray{C}, ::Grids.TensorSphere, s, field::Abst
     return (0:lmax, -lmax:lmax)
 end
 
-# Iso-latitude rings (HEALPix, ring / reduced-Gaussian grids): colatitude is constant along a ring, so the
-# longitude sum runs once per `(ring, m)` and the θ-Legendre contraction then runs over rings —
-# `O(N·lmax + nrings·lmax²)` against the per-point `O(N·lmax²)`. The longitude sum is the exact discrete
-# sum over each ring's own longitudes, so this is the per-point projection reassociated and agrees with it
-# to round-off. Longitude count and quadrature weight both vary by ring here, where the tensor form has a
-# shared `nlon` and a single `wθ` per latitude.
-function sph_run!(coeffs::AbstractArray{C}, ::Grids.RingSphere, s, field::AbstractArray,
+# Iso-latitude rings (HEALPix in RING order, ring and reduced-Gaussian grids, a masked or spheroid tensor
+# grid): colatitude is constant along a ring, so the longitude sum runs once per `(ring, m)` and the
+# θ-Legendre contraction over rings, `O(N·lmax + nrings·lmax²)`.
+function sph_run!(coeffs::AbstractArray{C}, ::FlowGeometries.Grids.IsoLatitudeRings, s, field::AbstractArray,
         lmax::Int, B::Int) where {C <: Number}
     FT = real(float(C))
     Nθc = lmax + 1
@@ -770,14 +695,14 @@ function sph_run!(coeffs::AbstractArray{C}, ::Grids.RingSphere, s, field::Abstra
     fill!(s.fhat, zero(eltype(s.fhat)))
     _fill_partner!(s.fhat2)
     _sph_ring_longitude!(s.fhat, s.fhat2, reshape(field, s.N, B), s.rt, 1:s.nr, lmax, B, FT)
-    _sph_theta_accumulate!(reshape(coeffs, Nθc, Nφc, B), s.fhat, s.fhat2, s.rt.θ, s.rt.w, s.tables,
+    _sph_theta_accumulate!(reshape(coeffs, Nθc, Nφc, B), s.fhat, s.fhat2, s.rt.θ, nothing, s.tables,
         1:s.nr, lmax, B, s.Plm)
     return (0:lmax, -lmax:lmax)
 end
 
-# Every other spherical layout — scattered nodes, and the pixelizations with no iso-latitude structure
-# (cubed-sphere, icosahedral, Yin-Yang) — so the per-point projection stands.
-function sph_run!(coeffs::AbstractArray{CT}, ::Grids.ScatteredSphere, s, field::AbstractArray,
+# A grid without iso-latitude rings — scattered nodes, the cubed sphere, the icosahedral geodesic,
+# Yin-Yang, HEALPix in NESTED order — takes the per-point projection.
+function sph_run!(coeffs::AbstractArray{CT}, ::FlowGeometries.Grids.NoRings, s, field::AbstractArray,
         lmax::Int, B::Int) where {CT <: Number}
     Nθc = lmax + 1
     Nφc = 2 * lmax + 1
@@ -785,28 +710,31 @@ function sph_run!(coeffs::AbstractArray{CT}, ::Grids.ScatteredSphere, s, field::
     F = reshape(field, N, B)
     C = reshape(coeffs, Nθc, Nφc, B)
     fill!(coeffs, zero(CT))
-    Plm = s.Plm
     @inbounds for p in 1:N
-        wp = s.wpt[p]
-        # A node of zero weight contributes nothing, and skipping it keeps a masked cell's value out of
-        # the sum entirely: masked data is commonly NaN, and `0 * NaN` is NaN.
-        iszero(wp) && continue
-        xj = cos(s.θpt[p])
-        sj = sin(s.θpt[p])
-        φp = s.φpt[p]
-        SphericalKernels.fill_legendre!(Plm, s.tables, xj, sj, lmax)
-        for l in 0:lmax
-            for m in -l:l
-                Ylm = _real_sph(Plm, l, m, φp)          # real SH (FSH convention)
-                idx = sph_mode_index(l, m)
-                gw = Ylm * wp
-                for b in 1:B
-                    C[idx, b] += F[p, b] * gw
-                end
+        _sph_project_point!(C, F, s.Plm, s.trig, s.tables, s.θpt[p], s.φpt[p], s.wpt[p], p, lmax, B)
+    end
+    return (0:lmax, -lmax:lmax)
+end
+
+# Node `p`'s weighted contribution to every coefficient. A node of zero weight contributes nothing, and
+# skipping it keeps a masked cell's value out of the sum entirely: masked data is commonly NaN, and
+# `0 * NaN` is NaN.
+@inline function _sph_project_point!(C, F, Plm::AbstractMatrix{FT}, trig, tables, θp, φp, wp, p::Int,
+        lmax::Int, B::Int) where {FT}
+    iszero(wp) && return C
+    SphericalKernels.fill_legendre!(Plm, tables, cos(θp), sin(θp), lmax)
+    cs, sn = trig
+    _lon_trig!(cs, sn, FT(φp), lmax)
+    @inbounds for l in 0:lmax
+        for m in -l:l
+            gw = _real_sph_tab(Plm, l, m, cs, sn) * wp      # real SH (FSH convention)
+            idx = sph_mode_index(l, m)
+            for b in 1:B
+                C[idx, b] += F[p, b] * gw
             end
         end
     end
-    return (0:lmax, -lmax:lmax)
+    return C
 end
 
 # One-shot: set up against this grid, then run. A repeated caller holds the setup in a plan.
@@ -826,10 +754,10 @@ per-node `Plm` scratch. Synthesis carries no quadrature, so this is the node lis
 Run it against coefficients with [`sph_synth_run!`](@ref); `DirectSumSynthesisPlan` holds it.
 """
 function sph_synth_setup(g, ::Type{FT}, lmax::Int) where {FT}
-    θraw, φraw = Grids._sph_points(g)      # synthesis reads nodes only; it carries no quadrature
+    θraw, φraw = Grids._sph_points(g)
     return (; θpt = FT.(θraw), φpt = FT.(φraw), N = length(θraw),
         tables = SphericalKernels.legendre_tables(FT, lmax),
-        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1))
+        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1), trig = _lon_scratch(FT, lmax))
 end
 
 """
@@ -838,33 +766,33 @@ end
 Evaluate the spherical harmonic sum at the setup's nodes, writing `out` `(N, batch…)`.
 """
 function sph_synth_run!(out::AbstractArray{OT}, s, coeffs::AbstractArray, lmax::Int) where {OT <: Number}
-    θpt = s.θpt
-    φpt = s.φpt
     N = s.N
-    tables = s.tables
-    Plm = s.Plm
-    Nθc = lmax + 1
-    Nφc = 2 * lmax + 1
     B = length(out) ÷ N
     O = reshape(out, N, B)
-    C = reshape(coeffs, Nθc, Nφc, B)
+    C = reshape(coeffs, lmax + 1, 2 * lmax + 1, B)
     fill!(O, zero(OT))
     @inbounds for p in 1:N
-        xj = cos(θpt[p])
-        sj = sin(θpt[p])
-        φp = φpt[p]
-        SphericalKernels.fill_legendre!(Plm, tables, xj, sj, lmax)
-        for l in 0:lmax
-            for m in -l:l
-                Ylm = _real_sph(Plm, l, m, φp)          # real SH (FSH convention)
-                idx = sph_mode_index(l, m)
-                for b in 1:B
-                    O[p, b] += C[idx, b] * Ylm
-                end
+        _sph_synth_point!(O, C, s.Plm, s.trig, s.tables, s.θpt[p], s.φpt[p], p, lmax, B)
+    end
+    return out
+end
+
+# The harmonic sum at node `p`.
+@inline function _sph_synth_point!(O, C, Plm::AbstractMatrix{FT}, trig, tables, θp, φp, p::Int, lmax::Int,
+        B::Int) where {FT}
+    SphericalKernels.fill_legendre!(Plm, tables, cos(θp), sin(θp), lmax)
+    cs, sn = trig
+    _lon_trig!(cs, sn, FT(φp), lmax)
+    @inbounds for l in 0:lmax
+        for m in -l:l
+            Ylm = _real_sph_tab(Plm, l, m, cs, sn)          # real SH (FSH convention)
+            idx = sph_mode_index(l, m)
+            for b in 1:B
+                O[p, b] += C[idx, b] * Ylm
             end
         end
     end
-    return out
+    return O
 end
 
 # One-shot: set up against this grid, then run.

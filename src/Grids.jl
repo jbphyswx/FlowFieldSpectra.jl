@@ -9,11 +9,8 @@ export physical_wavenumbers
     PointwiseCartesian
 
 Cartesian grids whose coordinates are stored per point: a node cloud, and a curvilinear grid, whose
-coordinate arrays hold one value per cell.
-
-Both index linearly in the field's own order, so a transform reads them identically — the direct sum, its
-Nyquist twin, both inverses, and a NUFFT provider's point list. A tensor grid stores axes instead and has
-its own factorized methods, which are more specific than this.
+coordinate arrays hold one value per cell. Both index linearly in the field's own order. A tensor grid
+has its own, more specific, factorized methods.
 """
 const PointwiseCartesian = Union{
     FlowGeometries.Grids.AbstractUnstructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
@@ -23,13 +20,11 @@ const PointwiseCartesian = Union{
 """
     SphericalHarmonicGeometry
 
-Geometries whose points are addressed by a DIRECTION, so a spherical-harmonic transform applies to a
+Geometries whose points are addressed by a direction, so a spherical-harmonic transform applies to a
 field sampled on them: a sphere, and a spheroid.
 
-A spherical harmonic is orthonormal over directions, and a spheroid node's direction is its geocentric
-one, which [`_colatitude`](@ref) reads through the geometry's own embedding. What such a transform
-returns is the SURFACE expansion of the field: the spheroid's radius varies with latitude, and that
-radial dependence belongs to the solid-harmonic expansion, which is a different transform.
+A spheroid node's direction is its geocentric one, which [`_colatitude`](@ref) gives, and the transform
+returns the field's surface expansion over those directions.
 """
 const SphericalHarmonicGeometry = Union{
     FlowGeometries.Geometry.AbstractSphericalGeometry,
@@ -37,23 +32,16 @@ const SphericalHarmonicGeometry = Union{
 }
 
 # =============================================================================
-# FlowGeometries adapter. FFS builds directly on FlowGeometries' grid/geometry types — a Cartesian grid
-# is a `StructuredGrid`/`UnstructuredGrid` over a `CartesianGeometry`, a spherical grid the same over a
-# `SphericalGeometry`. Callers construct grids with FlowGeometries; FFS reads them with FlowGeometries'
-# own accessors (`size`, `ndims`, `length`, `coordinates`, `isuniform`, `period`, …). There is no FFS
-# grid-construction or interface wrapper layer. This module holds only the two pieces FlowGeometries has
-# no equivalent for:
-#   • `physical_wavenumbers` — the spectral wavenumber grid (reads FlowGeometries' `period` for `L`);
-#   • the θ/φ/quadrature bridge from FlowGeometries' `(λ, φ_lat)` = (longitude, geographic latitude) to
-#     the transform's `(θ, φ)` = (colatitude, longitude).
+# What the transforms read from a FlowGeometries grid: wavenumbers, quadrature, point lists, and the
+# bridge from FlowGeometries' `(λ, φ_lat)` (longitude, geographic latitude) to the transform's `(θ, φ)`
+# (colatitude, longitude).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Physical wavenumbers (spectral; period-based). No FlowGeometries equivalent.
+# Physical wavenumbers.
 # -----------------------------------------------------------------------------
 
-# A caller has to say whether the field is real, since that decides the layout: a real transform halves
-# axis 1 and a complex one keeps every mode. The two-argument form states that requirement.
+# The layout depends on the field's realness, so the form without a `Val` raises.
 @inline physical_wavenumbers(g::FlowGeometries.Grids.AbstractGrid, ms::NTuple{D, Int}) where {D} =
     throw(ArgumentError(
         "physical_wavenumbers needs the field's realness, which fixes the layout: pass `Val(true)` for " *
@@ -62,31 +50,31 @@ const SphericalHarmonicGeometry = Union{
         "value, so a caller reducing its coefficients uses those."))
 
 """
-    physical_wavenumbers(Ls, ms, ::Val{real}) -> NTuple
+    physical_wavenumbers(Ls, box, ::Val{real}) -> NTuple
     physical_wavenumbers(grid, ms, ::Val{real}) -> NTuple
 
 Packed native-order wavenumber axes matching the packed coefficient layout: for a real transform axis 1
-is a nonnegative rfft axis (`FlowTransformBindings.RFFTAxis`, length `ms[1]÷2+1`) and axes `2:D` are
+is a nonnegative rfft axis (`FlowTransformBindings.RFFTAxis`, length `box[1]÷2+1`) and axes `2:D` are
 full fft axes (`FlowTransformBindings.FFTAxis`); for a complex transform every axis is a full fft axis.
-`ms[d]` is the full transform length along `d`, and a Fourier length of zero takes the spacing of unit
-length.
+`box[d]` is the coefficient box's mode count along `d`, which on `grid` is the [`mode_box`](@ref) of an
+`ms`-mode transform. A Fourier length of zero takes the spacing of unit length.
 """
-@inline physical_wavenumbers(Ls::NTuple{D, <:Real}, ms::NTuple{D, Int}, r::Val) where {D} =
-    FTB.wavenumber_axes(map(L -> iszero(L) ? one(L) : L, Ls), ms, r)
+@inline physical_wavenumbers(Ls::NTuple{D, <:Real}, box::NTuple{D, Int}, r::Val) where {D} =
+    FTB.wavenumber_axes(map(L -> iszero(L) ? one(L) : L, Ls), box, r)
 
 @inline function physical_wavenumbers(
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         ms::NTuple{D, Int}, r::Val) where {D}
     FT = eltype(g)
     Ls = ntuple(d -> axis_range(FT, g, d), Val(D))
-    return physical_wavenumbers(Ls, ms, r)
+    return physical_wavenumbers(Ls, mode_box(g, ms, r), r)
 end
 
 # -----------------------------------------------------------------------------
 # Cartesian quadrature. A transform estimates the domain average
 # `C(k) = Σ_j w_j f_j e^{-i k·(x_j - x₀)} / Σ_j w_j` with `w` the grid's per-node measure and `x₀` each
 # direction's smallest coordinate, the first sample of an ascending axis, so an FFT of the samples
-# returns it with no phase applied. Every backend here normalizes by the plain node count instead, and
+# returns it with no phase applied. Every backend normalizes by the node count `N`, and
 #
 #     Σ_j w_j f_j e^{-ikx} / Σw  ==  (1/N) Σ_j (N w_j / Σw) f_j e^{-ikx},
 #
@@ -100,14 +88,11 @@ end
 
 Per-node factor `α_j = N·w_j/Σw` taking a node-count-normalized transform to the measure-weighted
 quadrature over `grid`, or `nothing` where the measure is constant and `α_j` is exactly one. `N` is the
-number of spatial samples the field carries. Flat and of length `N`, indexed by the same column-major
-point order the field and the coordinates use, so it reads against a strengths vector and stages to a
-device as one.
+number of spatial samples the field carries; the result is flat, of length `N`, in the field's
+column-major point order.
 
-Read from `Grids.measure`, never `measure_array`: a rectilinear grid's measure is a `SeparableMeasure`
-and a ring layout's a `RingwiseVector`, whose `sum` and `extrema` cost `O(Σ Nᵈ)` and `O(nrings)` against
-a dense `O(∏ Nᵈ)`, and whose scaling by a constant stays in that representation. The result is therefore
-lazy on such a grid, carrying `O(Σ Nᵈ)` numbers for `N` entries.
+Read from `FlowGeometries.Grids.measure`, which keeps a rectilinear grid's `SeparableMeasure` and a ring
+layout's `RingwiseVector` compact, so the result is lazy on such a grid.
 """
 function quadrature_scale(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         ::Type{FT}, N::Integer) where {FT}
@@ -131,7 +116,7 @@ end
 
 Trailing batch sizes of `field` on `grid`: the dims after the leading `ndims(grid)` spatial ones, per the
 `(spatial…, batch…)` contract `Problem` states. `ndims(grid)` is `1` for a node cloud and `N` for a
-grid that indexes as an `N`-D array, so a path serving both reads its batch from here.
+grid that indexes as an `N`-D array.
 """
 field_batch_shape(g::FlowGeometries.Grids.AbstractGrid, field) =
     ntuple(i -> size(field, ndims(g) + i), ndims(field) - ndims(g))
@@ -141,9 +126,6 @@ field_batch_shape(g::FlowGeometries.Grids.AbstractGrid, field) =
 
 Per-axis origin and Fourier length: `offsets[d]` is the smallest coordinate along direction `d`, the `x₀`
 every phase is measured from, and `ranges[d]` the [`axis_range`](@ref) of direction `d`.
-
-`offsets` comes from `FlowGeometries.Grids.bounds`, which is `O(1)` on a structured grid (an axis is
-monotone, so its extremes are its endpoints) against an `O(N)` scan of the coordinates.
 """
 function axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int) where {FT}
     offsets = ntuple(d -> FT(FlowGeometries.Grids.bounds(g, d)[1]), D)
@@ -180,12 +162,8 @@ measure integrates over those cells, so the Fourier modes are periodic over the 
     point_coordinates(::Type{FT}, grid, D) -> (coords::NTuple{D}, spatial::Tuple)
 
 The `D` per-point coordinate vectors of `grid` in the field's own column-major order, and the spatial
-shape a field on it carries.
-
-`FlowGeometries.Grids.materialize` answers this for every architecture: a node cloud returns its nodes,
-a tensor grid the expansion of its axes, a curvilinear grid its per-cell values, and a pixelization its
-pixel centres. It allocates `D·n` numbers on a tensor grid (its docstring says so), so a repeated caller
-holds the result in a plan.
+shape a field on it carries. Read from `FlowGeometries.Grids.materialize`, which allocates `D·n` numbers
+on a tensor grid; a repeated caller holds the result in a plan.
 """
 function point_coordinates(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int) where {FT}
     pts = FlowGeometries.Grids.materialize(g)
@@ -206,13 +184,9 @@ _as_points(::Type{FT}, v::AbstractArray) where {FT} = FT.(vec(v))
     _sph_points(grid) -> (θ, φ)
 
 Per-point colatitude/longitude lists for any spherical `grid`, in the transform's
-`(θ = colatitude, φ = longitude)` convention.
-
-The nodes come from `FlowGeometries.Grids.materialize`, which every grid architecture answers: on an
-unstructured grid it returns the nodes themselves, on a structured `(nlon, nlat)` grid the expansion in
-column-major order (longitude fastest, matching `size` and the field layout), and on a pixelization
-(HEALPix, cubed-sphere, icosahedral, ring, Yin-Yang) the pixel centres. Those pixelizations answer
-neither `coordinates(grid, d)` nor `sampling(grid)`, so `materialize` is the accessor that spans them.
+`(θ = colatitude, φ = longitude)` convention and the field's column-major order (longitude fastest on a
+structured `(nlon, nlat)` grid). The nodes come from `FlowGeometries.Grids.materialize`, so a
+pixelization yields its pixel centres.
 """
 function _sph_points(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry})
     λ, φlat = FlowGeometries.Grids.materialize(g)   # (longitude, geographic latitude) per node
@@ -221,9 +195,9 @@ function _sph_points(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geome
     return (half .- FT.(φlat)), FT.(λ)
 end
 
-# A spheroid stores the GEODETIC latitude, which is not the colatitude of the direction its node lies in,
-# so each node's colatitude is read through `_colatitude`. A surface grid `(λ, φ)` is the domain of a
-# spherical-harmonic expansion; a grid carrying height as a third direction is not.
+# A spheroid stores the geodetic latitude, so each node's colatitude is read through `_colatitude`. A
+# surface grid `(λ, φ)` is the domain of a spherical-harmonic expansion; a grid carrying height as a third
+# direction is not.
 function _sph_points(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry})
     pts = FlowGeometries.Grids.materialize(g)
     length(pts) == 2 || throw(ArgumentError(
@@ -236,134 +210,55 @@ function _sph_points(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geome
     φ = pts[2]
     θ = similar(λ)
     @inbounds for i in eachindex(θ)
-        θ[i] = _colatitude(geo, λ[i], FT(φ[i]))
+        θ[i] = _colatitude(geo, FT(φ[i]))
     end
     return θ, λ
 end
 
 """
-    _colatitude(geometry, λ, φ) -> FT
+    _colatitude(geometry, φ) -> FT
 
-Colatitude of the direction the node `(λ, φ)` lies in.
-
-On a sphere that is `π/2 − φ`. On a spheroid the stored `φ` is the geodetic latitude, whose difference
-from the geocentric one reaches ~0.19° at mid-latitudes on Earth's ellipsoid, so the node is embedded
-through the geometry's own `geodetic_to_cartesian` and the direction read back from it. The result is
-independent of `λ` on both (a spheroid is a surface of revolution), so a latitude row remains one
-iso-latitude ring and the ring-factorized transform still applies.
+Colatitude of the direction the surface point at latitude `φ` lies in: `π/2` less its
+`Geometry.geocentric_latitude`, which is `φ` on a sphere and the direction of the geodetic `φ`'s point on
+a spheroid. Longitude does not enter, so a latitude row is one iso-latitude ring.
 """
-@inline _colatitude(::FlowGeometries.Geometry.AbstractSphericalGeometry, λ::FT, φ::FT) where {FT} =
-    FT(π) / 2 - φ
+@inline _colatitude(geo::FlowGeometries.Geometry.AbstractGeometry, φ::FT) where {FT} =
+    FT(π) / 2 - FT(FlowGeometries.Geometry.geocentric_latitude(geo, φ))
 
-@inline function _colatitude(geo::FlowGeometries.Geometry.AbstractEllipsoidalGeometry,
-        λ::FT, φ::FT) where {FT}
-    p = FlowGeometries.Geometry.geodetic_to_cartesian(geo, (λ, φ))
-    r = hypot(p.x, p.y, p.z)
-    return acos(clamp(FT(p.z) / FT(r), -one(FT), one(FT)))
-end
-
-# The colatitude of a whole latitude row, which both factorized paths read once per ring.
 _colatitude(g::FlowGeometries.Grids.AbstractGrid, φ::FT) where {FT} =
-    _colatitude(FlowGeometries.Grids.grid_geometry(g), zero(FT), φ)
+    _colatitude(FlowGeometries.Grids.grid_geometry(g), φ)
 
 # -----------------------------------------------------------------------------
-# Spherical layout routing. A sampling declares its own structure
-# (`SphericalSampling.is_tensor_product` / `is_iso_latitude`), and the transform picks its algorithm from
-# that. HEALPix and the reduced-Gaussian rings are iso-latitude without being tensor products, so a split
-# on the grid's Julia type alone cannot express them and sends them to the per-point projection where a
-# per-ring factorization applies.
+# Spherical layout routing, from how FlowGeometries reports a grid's cells lying on iso-latitude rings.
 # -----------------------------------------------------------------------------
 
-"""Tensor-product `(nlon, nlat)` sphere: one longitude axis shared by every latitude."""
-struct TensorSphere end
-
-"""Iso-latitude rings whose longitude count varies by ring (HEALPix, reduced Gaussian)."""
-struct RingSphere end
-
-"""No iso-latitude structure: a point cloud (Fibonacci, cubed-sphere, icosahedral, Yin-Yang)."""
-struct ScatteredSphere end
-
 """
-    _sph_sampling(grid) -> AbstractSphericalSampling or nothing
+    _sph_layout(grid) -> FlowGeometries.Grids.AbstractRingStructure
 
-The grid's own node-set recipe. A structured grid records one and carries it in its TYPE, so the traits
-read from it fold at compile time. A `HEALPixGrid` answers from its resolution parameter, `nside` fixing
-its recipe entirely. Anything else records none.
+Which spherical transform `grid` takes, named by `FlowGeometries.Grids.ring_structure`: `TensorRings()`
+is the tensor path, one longitude matrix shared by complete latitude rows under a sphere's latitude
+quadrature; `IsoLatitudeRings()` the ring path, a longitude sum per ring; `NoRings()` the per-point
+projection. A tensor grid with a mask, whose rows are incomplete, or on a spheroid, whose latitudes are
+geodetic, takes the ring path.
 """
-_sph_sampling(g::FlowGeometries.Grids.AbstractGrid) = FlowGeometries.Grids.sampling(g)
-_sph_sampling(g::FlowGeometries.Grids.HEALPixGrid) =
-    FlowGeometries.SphericalSampling.HEALPixSampling(FlowGeometries.Grids.nside(g))
+_sph_layout(g::FlowGeometries.Grids.AbstractGrid) = _sph_layout(FlowGeometries.Grids.ring_structure(g), g)
+_sph_layout(s::FlowGeometries.Grids.AbstractRingStructure, _) = s
+_sph_layout(::FlowGeometries.Grids.TensorRings, g) =
+    _tensor_layout(FlowGeometries.Grids.mask(g), FlowGeometries.Grids.grid_geometry(g))
 
-"""
-    _sph_layout(grid) -> TensorSphere | RingSphere | ScatteredSphere
+_tensor_layout(::FlowGeometries.Grids.AllActive, ::FlowGeometries.Geometry.AbstractSphericalGeometry) =
+    FlowGeometries.Grids.TensorRings()
+_tensor_layout(_, _) = FlowGeometries.Grids.IsoLatitudeRings()
 
-Which spherical algorithm `grid` admits, taken from its sampling's declared traits.
-"""
-function _sph_layout(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry})
-    s = _sph_sampling(g)
-    s === nothing && return ScatteredSphere()
-    FlowGeometries.SphericalSampling.is_tensor_product(s) && return TensorSphere()
-    FlowGeometries.SphericalSampling.is_iso_latitude(s) && return RingSphere()
-    return ScatteredSphere()
-end
-
-# A structured spherical grid stores `(λ, φ)` axes, so it is a tensor product by construction, whether or
-# not it records the sampling that generated them. A grid built from raw axes therefore stays on the
-# tensor path and reaches `_sht_weights`, which states that its latitude quadrature is undetermined.
-_sph_layout(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry}) =
-    _structured_layout(FlowGeometries.Grids.mask(g))
-
-_structured_layout(::FlowGeometries.Grids.AllActive) = TensorSphere()
-
-# The tensor path shares one longitude matrix across every latitude, which describes a complete longitude
-# row. A mask leaves partial rows, and the latitudes are iso-latitude rings, so a masked structured grid
-# takes the ring path, whose longitude sum runs per ring and skips inactive cells.
-_structured_layout(::AbstractArray{Bool}) = RingSphere()
-
-# A structured spherical grid's rings are its latitude rows, in the longitude-fastest order
-# `_sph_points` and the field layout both use.
-_nrings(g::FlowGeometries.Grids.AbstractStructuredGrid{<:SphericalHarmonicGeometry}) =
-    length(FlowGeometries.Grids.coordinates(g, 2))
-function _ring_range(g::FlowGeometries.Grids.AbstractStructuredGrid{<:SphericalHarmonicGeometry},
-        r::Int)
-    nlon = length(FlowGeometries.Grids.coordinates(g, 1))
-    return ((r - 1) * nlon + 1):(r * nlon)
-end
-
-# A `RingGrid` holds arbitrary per-ring latitudes and counts, so it records no sampling whose traits could
-# be read; it answers the ring accessors itself.
-_sph_layout(::FlowGeometries.Grids.RingGrid) = RingSphere()
-
-# A spheroid's latitude rows are iso-latitude — `_colatitude` reads the same value along a row — so a
-# structured spheroid grid takes the ring path, whose weight is each ring's own measure. A point set with
-# no such rows takes the per-point projection.
-_sph_layout(::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry}) =
-    ScatteredSphere()
-_sph_layout(::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry}) =
-    RingSphere()
-
-# The sampling whose latitude quadrature a factorized path may use. A sampling states its rule for a
-# SPHERE's colatitudes, and a spheroid's directions are the geocentric ones, so a spheroid grid states
-# none and its rings take their own measure as the rule.
-_quadrature_sampling(g::FlowGeometries.Grids.AbstractGrid) = _sph_sampling(g)
+# The sampling whose band limit the ring path checks a degree against. A sampling states its rule for a
+# sphere's colatitudes, and a spheroid's directions are the geocentric ones, so a spheroid grid states none.
+_quadrature_sampling(g::FlowGeometries.Grids.AbstractGrid) = FlowGeometries.Grids.sampling(g)
 _quadrature_sampling(::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractEllipsoidalGeometry}) =
     nothing
 
-# Ring count and a ring's slice of the flattened point vector. `RingGrid` answers both directly; a HEALPix
-# grid answers through its sampling, the grid-level accessors having methods for `RingGrid` alone
-# (FlowGeometries.jl#18 proposes forwarding them).
-_nrings(g::FlowGeometries.Grids.RingGrid) = FlowGeometries.Grids.nrings(g)
-_ring_range(g::FlowGeometries.Grids.RingGrid, r::Int) = FlowGeometries.Grids.ring_range(g, r)
-_nrings(g::FlowGeometries.Grids.HEALPixGrid) =
-    FlowGeometries.SphericalSampling.nrings(_sph_sampling(g))
-_ring_range(g::FlowGeometries.Grids.HEALPixGrid, r::Int) =
-    FlowGeometries.SphericalSampling.ring_range(_sph_sampling(g), r)
-
 # -----------------------------------------------------------------------------
-# Covered extent. A grid's mask says which cells participate, and `size`/`length` report the FULL shape
-# (`Base.size(grid) = size(mask(grid))`), so the extent a transform actually integrates over is the
-# active cells' measure. Whether a grid carries a mask is part of its type (`AllActive{N}` against a
-# `BitVector`), so the unmasked form resolves at compile time onto the measure's own specialized `sum`.
+# Masked fields. A grid's mask says which cells participate; the extent a transform integrates over is
+# `FlowGeometries.Grids.covered_area`.
 # -----------------------------------------------------------------------------
 
 """
@@ -371,11 +266,9 @@ _ring_range(g::FlowGeometries.Grids.HEALPixGrid, r::Int) =
 
 `field` with its inactive cells set to zero, or `field` itself where every cell is active.
 
-A transform that consumes complete longitude rows — a library SHT on its own grid, or a longitude `rfft`
-— is linear in the field, so zeroing an inactive cell's datum removes it from the sum exactly, matching
-what the per-point paths get by skipping it. The weights stay the sampling's own, so the active cells
-still carry their own solid angles and total the covered one. Writing zero also clears a `NaN`, which
-masked data commonly holds.
+A transform consuming complete longitude rows (a library SHT on its own grid, a longitude `rfft`) is
+linear in the field, so a zeroed datum drops out of its sum exactly, and a `NaN` under the mask is
+cleared. The weights stay the sampling's own.
 """
 _zeroed_inactive(field, g) = _zeroed_inactive(field, FlowGeometries.Grids.mask(g))
 
@@ -394,86 +287,131 @@ function _zeroed_inactive(field, mask::AbstractArray{Bool})
 end
 
 """
-    covered_area(grid) -> T
+    AbstractInactiveCells
 
-Total measure of the cells that participate: the extent a transform over `grid` integrates over.
-
-Equal to `sum(measure(grid))` on an unmasked grid — `4πR²` for a layout tiling the whole sphere, which a
-`GridMeasure` answers without visiting a cell — and the active cells' share of it under a mask.
+How a masked spherical grid's inactive cells enter a transform, passed as `inactive`: [`ZeroFill`](@ref)
+or [`Exclude`](@ref).
 """
-covered_area(g::FlowGeometries.Grids.AbstractGrid) = _covered_area(FlowGeometries.Grids.mask(g), g)
-
-# No mask: the measure's own `sum`, which is `O(Σ Nᵈ)` separable, `O(nrings)` ring-wise, `O(1)` formulaic.
-_covered_area(::FlowGeometries.Grids.AllActive, g) = sum(FlowGeometries.Grids.measure(g))
-
-function _covered_area(mask::AbstractArray{Bool}, g)
-    m = FlowGeometries.Grids.measure(g)
-    T = eltype(g)
-    s = zero(T)
-    @inbounds for i in eachindex(mask)
-        mask[i] && (s += T(m[i]))
-    end
-    return s
-end
+abstract type AbstractInactiveCells end
 
 """
-    sky_fraction(grid) -> T
+    ZeroFill <: AbstractInactiveCells
 
-Fraction of `grid`'s cells' total measure that participates: `covered_area(grid) / sum(measure(grid))`.
-One on an unmasked grid. On a partial-sky spherical grid this is `f_sky`, so a caller wanting the
-full-sphere-normalized convention scales coefficients by `inv(sky_fraction(grid))`.
+Inactive cells count as zero: the transform of the field extended by zero over the whole grid. The
+quadrature reads the grid's own weights, the inactive cells' contributing nothing, and the least-squares
+fit (`solve = true`) runs over every node, an inactive one reading zero.
 """
-function sky_fraction(g::FlowGeometries.Grids.AbstractGrid)
-    total = sum(FlowGeometries.Grids.measure(g))
-    return covered_area(g) / total
+struct ZeroFill <: AbstractInactiveCells end
+
+"""
+    Exclude <: AbstractInactiveCells
+
+Inactive cells are left out: the quadrature or the fit over the active cells as their own point set. The
+quadrature reads the active cells' weights rescaled to the whole grid's total ([`_inactive_scale`](@ref)),
+as a grid of the active cells alone weighs them, and the least-squares fit (`solve = true`) runs over the
+active nodes.
+"""
+struct Exclude <: AbstractInactiveCells end
+
+"""
+    _inactive_scale(inactive, grid, ::Type{FT}; sampling = nothing, weights = nothing) -> FT
+
+The factor on a spherical quadrature over `grid` under `inactive`: one under [`ZeroFill`](@ref) or with
+every cell active, and under [`Exclude`](@ref) the total of the grid's weights unmasked over the total of
+its active cells' ([`_sph_point_weights`](@ref)).
+"""
+_inactive_scale(::ZeroFill, g, ::Type{FT}; sampling = nothing, weights = nothing) where {FT} = one(FT)
+_inactive_scale(::Exclude, g, ::Type{FT}; sampling = nothing, weights = nothing) where {FT} =
+    _inactive_scale(FlowGeometries.Grids.mask(g), g, FT, sampling, weights)
+_inactive_scale(::FlowGeometries.Grids.AllActive, g, ::Type{FT}, sampling, weights) where {FT} = one(FT)
+_inactive_scale(::AbstractArray{Bool}, g, ::Type{FT}, sampling, weights) where {FT} =
+    _unmasked_total(g, FT, sampling, weights) / FT(sum(_sph_point_weights(g, FT; sampling, weights)))
+
+# The total of a spherical grid's weights with every cell active: the latitude rule times `2π` on a
+# structured sphere, `4π` for the grid's own node weights, the sum of explicit ones.
+_unmasked_total(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+    ::Type{FT}, sampling, weights) where {FT} =
+    FT(2π) * FT(sum(_sht_weights(g, length(FlowGeometries.Grids.coordinates(g, 2)); sampling, weights)))
+_unmasked_total(::FlowGeometries.Grids.AbstractGrid, ::Type{FT}, sampling, weights) where {FT} =
+    weights === nothing ? FT(4π) : FT(sum(weights))
+
+"""
+    _inactive_weights(inactive, grid, ::Type{FT}; sampling = nothing, weights = nothing) -> weights
+
+The `weights` a spherical quadrature over `grid` reads under `inactive`: `weights` itself where
+[`_inactive_scale`](@ref) is one, and otherwise the grid's weights times it, per latitude on a structured
+sphere and per node elsewhere, as `weights` is read there.
+"""
+function _inactive_weights(s::AbstractInactiveCells, g, ::Type{FT}; sampling = nothing,
+        weights = nothing) where {FT}
+    c = _inactive_scale(s, g, FT; sampling, weights)
+    isone(c) && return weights
+    return c .* _base_weights(g, FT, sampling, weights)
 end
 
-# Per-ring latitude weights where the sampling defines them, else `nothing`. A sampling may define no
-# `latitude_weights` method at all (an equal-area pixelization), or define one that declines for its own
-# reasons (McEwen–Wiaux states that the sine-series rule is not exact on its nodes).
-# Which rule a ring's weight comes from, by DISPATCH: each method returns one concrete type, so this is
-# type-stable per specialization and costs no method-table query.
-#
-# `AbstractSpectralQuadratureSampling` is exactly the set with a latitude rule (Gauss–Legendre,
-# Driscoll–Healy, Clenshaw–Curtis, McEwen–Wiaux). Everything else — an equal-area pixelization, a lat–lon
-# grid, a `RingGrid` recording no sampling — takes its own cell measure, which for a `RingGrid` is built
-# from the Gaussian weights already. McEwen–Wiaux states the method and declines the rule, so it raises
-# from here, as the tensor path does for that grid unmasked.
-_ring_latitude_weights(::Type{FT}, ::Nothing, nr::Int) where {FT} = nothing
-_ring_latitude_weights(::Type{FT}, ::FlowGeometries.SphericalSampling.AbstractSphericalSampling,
-    nr::Int) where {FT} = nothing
-_ring_latitude_weights(::Type{FT},
-    s::FlowGeometries.SphericalSampling.AbstractSpectralQuadratureSampling, nr::Int) where {FT} =
-    FlowGeometries.SphericalSampling.latitude_weights(FT, s, nr)
+_base_weights(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+    ::Type{FT}, sampling, weights) where {FT} =
+    FT.(_sht_weights(g, length(FlowGeometries.Grids.coordinates(g, 2)); sampling, weights))
+_base_weights(g::FlowGeometries.Grids.AbstractGrid, ::Type{FT}, sampling, weights) where {FT} =
+    collect(FT, _sph_point_weights(g, FT; sampling, weights))
 
-# The two rules as separate methods, so the choice above is resolved by one dispatch and each ring loop
-# sees a concrete type.
-function _fill_ring_weights!(w, ::Nothing, ranges, m, sc, ::Type{FT}) where {FT}
-    @inbounds for r in eachindex(w)
-        w[r] = FT(m[first(ranges[r])]) * sc
-    end
-    return w
-end
+"""
+    _transform_nodes(inactive, grid, solve) -> (act, live)
 
-# `latitude_weights` carries `Σw = 2`, so `wⱼ·(2π/nlonⱼ)` totals `4π` over the rings with no further
-# normalization — the rule `latitude_weights`' own docstring states for ring grids.
-function _fill_ring_weights!(w, wlat::AbstractVector, ranges, m, sc, ::Type{FT}) where {FT}
-    @inbounds for r in eachindex(w)
-        w[r] = FT(wlat[r]) * (FT(2π) / length(ranges[r]))
-    end
-    return w
-end
+The nodes a spherical transform over `grid` holds under `inactive`, `act` their indices (`nothing` for
+every node), and which of them read the field, `live` a flag per held node (`nothing` where every one
+does). A quadrature gives an inactive node no weight, so it holds the active nodes. A least-squares fit
+(`solve`) holds every node under [`ZeroFill`](@ref), an inactive one reading zero, and the active nodes
+under [`Exclude`](@ref).
+"""
+_transform_nodes(s::AbstractInactiveCells, g::FlowGeometries.Grids.AbstractGrid, solve::Bool) =
+    _transform_nodes(s, FlowGeometries.Grids.mask(g), solve)
+_transform_nodes(::AbstractInactiveCells, ::FlowGeometries.Grids.AllActive, ::Bool) = (nothing, nothing)
+_transform_nodes(s::AbstractInactiveCells, mask::AbstractArray{Bool}, solve::Bool) =
+    (solve && s isa ZeroFill) ? (nothing, vec(mask)) : (findall(vec(mask)), nothing)
+
+# `v` at the points `act`, or `v` itself where every point is active.
+_at_points(v::AbstractVector, ::Nothing) = v
+_at_points(v::AbstractVector, act::AbstractVector{Int}) = v[act]
+
+# -----------------------------------------------------------------------------
+# The coefficient box of a Cartesian transform.
+# -----------------------------------------------------------------------------
+
+"""
+    mode_box(grid, ms, ::Val{real}) -> NTuple
+
+The extents of the coefficient box an `ms`-mode Cartesian transform of a real field on `grid` fills: an
+even `ms[d]` on an axis whose samples tell `+ms[d]/2` from `-ms[d]/2` apart widens to `ms[d] + 1`
+(`FlowTransformBindings.box_size`), so that the packed half reaches every conjugate partner. A uniform axis
+of a structured grid transformed at its own length samples the two as one mode and keeps `ms[d]`. A
+complex field's box is `ms`.
+"""
+mode_box(g, ms::NTuple{D, Int}, ::Val{true}) where {D} =
+    FTB.box_size(ms, ntuple(d -> !_nyquist_shared(g, d, ms[d]), Val(D)))
+mode_box(g, ms::NTuple{D, Int}, ::Val{false}) where {D} = ms
+
+"""
+    series_modes(grid, ms, ::Val{real}) -> NTuple
+
+The mode counts, in FFT order, of the complex series an `ms`-mode synthesis on `grid` evaluates: for a
+real field `mode_box(grid, ms, Val(true))[1]` on axis 1 and `ms` on the others, whose real part, with the
+coefficients `DirectSum.native_coefficients!` writes, is the series of the packed half over the whole
+coefficient box; `ms` for a complex field.
+"""
+series_modes(g, ms::NTuple{D, Int}, ::Val{true}) where {D} = (mode_box(g, ms, Val(true))[1], Base.tail(ms)...)
+series_modes(g, ms::NTuple{D, Int}, ::Val{false}) where {D} = ms
+
+_nyquist_shared(g::FlowGeometries.Grids.AbstractStructuredGrid, d::Int, m::Int) =
+    FlowGeometries.Grids.isuniform(g, d) && m == size(g, d)
+_nyquist_shared(::FlowGeometries.Grids.AbstractGrid, ::Int, ::Int) = false
 
 """
     _warn_bandlimit(sampling, nlat, lmax)
 
-Warn when degree `lmax` exceeds what `nlat` latitude samples of `sampling` support, so the coefficients
-above it are not resolved by that grid's quadrature.
-
-Warned, never raised: an over-resolved request still returns coefficients, and a caller may want them.
-The relation is the sampling's own `SphericalSampling.bandlimit` — notably `nlat÷2 − 1` for
-Driscoll–Healy against `nlat − 1` for Gauss–Legendre and Clenshaw–Curtis. `maxlog = 1` caps this per
-logger instance, so a fresh logger still observes it.
+Warn, once per logger, when degree `lmax` exceeds what `nlat` latitude samples of `sampling` resolve; the
+coefficients are still returned. The relation is the sampling's own `SphericalSampling.bandlimit`:
+`nlat÷2 − 1` for Driscoll–Healy, `nlat − 1` for Gauss–Legendre and Clenshaw–Curtis.
 """
 function _warn_bandlimit(s, nlat::Integer, lmax::Integer)
     lim = _bandlimit_or_nothing(s, nlat)
@@ -483,6 +421,21 @@ function _warn_bandlimit(s, nlat::Integer, lmax::Integer)
         sampling = nameof(typeof(s)), nlat, lmax, bandlimit = lim,
         exact_quadrature = FlowGeometries.SphericalSampling.admits_exact_bandlimited_quadrature(s),
         maxlog = 1)
+    return nothing
+end
+
+"""
+    _warn_longitude_bandlimit(nlon, lmax)
+
+Warn when `nlon` longitudes cannot separate the orders `|m| ≤ lmax`. The trigonometric polynomials of
+degree `lmax` span `2lmax + 1` dimensions, so on fewer longitudes one of them vanishes at every node and
+the orders alias; on equispaced longitudes `cos(mλ)` and `cos((nlon − m)λ)` take the same samples. Warned,
+as [`_warn_bandlimit`](@ref) warns for the latitudes.
+"""
+function _warn_longitude_bandlimit(nlon::Integer, lmax::Integer)
+    2 * lmax + 1 <= nlon && return nothing
+    @warn("requested spherical order exceeds what this grid's longitudes resolve; orders above " *
+          "(nlon - 1) ÷ 2 alias onto lower ones", nlon, lmax, resolved = (nlon - 1) ÷ 2, maxlog = 1)
     return nothing
 end
 
@@ -500,58 +453,38 @@ function _bandlimit_or_nothing(s, nlat::Integer)
 end
 
 """
-    _ring_table(grid, ::Type{FT}; lmax=nothing) -> (; ranges, θ, w, λ)
+    _ring_table(grid, ::Type{FT}; lmax=nothing, sampling=nothing, weights=nothing) -> (; ranges, θ, λ, wpt)
 
-Per iso-latitude ring: its slice of the flattened point vector, its colatitude, and the per-point
-quadrature weight inside it; plus every point's longitude.
-
-Colatitude and the weight are read at the ring's first point, both being constant along a ring. The
-weight comes from `Grids.measure`, rescaled so the weights total `4π` — the transform's convention, the
-same total [`_sph_node_weights`](@ref) carries. A ring layout's measure is a `RingwiseVector` and an
-equal-area one's an `Axes.ConstantVector`, whose `sum` is `O(nrings)` and `O(1)`, so no dense
-`∏N`-sized measure is built.
+Per iso-latitude ring: its slice of the flattened point vector and its colatitude, read at the ring's first
+point; plus every point's longitude and quadrature weight. The weights are
+[`_sph_point_weights`](@ref)`(grid, FT; sampling, weights)`, the ones the per-point projection reads, so
+the ring transform is that projection reassociated for every quadrature a caller can state.
 """
-function _ring_table(g, ::Type{FT}; lmax = nothing) where {FT}
-    nr = _nrings(g)
+function _ring_table(g, ::Type{FT}; lmax = nothing, sampling = nothing, weights = nothing) where {FT}
+    nr = FlowGeometries.Grids.nrings(g)
     if lmax !== nothing
-        s = _quadrature_sampling(g)
+        s = sampling === nothing ? _quadrature_sampling(g) : sampling
         s === nothing || _warn_bandlimit(s, nr, lmax)
     end
-    λraw, φlat = FlowGeometries.Grids.materialize(g)
-    m = FlowGeometries.Grids.measure(g)
-    total = sum(m)
-    (isfinite(total) && total > 0) || throw(ArgumentError(
-        "grid measure sums to $total, so it cannot set quadrature weights; pass `weights=`."))
-    sc = FT(4π) / FT(total)
-    # A sampling that defines latitude weights states the QUADRATURE for its rings, which is a different
-    # thing from the geometric cell area `measure` reports: Gaussian weights are chosen for exactness, so
-    # on a Gauss–Legendre grid the two differ and only the former integrates a band-limited field
-    # exactly. Where a sampling defines none — HEALPix, whose equal-area pixel is its own weight, and a
-    # `RingGrid`, whose `ring_area` is built from the Gaussian weights already — the measure is the rule.
     ranges = Vector{UnitRange{Int}}(undef, nr)
     θ = Vector{FT}(undef, nr)
-    w = Vector{FT}(undef, nr)
     @inbounds for r in 1:nr
-        rr = _ring_range(g, r)
-        ranges[r] = rr
-        θ[r] = _colatitude(g, FT(φlat[first(rr)]))
+        ranges[r] = FlowGeometries.Grids.ring_range(g, r)
+        θ[r] = _colatitude(g, FT(FlowGeometries.Grids.ring_latitude(g, r)))
     end
-    _fill_ring_weights!(w, _ring_latitude_weights(FT, _quadrature_sampling(g), nr), ranges, m, sc, FT)
-    # A ring's weight is one number, so a partially masked ring cannot be expressed by zeroing it; the
-    # mask travels with the table and the longitude sum skips inactive points instead.
-    return (; ranges, θ, w, λ = FT.(λraw), mask = FlowGeometries.Grids.mask(g))
+    return (; ranges, θ, λ = FT.(first(FlowGeometries.Grids.materialize(g))),
+        wpt = _sph_point_weights(g, FT; sampling = sampling, weights = weights))
 end
 
 """
-    _sht_weights(grid, nlat; sampling=nothing, weights=nothing) -> Vector
+    _sht_weights(grid, nlat; sampling=nothing, weights=nothing, lmax=nothing) -> Vector
 
 Per-colatitude quadrature weights for a structured spherical `grid`, from its own node-set recipe
 `FlowGeometries.Grids.sampling(grid)` via `SphericalSampling.latitude_weights` (`Σw = 2`, carrying the
-`sinθ` Jacobian — the transform's convention). `weights` or `sampling` override it.
+`sinθ` Jacobian). `weights` or `sampling` override it; `lmax` is checked against the band limit.
 
-The recipe is the only thing that determines the quadrature: Gauss–Legendre and an arbitrary lat–lon
-grid are the same coordinates to round-off, and only the recipe says which rule is exact on them. A grid
-built from raw axes records none, so it raises here and the caller states the quadrature.
+Coordinates alone do not fix the quadrature, so a grid built from raw axes, which records no recipe,
+raises unless the caller states one.
 """
 function _sht_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGeometry},
         nlat::Integer;
@@ -568,34 +501,65 @@ function _sht_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGe
 end
 
 """
+    _sph_point_weights(grid, ::Type{FT}; sampling=nothing, weights=nothing) -> AbstractVector{FT}
+
+Per-point quadrature weights of a spherical `grid` in the field's column-major order, an inactive point at
+zero: on a structured sphere the latitude rule of [`_sht_weights`](@ref) times `2π/nlon`, and on every
+other grid the per-node weights of [`_sph_node_weights`](@ref). Both total `4π` over an unmasked grid.
+`sampling` and `weights` override the grid's own rule as those two state, so `weights` holds one value per
+latitude on a structured sphere and one per node elsewhere.
+"""
+function _sph_point_weights(
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
+        ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
+    nlon = length(FlowGeometries.Grids.coordinates(g, 1))
+    nlat = length(FlowGeometries.Grids.coordinates(g, 2))
+    wlat = _sht_weights(g, nlat; sampling = sampling, weights = weights)
+    length(wlat) == nlat || throw(DimensionMismatch("$(length(wlat)) latitude weights for $nlat latitudes"))
+    dλ = FT(2π) / nlon
+    mask = FlowGeometries.Grids.mask(g)
+    wpt = Vector{FT}(undef, nlon * nlat)
+    # Point `p` is `iλ + (jφ-1)·nlon`, the mask's own linear order.
+    @inbounds for p in eachindex(wpt)
+        wpt[p] = mask[p] ? FT(wlat[(p - 1) ÷ nlon + 1]) * dλ : zero(FT)
+    end
+    return wpt
+end
+
+_sph_point_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGeometry}, ::Type{FT};
+    sampling = nothing, weights = nothing) where {FT} = _sph_node_weights(g, FT, length(g), weights)
+
+"""
     _sph_node_weights(grid, ::Type{FT}, N, weights) -> Vector{FT}
 
 Per-node quadrature weights for a scattered spherical `grid`, from its own per-node measure rescaled to
 sum to `4π` — the transform's convention, the same total the structured path's
-`latitude_weights ⊗ 2π/nlon` carries. `weights` overrides it. Only the relative measures matter, so a
-grid of true dual-cell areas integrates exactly and a grid of equal-area nodes gives `4π/N`.
+`latitude_weights ⊗ 2π/nlon` carries. `weights` overrides it, one per node, an inactive node still at
+zero. Only the relative measures matter, so a grid of true dual-cell areas integrates exactly and a grid
+of equal-area nodes gives `4π/N`.
 """
 function _sph_node_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGeometry},
         ::Type{FT}, N::Integer, weights) where {FT}
-    weights === nothing || return FT.(weights)
+    if weights !== nothing
+        length(weights) == N || throw(DimensionMismatch("$(length(weights)) weights for $N nodes"))
+        return _masked_weights(FlowGeometries.Grids.mask(g), FT.(weights), one(FT), FT)
+    end
     m = FlowGeometries.Grids.measure(g)
     length(m) == N || throw(DimensionMismatch(
         "grid measure has $(length(m)) entries for $N nodes"))
     s = sum(m)
     (isfinite(s) && s > 0) || throw(ArgumentError(
         "grid measure sums to $s, so it cannot set quadrature weights; pass `weights=`."))
-    # Dividing by the FULL measure total turns each cell's measure into its solid angle on the unit
-    # sphere, so summing the active ones gives the covered solid angle — `4π` on an unmasked grid and
-    # `4π·f_sky` under a mask, which is the convention `covered_area` states.
+    # Divided by the whole grid's measure, each cell's measure is its solid angle on the unit sphere, and
+    # the active ones total the covered solid angle: `4π` unmasked, `4π·f_sky` under a mask.
     return _masked_weights(FlowGeometries.Grids.mask(g), m, FT(4π) / FT(s), FT)
 end
 
 # No mask: every cell participates, so the scaled measure stands as it is (lazy where separable).
 _masked_weights(::FlowGeometries.Grids.AllActive, m, c, ::Type{FT}) where {FT} = vec(c .* m)
 
-# An inactive node gets weight zero, which drops it from every quadrature sum without any loop or kernel
-# knowing about masks — the per-point paths, the threaded accumulators and the device kernel all read
-# these weights. The zero pattern is arbitrary, so this one materializes.
+# An inactive node gets weight zero, which drops it from every quadrature sum reading these weights. The
+# zero pattern is arbitrary, so this materializes.
 function _masked_weights(mask::AbstractArray{Bool}, m, c, ::Type{FT}) where {FT}
     w = Vector{FT}(undef, length(m))
     @inbounds for i in eachindex(w)

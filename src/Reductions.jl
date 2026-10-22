@@ -9,17 +9,16 @@ export isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spec
     cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
 
 # =============================================================================
-# Reductions are BATCH-PRESERVING. Coefficients are `(spectral…, batch…)` (the first `D = length(ks)`
-# dims are spectral; the rest are batch). A reduction bins/integrates over the spectral dims and keeps
-# every batch dim, returning `E(kbin, batch…)` — so a whole `(kx, ky, comp, z, t)` stack reduces in one
-# vectorized pass with no per-slice reshape loop. `dims=` opts into folding designated batch axes into
-# the energy (e.g. `dims=D+1` sums the vector-component axis → a kinetic-energy spectrum).
+# Reductions preserve the batch. Coefficients are `(spectral…, batch…)`, the first `D = length(ks)` dims
+# spectral; a reduction bins or integrates the spectral dims and keeps every batch dim, returning
+# `E(kbin, batch…)`. `dims=` folds designated batch axes into the energy (`dims=D+1` sums the
+# vector-component axis into a kinetic-energy spectrum).
 # =============================================================================
 
 # Wavenumber sums over the heterogeneous axis tuple, folded by recursion so `ks[d]` with a runtime `d`
 # never boxes: `ksq` is `Σ_d k_d(I_d)²`, `kmax` the largest shell the mode box holds whole
-# (`min_d max|k_d|`), `kcorner` the box's corner `√(Σ_d max|k_d|²)`, `dk_product` the product of the
-# spacings of the axes in `dims`, and `neg_rest` the indices of `-k_d` on the axes `2:D`.
+# (`min_d max|k_d|`), `kcorner` the box's corner `√(Σ_d max|k_d|²)`, and `dk_product` the product of the
+# spacings of the axes in `dims`.
 @inline ksq(::Type{T}, ks::Tuple, I::CartesianIndex) where {T} = ksq(T, ks, I, 1)
 @inline function ksq(::Type{T}, ks::Tuple, I::CartesianIndex, d::Int) where {T}
     kv = T(first(ks)[I[d]])
@@ -38,11 +37,6 @@ end
 @inline _dkp(::Type{T}, ks::Tuple, dims::Tuple, d::Int) where {T} =
     (d in dims ? T(first(ks)[2] - first(ks)[1]) : one(T)) * _dkp(T, Base.tail(ks), dims, d + 1)
 @inline _dkp(::Type{T}, ::Tuple{}, ::Tuple, ::Int) where {T} = one(T)
-
-@inline neg_rest(ks::Tuple, I::CartesianIndex) = _neg_rest(Base.tail(ks), I, 2)
-@inline _neg_rest(ks::Tuple, I::CartesianIndex, d::Int) =
-    (FTB.neg_index(first(ks), I[d]), _neg_rest(Base.tail(ks), I, d + 1)...)
-@inline _neg_rest(::Tuple{}, ::CartesianIndex, ::Int) = ()
 
 # Default radial bin count: half the shortest axis's full mode count, the same for a real field's packed
 # half as for a complex field's full spectrum.
@@ -110,35 +104,6 @@ function _shell_values!(E::AbstractArray, nmodes::AbstractVector{T}, dk::T, ks::
     return E
 end
 
-"""
-    _native_energy(ks, coeffs, I, twin) -> T
-
-`|C|²` over the native modes the stored mode `I` stands for: `I` itself, and on a halved axis its
-`k₁ < 0` partner, at the same `|k|`. The partner's magnitude is that of the stored `(k₁, −k_rest)`, or of
-the axis's `FlowTransformBindings.NyquistTwin` where `−k_rest` leaves the native axes. A stored `+N₁/2`
-is not itself a native mode.
-"""
-@inline function _native_energy(ks::Tuple, C::AbstractArray{Complex{T}, N}, I::CartesianIndex{N},
-        twin) where {T, N}
-    FTB.is_halved(first(ks)) || return abs2(C[I])
-    D = length(ks)
-    e = FTB.is_nyquist(first(ks), I[1]) ? zero(T) : abs2(C[I])
-    I[1] > 1 || return e
-    q = twin === nothing ? 0 : FTB.nyquist_mask(ks, I)
-    q != 0 && return e + abs2(twin[q, I])
-    J = CartesianIndex(I[1], neg_rest(ks, I)..., ntuple(i -> I[D + i], Val(N - D))...)
-    return e + abs2(C[J])
-end
-
-function _native_power(ks_phys::Tuple, C::AbstractArray{Complex{T}, N}) where {T, N}
-    P = Array{T}(undef, size(C))
-    twin = FTB.axis_twin(first(ks_phys))
-    @inbounds for I in CartesianIndices(C)
-        P[I] = _native_energy(ks_phys, C, I, twin)
-    end
-    return P
-end
-
 # =============================================================================
 # Isotropic (radial) energy spectrum — E(k, batch…)
 # =============================================================================
@@ -151,12 +116,13 @@ end
 length(ks_phys)` spectral dims and **preserving all batch dims** → `(k_bins, E)` with `E` of shape
 `(num_bins, batch…)`. `dims` (absolute batch-dim index/indices `> D`) folds those axes into the energy
 (e.g. `dims=D+1` sums a vector-component axis into a single kinetic-energy spectrum). A bin collects
-`½|C|²` over its native modes, a packed half standing for both signs of `k₁`.
+`½|C|²` over its modes of the coefficient box, a packed half standing for both signs of `k₁`.
 
 `cutoff = true` bins the modes with `|k| ≤ k_max = min_d max|k_d|`, the shells the mode box holds whole.
 `cutoff = false` bins every mode, the bins continuing at the same width to the corner of the mode box;
-under `ShellSum` the bins then hold `½ Σ |C|²` over the whole spectrum, `½⟨|f|²⟩` for a transform on a
-uniform grid. `num_bins = 0` takes half the shortest axis's full mode count up to `k_max`.
+under `ShellSum` the bins then hold `½ Σ |C|²` over the whole coefficient box, `½⟨|f|²⟩` for a transform
+on a uniform grid at its own length. `num_bins = 0` takes half the shortest axis's full mode count up to
+`k_max`.
 
 `convention.estimator` takes the bin's sum (`ShellSum()`, the default) or its mode average times a whole
 shell's mode count (`ModeAverage()`); `convention.scaling` divides by the bin width (`DensityScaling()`,
@@ -171,8 +137,7 @@ function isotropic_spectrum(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}
     N >= D || throw(ArgumentError("coeffs must have ≥ $D spectral dims (got $N)"))
     _radial_sided(convention.sided)
     fold = _fold_dims(dims, D, N)
-    E = cutoff ? abs2.(coeffs) : _native_power(ks_phys, coeffs)
-    P = isempty(fold) ? E : dropdims(sum(E; dims = fold); dims = fold)
+    P = isempty(fold) ? abs2.(coeffs) : dropdims(sum(abs2, coeffs; dims = fold); dims = fold)
     return cutoff ? _bin_isotropic(ks_phys, P, num_bins, convention, Val(true)) :
                     _bin_isotropic(ks_phys, P, num_bins, convention, Val(false))
 end
@@ -189,11 +154,9 @@ _radial_sided(s::Normalization.AbstractSidedness) = throw(ArgumentError(
 _scale_bins!(E, dk, ::Normalization.DensityScaling) = (E ./= dk)
 _scale_bins!(E, dk, ::Normalization.PowerScaling) = E
 
-# Barrier: `P` (real power, shape (ms…, kept_batch…)) has a concrete rank here → type-stable.
-# `Val(true)`: `P` is `|C|²` and each mode carries its fold weight. `k_max = min_d max|k_d|` excludes
-# every `−N_d/2` mode except the axis-aligned one (`|k| = √(k₁² + (N_d/2)²) > k_max` for `k₁ ≠ 0`), and at
-# `k₁ = 0` the Nyquist twins are conjugates, so the mirror fold is exact there on any grid.
-# `Val(false)`: `P` is already the native energy of `_native_power`.
+# Barrier: `P` (real power `|C|²`, shape (ms…, kept_batch…)) has a concrete rank here → type-stable. Each
+# mode carries its fold weight: the halved axis's mirror holds the partners of the stored modes, at the
+# same `|k|`, and nothing else in the coefficient box. `Val(true)` stops at `k_top = k_max`.
 function _bin_isotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_bins::Int,
         convention::Normalization.SpectralConvention, cut::Val{C}) where {T, NP, C}
     D = length(ks_phys)
@@ -207,9 +170,8 @@ function _bin_isotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_bins::Int,
         bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
         n = T(FTB.mode_fold(ks_phys, I))
         nmodes[bin] += n
-        w = C ? n : one(T)
         for Ib in bat
-            E[bin, Ib] += T(0.5) * w * P[I, Ib]
+            E[bin, Ib] += T(0.5) * n * P[I, Ib]
         end
     end
     _shell_values!(E, nmodes, dk, ks_phys, convention.estimator)
@@ -224,8 +186,7 @@ In-place, allocation-free isotropic spectrum that **preserves all batch dims** (
 preallocated `E` (shape `(nb, batch…)`) and `k_bins` (length `nb`). With the cutoff `nb` bins span
 `[0, k_max]`; with `cutoff = false`, `num_bins` of them span `[0, k_max]` (`0`: the default count) and
 `nb` is the total that reaches the corner of the mode box, the length `isotropic_spectrum` returns.
-Reusable across a time loop with zero steady-state heap traffic. `cutoff` and `convention` are read as
-in [`isotropic_spectrum`](@ref).
+`cutoff` and `convention` are read as in [`isotropic_spectrum`](@ref).
 """
 function isotropic_spectrum!(E::AbstractArray{T}, k_bins::AbstractVector{T}, ks_phys::Tuple,
         coeffs::AbstractArray{Complex{T}, N}; num_bins::Int = 0, cutoff::Bool = true,
@@ -267,7 +228,6 @@ function _fill_isotropic!(E::AbstractArray{T}, k_bins::AbstractVector{T}, ks_phy
     nb, dk, k_top = _radial_extent(ks_phys, req, T, cut)
     fill!(E, zero(T))
     fill!(k_bins, zero(T))
-    twin = FTB.axis_twin(first(ks_phys))
     bat = CartesianIndices(ntuple(i -> size(coeffs, D + i), Val(N - D)))
     @inbounds for I in CartesianIndices(ntuple(d -> size(coeffs, d), Val(D)))
         kmag = sqrt(ksq(T, ks_phys, I))
@@ -276,9 +236,7 @@ function _fill_isotropic!(E::AbstractArray{T}, k_bins::AbstractVector{T}, ks_phy
         n = T(FTB.mode_fold(ks_phys, I))
         k_bins[bin] += n
         for Ib in bat
-            J = CartesianIndex(I, Ib)
-            e = C ? n * abs2(coeffs[J]) : _native_energy(ks_phys, coeffs, J, twin)
-            E[bin, Ib] += T(0.5) * e
+            E[bin, Ib] += T(0.5) * n * abs2(coeffs[CartesianIndex(I, Ib)])
         end
     end
     _shell_values!(E, k_bins, dk, ks_phys, convention.estimator)
@@ -298,8 +256,9 @@ end
                          convention=SpectralConvention())
 
 Anisotropy-resolved 2D energy spectrum `E(k, θ, batch…)` for a 2D field: bin `½|C|²` by wavenumber
-magnitude up to `k_max` and polar angle, preserving batch. Integrating over `θ` recovers the isotropic
-spectrum. Under `ModeAverage()` a bin's mean is scaled by the mode count of its whole annular sector,
+magnitude up to `k_max` and polar angle, preserving batch. The `k = 0` mode has no angle and is spread
+evenly over the `θ` bins of the first `k` bin, so integrating over `θ` recovers the isotropic spectrum
+in every bin. Under `ModeAverage()` a bin's mean is scaled by the mode count of its whole annular sector,
 `(dθ/2)(k₊² − k₋²)/(Δk₁Δk₂)`; `DensityScaling()` divides by `dk·dθ`.
 """
 function anisotropic_spectrum(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N};
@@ -328,7 +287,18 @@ function _bin_anisotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_k_bins::I
         kx = T(ks_phys[1][I[1]])
         ky = T(ks_phys[2][I[2]])
         kmag = sqrt(kx^2 + ky^2)
-        (kmag > k_max || kmag == 0) && continue
+        kmag > k_max && continue
+        if iszero(kmag)
+            # `k = 0` has no direction: its energy spreads evenly over the angles, so the first `k` bin
+            # summed over `θ` holds it whole, as the isotropic spectrum's does.
+            for iθ in 1:num_θ_bins
+                nmodes[1, iθ] += one(T) / num_θ_bins
+                for Ib in bat
+                    E[1, iθ, Ib] += T(0.5) * P[I, Ib] / num_θ_bins
+                end
+            end
+            continue
+        end
         ik = clamp(floor(Int, kmag / dk) + 1, 1, num_k_bins)
         # The halved axis stores its even Nyquist slot as +k₁max, which a full axis labels −k₁max, so
         # that sign gives the angle of the two-sided spectrum.
@@ -433,7 +403,7 @@ function quadspectrum(ks_phys::Tuple, coeffs_f, coeffs_g; kwargs...)
 end
 
 # =============================================================================
-# Transect spectrum — integrate out specific SPECTRAL dims, preserve the rest + batch
+# Transect spectrum: integrate out chosen spectral dims, keep the rest and the batch
 # =============================================================================
 
 """
@@ -443,15 +413,10 @@ Integrate the spectral energy density `½|C|²` along the spectral dimensions `d
 `1:D`), scaling by their wavenumber spacing. Returns `(ks_reduced, E_reduced)` where `E_reduced` has
 the *kept* spectral dims followed by the batch dims.
 
-`Σ E_reduced / ∏dk` over the kept axes is the field's folded Parseval total, whichever axes are kept: a
-kept full axis carries both signs of its wavenumber outright, and a kept halved axis reports `|k₁|` with
-the `−k₁` energy folded in. So a kept full axis's entries at `±k` are equal for a real field's spectrum
-and differ for a complex field's, where the sign carries the propagation direction.
-
-This is the one reduction with no radial cutoff, so it reaches the `−N_d/2` modes whose `k₁ < 0`
-partners are the `+N_d/2` twins. It reads those from the halved axis's
-`FlowTransformBindings.NyquistTwin`, which the transform attaches whenever index negation cannot reach
-them.
+`Σ E_reduced / ∏dk` over the kept axes is the field's folded Parseval total over the coefficient box,
+whichever axes are kept: a kept full axis carries both signs of its wavenumber outright, and a kept halved
+axis reports `|k₁|` with the `−k₁` energy folded in. So a kept full axis's entries at `±k` are equal for a
+real field's spectrum and differ for a complex field's, where the sign carries the propagation direction.
 """
 function transect_spectrum(ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}, dims::Tuple) where {T, N}
     D = length(ks_phys)
@@ -478,10 +443,9 @@ function transect_spectrum!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
     # Column-major linear index into E_reduced (kept spectral dims + all batch dims), built inline so
     # the reduction over the summed spectral dims is allocation-free.
     halved_out = FTB.is_halved(ks_phys[1]) && (1 in dims)
-    # A halved axis that is KEPT reports `|k₁|`, and the field's `−k₁` energy is stored nowhere else, so
+    # A kept halved axis reports `|k₁|`, and the field's `−k₁` energy is stored nowhere else, so
     # each interior stored mode carries its `fold_weight` of 2 (1 at dc and, for even `n₁`, at Nyquist).
     halved_kept = FTB.is_halved(ks_phys[1]) && !(1 in dims)
-    nyquist_twin = FTB.axis_twin(ks_phys[1])
     @inbounds for I in CartesianIndices(coeffs)
         lin = 1
         stride = 1
@@ -492,21 +456,14 @@ function transect_spectrum!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
             end
         end
         if halved_out
-            # Integrating out the halved axis: two weight-1 passes cover the native `k₁` set. Pass 1
-            # takes the stored rows that are themselves native — for even `N₁` the stored `+N₁/2` is not,
-            # since the native set holds `−N₁/2` at that magnitude. Pass 2 takes the `k₁ < 0` rows, which
-            # carry `|C(k₁>0, −k_·)|`. On a `−N_d/2` entry the negation aliases to itself (the
-            # periodic-grid identity), so the axis's twin (the `+N_d/2` value) is read there.
-            FTB.is_nyquist(ks_phys[1], I[1]) || (E_reduced[lin] += T(0.5) * abs2(coeffs[I]))
-            if I[1] > 1
-                q = nyquist_twin === nothing ? 0 : FTB.nyquist_mask(ks_phys, I)
-                if q != 0
-                    E_reduced[lin] += T(0.5) * abs2(nyquist_twin[q, I])
-                else
-                    J = CartesianIndex(ntuple(d -> d == 1 ? I[1] :
-                            (d <= D ? FTB.neg_index(ks_phys[d], I[d]) : I[d]), Val(N)))
-                    E_reduced[lin] += T(0.5) * abs2(coeffs[J])
-                end
+            # Integrating out the halved axis: each stored row stands for itself and, where its fold
+            # weight is 2, for the `k₁ < 0` row at the same kept `k_·`, whose magnitude is that of the
+            # stored `(k₁, −k_·)`.
+            E_reduced[lin] += T(0.5) * abs2(coeffs[I])
+            if FTB.fold_weight(ks_phys[1], I[1]) == 2
+                J = CartesianIndex(ntuple(d -> d == 1 ? I[1] :
+                        (d <= D ? FTB.neg_index(ks_phys[d], I[d]) : I[d]), Val(N)))
+                E_reduced[lin] += T(0.5) * abs2(coeffs[J])
             end
         else
             w = halved_kept ? T(FTB.fold_weight(ks_phys[1], I[1])) : one(T)
@@ -525,10 +482,8 @@ end
     spherical_energy_spectrum(coeffs; lmax=size(coeffs,1)-1)
 
 Degree energy spectrum `E(ℓ, batch…) = ½ Σ_{m=-ℓ}^{ℓ} |C_ℓ^m|²` of spherical-harmonic coefficients
-`(Nθ, Nφ, batch…)`. Returns `(0:lmax, E_l)`, `E_l` of shape `(lmax+1, batch…)`.
-
-Reads real coefficients (what a real field transforms to, the real spherical harmonics being real) and
-complex ones alike; `E_l` carries the real type either way.
+`(Nθ, Nφ, batch…)`. Returns `(0:lmax, E_l)`, `E_l` of shape `(lmax+1, batch…)` and real element type,
+from real or complex coefficients.
 """
 function spherical_energy_spectrum(coeffs::AbstractArray{<:Number, N};
         lmax::Int = size(coeffs, 1) - 1) where {N}
@@ -558,8 +513,8 @@ function _accumulate_degree!(E::AbstractArray{T}, coeffs::AbstractArray{<:Number
     NθNφ = Nθ * Nφ
     B = length(coeffs) ÷ NθNφ
     Lp1 = lmax + 1
-    # Linear indexing (no `reshape`): degree ℓ / order m / batch b lives at
-    # `coeffs[row + (col-1)·Nθ + (b-1)·Nθ·Nφ]`. Avoids the reshape-header alloc under --check-bounds=yes.
+    # Degree ℓ / order m / batch b lives at `coeffs[row + (col-1)·Nθ + (b-1)·Nθ·Nφ]`. Indexed linearly,
+    # since a `reshape` allocates under `--check-bounds=yes`.
     @inbounds for b in 1:B
         cbase = (b - 1) * NθNφ
         ebase = (b - 1) * Lp1

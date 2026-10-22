@@ -1,15 +1,6 @@
-# Independent references: each transform checked against something that shares no code with it.
-#
-# Three kinds of check live here.
-#
-# 1. The factorized direct sum against an INLINE naive double sum. The direct sum is what every other
-#    backend is compared to, so its own reference is written out here in the test file.
-# 2. The hybrid FFT/NUFFT composite against the direct sum. The composite runs an FFT over the uniform
-#    axes and a 1-D NUFFT along each stretched one, so nothing about it is shared with the direct sum.
-# 3. Inverses WITHOUT the direct sum: FFT and FastSphericalHarmonics each round-trip through their own
-#    pair, and the NUFFT/NUFSHT type-2 is checked against an inline evaluation of the mode sum. A NUFFT
-#    type-2 is the ADJOINT of the type-1, so composing them on nonuniform nodes gives `AᴴA`; the
-#    invariant that holds there is the mode sum.
+# Each transform against a reference that shares no code with it: the factorized direct sum and every
+# library over a widened coefficient box against an inline naive sum, the FFT and FastSphericalHarmonics
+# against their own inverse pairs, and every synthesis against an inline evaluation of its mode sum.
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
@@ -27,9 +18,14 @@ using Random: Random
 const RP_SER = CB.SerialBackend()
 const RP_DS = SB.DirectSumSpectralBackend()
 const RP_FFT = SB.FFTSpectralBackend()
+const RP_CART = FG.Geometry.CartesianGeometry{Float64}()
 rp_rel(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
 rp_uni(L, N) = range(0.0, L; length = N + 1)[1:N]
 rp_str(L, N) = [L * (i - 1) / N + 0.04 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
+# The integer frequencies of an `m + 1`-mode widened axis, `m` even, in FFT order.
+rp_wide(m) = [0:(m ÷ 2); -(m ÷ 2):-1]
+# The libraries a Cartesian transform or synthesis runs through, each with its tolerance.
+const RP_NUFFTS = ((FTB.FINUFFTBackend(), (; eps = 1e-13), 1e-10), (FTB.NonuniformFFTsBackend(), (; eps = 1e-13), 1e-10))
 
 Test.@testset "Factorized direct sum equals an inline naive sum" begin
     # `C[k] = (1/N) Σ_j f_j exp(-i k·x_j)` over the packed half, written out here. On a uniform grid the
@@ -38,8 +34,7 @@ Test.@testset "Factorized direct sum equals an inline naive sum" begin
     L = 2π
     N = 6
     xs = rp_uni(L, N)
-    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-        periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; periodic = (true, true), period = (L, L))
     f = randn(N, N)
     ms = (N, N)
     c, ks = FFS.calculate_spectrum(g, f, ms; transform = RP_DS, execution = RP_SER)
@@ -57,64 +52,143 @@ Test.@testset "Factorized direct sum equals an inline naive sum" begin
     end
     Test.@test rp_rel(c, naive) < 1e-13
 
-    # The same on a STRETCHED grid, where the quadrature factor is not one: the naive sum carries the
-    # grid's own per-node measure, `C[k] = Σ w f e^{-ikx} / Σw`.
+    # The same on a stretched grid, where the quadrature factor is not one: the naive sum carries the
+    # grid's own per-node measure, `C[k] = Σ w f e^{-ikx} / Σw`. Both even axes tell `±N/2` apart there, so
+    # the box holds `k₁ = 0 … N/2` and `k₂ = -N/2 … N/2`.
     ax = rp_str(L, N)
-    gs = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), ax, ax;
-        periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(RP_CART, ax, ax; periodic = (true, true), period = (L, L))
     cs, kss = FFS.calculate_spectrum(gs, f, ms; transform = RP_DS, execution = RP_SER)
     w = collect(FG.Grids.measure(gs))
-    sw = sum(w)
-    naives = zeros(ComplexF64, pms...)
-    for i1 in 1:pms[1], i2 in 1:pms[2]
-        k1 = kss[1][i1]
-        k2 = kss[2][i2]
-        acc = zero(ComplexF64)
-        for I in CartesianIndices((N, N))
-            acc += w[I] * f[I] * cis(-(k1 * ax[I[1]] + k2 * ax[I[2]]))
-        end
-        naives[i1, i2] = acc / sw
-    end
+    k1s = 0:(N ÷ 2)
+    k2s = rp_wide(N)
+    Test.@test collect(kss[1]) ≈ k1s .* (2π / L)
+    Test.@test collect(kss[2]) ≈ k2s .* (2π / L)
+    naives = [sum(w[I] * f[I] * cis(-(k1 * ax[I[1]] + k2 * ax[I[2]]) * 2π / L) for I in CartesianIndices((N, N))) /
+              sum(w) for k1 in k1s, k2 in k2s]
     Test.@test rp_rel(cs, naives) < 1e-13
 end
 
-Test.@testset "Hybrid composite equals the direct sum" begin
-    # The composite shares no code with the direct sum: an FFT over the uniform axes, a 1-D NUFFT along
-    # each stretched one. Both NUFFT providers are checked.
-    Random.seed!(32)
+Test.@testset "Every transform of a point set equals the naive sum over its coefficient box" begin
+    # Every even axis of a point set tells `±m/2` apart, so the box holds `-m/2 … m/2` on it. A real field's
+    # transform computes the packed half of the `m`-mode box and, by conjugate symmetry, its mirror; with
+    # two axes `d ≥ 2` widened, a mode at `+m_d/2` with `-m_e/2` lies in neither and holds zero. Every other
+    # mode is the naive sum `(1/M) Σ_j f_j exp(-iflag·i k·(x_j - x₀))`.
+    Random.seed!(35)
     L = 2π
-    for (N1, N2) in ((8, 8), (8, 7), (7, 8))
-        g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(),
-            rp_uni(L, N1), rp_str(L, N2); periodic = (true, true), period = (L, L))
-        f = randn(N1, N2)
-        ms = (N1, N2)
-        cd, ksd = FFS.calculate_spectrum(g, f, ms; transform = RP_DS, execution = RP_SER)
-        for nu in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend())
-            ch, ksh = FFS.calculate_spectrum(g, f, ms; transform = RP_FFT, execution = RP_SER,
-                nufft = nu, eps = 1e-12)
-            Test.@test size(ch) == size(cd)
-            Test.@test rp_rel(ch, cd) < 1e-9
-            # The Nyquist twin the composite publishes must match the direct sum's entry for entry.
-            th = FTB.axis_twin(ksh[1])
-            td = FTB.axis_twin(ksd[1])
-            if th !== nothing && td !== nothing
-                for (a, b) in zip(th.slices, td.slices)
-                    isempty(a) || Test.@test rp_rel(a, b) < 1e-9
-                end
+    M = 120
+    for ms in ((6, 6), (4, 6, 4))
+        D = length(ms)
+        xs = ntuple(_ -> L .* rand(M), D)
+        g = FG.Grids.UnstructuredGrid(RP_CART, xs, fill(1.0, M); periodic = ntuple(_ -> true, D),
+            period = ntuple(_ -> L, D))
+        x0 = map(minimum, xs)
+        f = randn(M)
+        axk = (0:(ms[1] ÷ 2), ntuple(d -> rp_wide(ms[d + 1]), D - 1)...)
+        outside(k) = D == 3 && (k[2], k[3]) in ((ms[2] ÷ 2, -(ms[3] ÷ 2)), (-(ms[2] ÷ 2), ms[3] ÷ 2))
+        for iflag in (1, -1)
+            naive = map(Iterators.product(axk...)) do k
+                outside(k) ? zero(ComplexF64) :
+                    sum(f[j] * cis(-iflag * sum(k[d] * (xs[d][j] - x0[d]) for d in 1:D)) for j in 1:M) / M
+            end
+            for (t, kw, tol) in ((RP_DS, (; execution = RP_SER), 1e-13), RP_NUFFTS...)
+                c, _ = FFS.calculate_spectrum(g, f, ms; transform = t, iflag, kw...)
+                Test.@test size(c) == size(naive)
+                Test.@test rp_rel(c, naive) < tol
             end
         end
     end
+end
 
-    # Complex and batched fields take the same route.
-    N = 8
-    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(),
-        rp_uni(L, N), rp_str(L, N); periodic = (true, true), period = (L, L))
-    fb = randn(N, N, 2)
-    Test.@test rp_rel(FFS.calculate_spectrum(g, fb, (N, N); transform = RP_FFT, execution = RP_SER, eps = 1e-12)[1],
-        FFS.calculate_spectrum(g, fb, (N, N); transform = RP_DS, execution = RP_SER)[1]) < 1e-9
-    fc = randn(ComplexF64, N, N)
-    Test.@test rp_rel(FFS.calculate_spectrum(g, fc, (N, N); transform = RP_FFT, execution = RP_SER, eps = 1e-12)[1],
-        FFS.calculate_spectrum(g, fc, (N, N); transform = RP_DS, execution = RP_SER)[1]) < 1e-9
+Test.@testset "Two widened axes of a stretched grid: zero outside the computed modes and their mirror" begin
+    # Uniform along axis 1 at its own length and stretched along axes 2 and 3, whose `±m/2` the box holds.
+    # The modes at `+m₂/2` with `-m₃/2`, and at `-m₂/2` with `+m₃/2`, are zero; every other mode is the naive
+    # sum `Σ w f e^{-ik·(x - x₀)} / Σw`, through the direct sum, the separable NUFFT of each library and the
+    # hybrid FFT/NUFFT composite.
+    Random.seed!(37)
+    L = 2π
+    n = 6
+    x1 = rp_uni(L, n)
+    ax = rp_str(L, n)
+    g = FG.Grids.StructuredGrid(RP_CART, x1, ax, ax; periodic = (true, true, true), period = (L, L, L))
+    ms = (n, 6, 4)
+    f = randn(n, n, n)
+    w = collect(FG.Grids.measure(g))
+    axk = (0:(n ÷ 2), rp_wide(ms[2]), rp_wide(ms[3]))
+    naive = map(Iterators.product(axk...)) do k
+        (k[2], k[3]) in ((3, -2), (-3, 2)) ? zero(ComplexF64) :
+            sum(w[I] * f[I] * cis(-(k[1] * x1[I[1]] + k[2] * ax[I[2]] + k[3] * ax[I[3]])) for I in CartesianIndices(f)) /
+            sum(w)
+    end
+    Test.@test count(iszero, naive) == 2 * length(axk[1])
+    hybrid = map(((t, kw, tol),) -> (RP_FFT, (; execution = RP_SER, nufft = t, kw...), tol), RP_NUFFTS)
+    for (t, kw, tol) in ((RP_DS, (; execution = RP_SER), 1e-13), RP_NUFFTS..., hybrid...)
+        c, _ = FFS.calculate_spectrum(g, f, ms; transform = t, kw...)
+        Test.@test size(c) == size(naive)
+        Test.@test rp_rel(c, naive) < tol
+    end
+end
+
+Test.@testset "Synthesis from the coefficient box is the real series over the whole box" begin
+    # `f_j = Σ_κ C_κ exp(+iflag·iκ·(x_j - x₀))` over every mode of the box, the packed half unpacked by
+    # conjugate symmetry, evaluated inline at each point. The series is real, and every synthesis of the
+    # packed half gives it: on a grid stretched along both axes, uniform along axis 1 and stretched along
+    # axis 2, and point sets in two and three dimensions.
+    Random.seed!(36)
+    L = 2π
+    M = 50
+    ax = rp_str(L, 8)
+    hybrid = map(((t, kw, tol),) -> (RP_FFT, (; nufft = t, kw...), tol), RP_NUFFTS)
+    cases = (
+        (FG.Grids.StructuredGrid(RP_CART, ax, ax; periodic = (true, true), period = (L, L)), (8, 8), ()),
+        (FG.Grids.StructuredGrid(RP_CART, rp_uni(L, 8), ax; periodic = (true, true), period = (L, L)), (8, 8),
+            hybrid),
+        (FG.Grids.UnstructuredGrid(RP_CART, (L .* rand(M), L .* rand(M)), fill(1.0, M);
+            periodic = (true, true), period = (L, L)), (6, 8), ()),
+        (FG.Grids.UnstructuredGrid(RP_CART, (L .* rand(M), L .* rand(M), L .* rand(M)), fill(1.0, M);
+            periodic = (true, true, true), period = (L, L, L)), (4, 6, 4), ()),
+    )
+    for (g, ms, extra) in cases, iflag in (1, -1)
+        D = length(ms)
+        pts = FG.Grids.materialize(g)
+        xs = ntuple(d -> vec(collect(pts[d])), D)
+        x0 = map(minimum, xs)
+        c, ks = FFS.calculate_spectrum(g, randn(size(g)...), ms; transform = RP_DS, execution = RP_SER, iflag)
+        box = FTB.full_size(ks)
+        full = FTB.unpacked(c, box)
+        kf = ntuple(d -> [FTB.mode_frequency(FTB.FFTAxis(box[d], 1.0), i) for i in 1:box[d]], D)
+        ref = [sum(full[I] * cis(iflag * sum(kf[d][I[d]] * (xs[d][j] - x0[d]) for d in 1:D))
+                   for I in CartesianIndices(box)) for j in eachindex(xs[1])]
+        Test.@test maximum(abs ∘ imag, ref) < 1e-13 * maximum(abs, ref)
+        for (t, kw, tol) in ((RP_DS, (; execution = RP_SER), 1e-12), RP_NUFFTS..., extra...)
+            out = FFS.synthesize(g, c, ms; transform = t, iflag, kw...)
+            Test.@test eltype(out) === Float64
+            Test.@test rp_rel(vec(out), real.(ref)) < tol
+        end
+    end
+end
+
+Test.@testset "Synthesis reproduces the band-limited part of a field" begin
+    # A uniform grid transformed below its own length: the transform of each mode of the box is exact, so
+    # synthesis of a field's coefficients is its projection `Σ_κ a_κ exp(iκ·x)` onto the box, with
+    # `a_κ = (1/N²) Σ_j f_j exp(-iκ·x_j)`, and a field in that span returns unchanged.
+    Random.seed!(38)
+    L = 2π
+    N = 12
+    xs = rp_uni(L, N)
+    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; periodic = (true, true), period = (L, L))
+    ms = (6, 6)
+    k = -(ms[1] ÷ 2):(ms[1] ÷ 2)
+    f = randn(N, N)
+    a = [sum(f[i, j] * cis(-(k1 * xs[i] + k2 * xs[j])) for i in 1:N, j in 1:N) / N^2 for k1 in k, k2 in k]
+    proj = [sum(a[p, q] * cis(k[p] * xs[i] + k[q] * xs[j]) for p in eachindex(k), q in eachindex(k)) for i in 1:N, j in 1:N]
+    Test.@test maximum(abs ∘ imag, proj) < 1e-13 * maximum(abs, proj)
+    proj = real.(proj)
+    for (t, kw, tol) in ((RP_DS, (; execution = RP_SER), 1e-12), RP_NUFFTS...)
+        c, _ = FFS.calculate_spectrum(g, f, ms; transform = t, kw...)
+        Test.@test rp_rel(FFS.synthesize(g, c, ms; transform = t, kw...), proj) < tol
+        cp, _ = FFS.calculate_spectrum(g, proj, ms; transform = t, kw...)
+        Test.@test rp_rel(FFS.synthesize(g, cp, ms; transform = t, kw...), proj) < tol
+    end
 end
 
 Test.@testset "Inverses that use no direct sum" begin
@@ -122,22 +196,20 @@ Test.@testset "Inverses that use no direct sum" begin
     L = 2π
     N = 12
     xs = rp_uni(L, N)
-    g = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-        periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; periodic = (true, true), period = (L, L))
     f = randn(N, N)
     ms = (N, N)
 
     # FFT: its own forward/inverse pair round-trips the field.
-    c, ks = FFS.calculate_spectrum(g, f, ms; transform = RP_FFT, execution = RP_SER)
-    fr = FFS.synthesize(g, c, ms; transform = RP_FFT, execution = RP_SER, ks = ks)
-    Test.@test eltype(fr) === Float64
+    c, _ = FFS.calculate_spectrum(g, f, ms; transform = RP_FFT, execution = RP_SER)
+    fr = FFS.synthesize(g, c, ms; transform = RP_FFT, execution = RP_SER)
     Test.@test rp_rel(fr, f) < 1e-12
     # And through the complex route.
-    cc, kc = FFS.calculate_spectrum(g, ComplexF64.(f), ms; transform = RP_FFT, execution = RP_SER)
-    fcr = FFS.synthesize(g, cc, ms; transform = RP_FFT, execution = RP_SER, real_output = false, ks = kc)
+    cc, _ = FFS.calculate_spectrum(g, ComplexF64.(f), ms; transform = RP_FFT, execution = RP_SER)
+    fcr = FFS.synthesize(g, cc, ms; transform = RP_FFT, execution = RP_SER, real_output = false)
     Test.@test rp_rel(real.(fcr), f) < 1e-12
 
-    # FastSphericalHarmonics: its analysis and synthesis are an exact pair, in the COEFFICIENT direction.
+    # FastSphericalHarmonics: its analysis and synthesis are an exact pair in the coefficient direction.
     # Its Clenshaw–Curtis grid carries more samples than the degree it resolves, so analysis of an
     # arbitrary grid field is a band-limited projection; the identity is synthesis followed by analysis.
     lmax = 5
@@ -148,51 +220,14 @@ Test.@testset "Inverses that use no direct sum" begin
         C[FFS.sph_mode_index(l, m)] = randn()
     end
     fsyn = FFS.synthesize(gcc, C, sms; transform = SB.FSHTSpectralBackend(), execution = RP_SER)
-    Test.@test eltype(fsyn) === Float64
-    Test.@test size(fsyn) == size(gcc)
     C2 = FFS.calculate_spectrum(gcc, fsyn, sms; transform = SB.FSHTSpectralBackend(), execution = RP_SER)[1]
-    for l in 0:lmax, m in -l:l
-        Test.@test isapprox(C2[FFS.sph_mode_index(l, m)], C[FFS.sph_mode_index(l, m)], atol = 1e-11)
-    end
-    # A band-limited field then round-trips in the FIELD direction too.
+    Test.@test maximum(abs, C2 .- C) < 1e-12
+    # A band-limited field then round-trips in the field direction too.
     Test.@test rp_rel(FFS.synthesize(gcc, C2, sms; transform = SB.FSHTSpectralBackend(), execution = RP_SER),
         fsyn) < 1e-11
 end
 
-Test.@testset "A NUFFT type-2 evaluates the mode sum" begin
-    # `synthesize` through a NUFFT is the type-2, `f_j = Σ_κ C_κ exp(+i κ·(x_j - x₀))` over the native
-    # modes, `x₀` each direction's smallest coordinate. Composing it with the type-1 gives `AᴴA` on
-    # nonuniform nodes, so the mode sum written out here is the invariant, and it shares no code with the
-    # provider.
-    Random.seed!(34)
-    L = 2π
-    M = 40
-    N = 8
-    ms = (N, N)
-    xv = L .* rand(M)
-    yv = L .* rand(M)
-    g = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv),
-        fill(L^2 / M, M); periodic = (true, true), period = (L, L))
-    f = randn(M)
-    c, ks = FFS.calculate_spectrum(g, f, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-12)
-
-    # The full native cube the half stands for, and the physical wavenumbers of each native mode.
-    full = FTB.unpacked(c, ms, ks)
-    kf = FFS.Grids.physical_wavenumbers(g, ms, Val(false))
-    x0, y0 = minimum(xv), minimum(yv)
-    ref = zeros(Float64, M)
-    for j in 1:M
-        acc = zero(ComplexF64)
-        for I in CartesianIndices(ms)
-            acc += full[I] * cis(kf[1][I[1]] * (xv[j] - x0) + kf[2][I[2]] * (yv[j] - y0))
-        end
-        ref[j] = real(acc)
-    end
-    out = FFS.synthesize(g, c, ms; transform = FTB.NonuniformFFTsBackend(), ks = ks, eps = 1e-12)
-    Test.@test length(out) == M
-    Test.@test rp_rel(out, ref) < 1e-9
-
-    # NUFSHT's type-2 likewise: an evaluation of the harmonic sum at the nodes.
+Test.@testset "A NUFSHT type-2 evaluates the harmonic sum" begin
     lmax = 3
     sms = (lmax + 1, 2 * lmax + 1)
     Ns = 60

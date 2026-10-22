@@ -4,7 +4,6 @@ using FFTW: FFTW
 using LinearAlgebra: LinearAlgebra as LA
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FlowTransformBindings: FlowTransformBindings as FTB
-using ComputationalBackends: ComputationalBackends
 using SpectralBackends: SpectralBackends
 using FlowGeometries: FlowGeometries
 
@@ -41,6 +40,12 @@ struct CFFTPlan{RT, D, NB, P, KS} <: FFS.AbstractSpectralPlan
     norm::RT
     ks_phys::KS
 end
+
+# One line each: a default `show` prints the FFTW plan, whose own `show` spans several lines.
+Base.show(io::IO, p::RFFTPlan{RT, D}) where {RT, D} =
+    print(io, "RFFTPlan{", RT, ", ", D, "}(", p.ns, ", batch=", p.batch, ")")
+Base.show(io::IO, p::CFFTPlan{RT, D}) where {RT, D} =
+    print(io, "CFFTPlan{", RT, ", ", D, "}(", p.ns, ", batch=", p.batch, ")")
 
 FFS.Plans.coefficient_size(p::RFFTPlan{RT, D}) where {RT, D} =
     (FTB.packed_size(p.ns, Val(true))..., p.batch...)
@@ -108,7 +113,7 @@ end
     ns = size(g)
     Tuple(ms) == ns || throw(ArgumentError(
         "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform. " *
-        "Use NUFFT/DirectSum for a different mode count."))
+        "Use a NUFFT or DirectSumSpectralBackend() for a different mode count."))
     D = length(ns)
     ndims(field) >= D || throw(DimensionMismatch("field has $(ndims(field)) dims, grid needs $D spatial"))
     batch = ntuple(i -> size(field, D + i), ndims(field) - D)
@@ -116,30 +121,34 @@ end
 end
 
 # Same split the forward makes: all-uniform takes the pure FFTW plan, uniform-in-some-directions takes
-# the hybrid composite plan, all-stretched raises pointing at NUFFT.
-function FFS.plan_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec::ComputationalBackends.AbstractExecutionBackend,
+# the hybrid composite plan, all-stretched raises pointing at NUFFT. FFTW plans run on the host, so these
+# methods take the host execution backends; a device plan is the KernelAbstractions extension's.
+# `measure` plans with FFTW's `MEASURE`, for a plan held across executions, and otherwise with `ESTIMATE`,
+# which a plan built for one call takes.
+_flags(measure::Bool) = measure ? FFTW.MEASURE : FFTW.ESTIMATE
+
+function FFS.plan_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec::FFS._HostExec,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, ::Type{T}, ms::NTuple{D, Int};
         batch::Tuple = (), iflag::Int = 1,
         nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
-        kwargs...) where {T, D}
+        measure::Bool = true, kwargs...) where {T, D}
     umask = ntuple(d -> FlowGeometries.Grids.isuniform(g, d), Val(D))
     if !all(umask)
-        any(umask) || throw(ArgumentError(
-            "FFTSpectralBackend needs a uniform axis in at least one direction (an AbstractRange); " *
-            "every axis of this grid is stretched. Use NUFFTSpectralBackend."))
-        return FFS._hybrid_plan(nufft, exec, g, T, ms, umask; batch = batch, iflag = iflag, kwargs...)
+        any(umask) || FFS._all_stretched_fft()
+        return FFS._hybrid_plan(nufft, exec, g, T, ms, umask; batch = batch, iflag = iflag, measure = measure,
+            kwargs...)
     end
     ns = size(g)
     Tuple(ms) == ns || throw(ArgumentError("FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms)))"))
     nth = FFS._backend_nthreads(exec)
     sample = zeros(T, ns..., batch...)
-    return _fftw_plan(T, g, ns, sample, nth, FFTW.MEASURE; iflag = iflag)
+    return _fftw_plan(T, g, ns, sample, nth, _flags(measure); iflag = iflag)
 end
 
 # One-shot allocating entry (routed from the (transform, execution, grid) dispatch; the hub already
 # checked `isuniform`). Plans on the field itself with `ESTIMATE`, so there is no dummy planning array;
 # the output is allocated at the packed size.
-function FFS._calculate_spectrum_fft(exec::ComputationalBackends.AbstractExecutionBackend,
+function FFS._calculate_spectrum_fft(exec::FFS._HostExec,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::Tuple; iflag::Int = 1, kwargs...)
     ns, batch = _fft_setup(g, field, ms)
@@ -159,80 +168,35 @@ function FFS._calculate_spectrum_fft(exec::ComputationalBackends.AbstractExecuti
     return coeffs, ks
 end
 
+# The hybrid composite's FFT over the uniform axes `dims`, on host arrays, leaving the stretched axes for
+# the NUFFT passes. `halve` takes the real field's `rfft` (which halves `dims[1] == 1`); otherwise the field
+# is converted to complex and transformed in full, so the whole `k₁` range stays available for the
+# conjugate reads a widened coefficient box takes.
+function FFS._region_fft_plan(exec::FFS._HostExec, ::Type{T}, insize::Tuple, dims::Tuple, halve::Bool,
+        conj_in::Bool, measure::Bool) where {T}
+    nth = FFS._backend_nthreads(exec)
+    RT = real(float(T))
+    # `rfft` halves the first transformed dim, which the composite requires to be axis 1.
+    outsize = halve ? (insize[1] ÷ 2 + 1, Base.tail(insize)...) : insize
+    scratch = halve ? Array{RT}(undef, insize...) : Array{Complex{RT}}(undef, insize...)
+    fwd = halve ? FFTW.plan_rfft(scratch, dims; flags = _flags(measure), num_threads = nth) :
+                  FFTW.plan_fft(scratch, dims; flags = _flags(measure), num_threads = nth)
+    return FFS.RegionFFT(fwd, scratch, outsize, halve, conj_in)
+end
+
+# The hybrid synthesis's backward FFT over the uniform axes `dims` of the native spectrum `A`, in place:
+# `Σ_κ C_κ e^{+iflag·iκx}` unnormalized, `bfft` for `iflag = 1` and `fft` for `-1`.
+FFS._region_bfft_plan(exec::FFS._HostExec, A::Array, dims::Tuple, iflag::Int, measure::Bool) =
+    iflag == 1 ?
+        FFTW.plan_bfft!(A, dims; flags = _flags(measure), num_threads = FFS._backend_nthreads(exec)) :
+        FFTW.plan_fft!(A, dims; flags = _flags(measure), num_threads = FFS._backend_nthreads(exec))
+
 # =============================================================================
 # Inverse (synthesis). The forward folds `1/∏N` into its output, and FFTW's backward transforms are
 # unnormalized, so the two scalings cancel exactly: `f == brfft(C, N_1)` for a real field and
 # `f == bfft(C)` for a complex one, with no rescaling. FFTW's multi-dimensional c2r overwrites its input
 # (it admits no `PRESERVE_INPUT`), so the real path transforms a copy and leaves the caller's `coeffs`
-# intact.
-# =============================================================================
-
-# Hybrid composite: transform only the uniform axes `dims`, leaving the stretched axes for the NUFFT
-# passes. `halve` takes the real field's `rfft` (which halves `dims[1] == 1`); otherwise the field is
-# widened and transformed in full, so the whole `k₁` range stays available for a conjugate twin read.
-# `conj_in` conjugates a complex input, which carries the `iflag = -1` sign through the composite.
-# Raw output: the composite applies the offset phase and the `1/∏N_d` normalization once at the end.
-function FFS._region_fft(exec::ComputationalBackends.AbstractExecutionBackend, field::AbstractArray,
-        dims::Tuple, halve::Bool, conj_in::Bool)
-    nth = FFS._backend_nthreads(exec)
-    if halve
-        x = float(field)
-        return FFTW.plan_rfft(x, dims; num_threads = nth) * x
-    end
-    A = Array{Complex{real(float(eltype(field)))}}(undef, size(field)...)
-    copyto!(A, field)
-    conj_in && (A .= conj.(A))
-    return FFTW.plan_fft!(A, dims; num_threads = nth) * A
-end
-
-# ---- the same pass, held for reuse ----
-
-"""
-    RegionFFT{P,S}
-
-The uniform-region FFT of the hybrid composite, planned once. `halve` marks the real path, whose `rfft`
-shortens axis 1 to `n₁÷2+1`; `conj_in` conjugates a complex input, carrying `iflag = -1` through the
-composite. `scratch` takes the (possibly conjugated) input, so the caller's field is never mutated and
-the plan is built with `MEASURE`.
-"""
-struct RegionFFT{P, S, O <: Tuple}
-    fwd::P
-    scratch::S
-    outsize::O
-    halve::Bool
-    conj_in::Bool
-end
-
-Base.show(io::IO, r::RegionFFT) = print(io, "RegionFFT(", r.halve ? "rfft" : "fft", " → ", r.outsize, ")")
-
-function FFS._region_fft_plan(exec::ComputationalBackends.AbstractExecutionBackend, ::Type{T},
-        insize::Tuple, dims::Tuple, halve::Bool, conj_in::Bool) where {T}
-    nth = FFS._backend_nthreads(exec)
-    RT = real(float(T))
-    # `rfft` halves the FIRST transformed dim, which the composite requires to be axis 1.
-    outsize = halve ? (insize[1] ÷ 2 + 1, Base.tail(insize)...) : insize
-    scratch = halve ? Array{RT}(undef, insize...) : Array{Complex{RT}}(undef, insize...)
-    fwd = halve ? FFTW.plan_rfft(scratch, dims; flags = FFTW.MEASURE, num_threads = nth) :
-                  FFTW.plan_fft(scratch, dims; flags = FFTW.MEASURE, num_threads = nth)
-    return RegionFFT{typeof(fwd), typeof(scratch), typeof(outsize)}(fwd, scratch, outsize, halve, conj_in)
-end
-
-# Output shape of the held region pass, so the composite sizes the working array that follows it.
-FFS._region_fft_size(r::RegionFFT) = r.outsize
-
-function FFS._region_fft_exec!(out::AbstractArray, r::RegionFFT, field::AbstractArray)
-    copyto!(r.scratch, field)
-    r.conj_in && !r.halve && (r.scratch .= conj.(r.scratch))
-    LA.mul!(out, r.fwd, r.scratch)
-    return out
-end
-
-# =============================================================================
-# Reusable synthesis: the backward FFTW plan and the buffer its c2r consumes, built once.
-#
-# FFTW's multi-dimensional c2r has no `PRESERVE_INPUT`, so the real path transforms a COPY and the
-# caller's `coeffs` survives. `brfft` is unnormalized and the forward carried `1/∏N`, so neither
-# direction rescales.
+# intact. The reusable plan holds the backward FFTW plan and the buffer its c2r consumes.
 # =============================================================================
 
 struct FFTWSynthesisPlan{RT, D, NB, R, P, SC} <: FFS.AbstractSynthesisPlan
@@ -249,12 +213,19 @@ Base.show(io::IO, ::FFTWSynthesisPlan{RT, D, NB, R}) where {RT, D, NB, R} =
 FFS.Plans.field_size(p::FFTWSynthesisPlan) = (p.ns..., p.batch...)
 FFS.Plans.field_type(::FFTWSynthesisPlan{RT, D, NB, R}) where {RT, D, NB, R} = R ? RT : Complex{RT}
 
-function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
-        exec::ComputationalBackends.AbstractExecutionBackend,
+# The forward's split again: a grid uniform in some directions and stretched in others takes the hybrid
+# composite's synthesis plan.
+function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend, exec::FFS._HostExec,
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1, kwargs...) where {T, D}
-    FlowGeometries.Grids.isuniform(g) || throw(ArgumentError(
-        "FFTSpectralBackend needs a uniform axis in every direction; got a stretched axis."))
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1,
+        nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+        measure::Bool = true, kwargs...) where {T, D}
+    umask = ntuple(d -> FlowGeometries.Grids.isuniform(g, d), Val(D))
+    if !all(umask)
+        any(umask) || FFS._all_stretched_fft()
+        return FFS._hybrid_synthesis_plan(nufft, exec, g, T, ms, umask; batch = batch, iflag = iflag,
+            measure = measure, kwargs...)
+    end
     ns = size(g)
     Tuple(ms) == ns || throw(ArgumentError(
         "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform."))
@@ -262,22 +233,21 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractFFTSpectralBackend,
     RT = real(float(T))
     R = T <: Real
     bt = NTuple{length(batch), Int}(batch)
+    flags = _flags(measure)
     if R
         scratch = Array{Complex{RT}}(undef, FTB.packed_size(ns, Val(true))..., bt...)
-        bwd = FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.MEASURE, num_threads = nth)
+        bwd = FFTW.plan_brfft(scratch, ns[1], 1:D; flags = flags, num_threads = nth)
     else
         scratch = Array{Complex{RT}}(undef, ns..., bt...)
-        bwd = iflag == 1 ? FFTW.plan_bfft(scratch, 1:D; flags = FFTW.MEASURE, num_threads = nth) :
-                           FFTW.plan_fft(scratch, 1:D; flags = FFTW.MEASURE, num_threads = nth)
+        bwd = iflag == 1 ? FFTW.plan_bfft(scratch, 1:D; flags = flags, num_threads = nth) :
+                           FFTW.plan_fft(scratch, 1:D; flags = flags, num_threads = nth)
     end
     return FFTWSynthesisPlan{RT, D, length(bt), R, typeof(bwd), typeof(scratch)}(
         bwd, scratch, ns, bt, iflag < 0)
 end
 
-# A uniform grid's twins equal their negated-index partners, and FFT requires a uniform grid, so `ks`
-# carries nothing this inverse needs.
 function FFS.Plans.synthesize!(out::AbstractArray, plan::FFTWSynthesisPlan{RT, D, NB, R},
-        coeffs::AbstractArray; ks = nothing) where {RT, D, NB, R}
+        coeffs::AbstractArray) where {RT, D, NB, R}
     size(coeffs) == size(plan.scratch) || throw(DimensionMismatch(
         "coeffs is $(size(coeffs)); this plan was built for $(size(plan.scratch)) — pass the matching " *
         "`batch=` and element type to plan_synthesis"))
@@ -290,38 +260,6 @@ function FFS.Plans.synthesize!(out::AbstractArray, plan::FFTWSynthesisPlan{RT, D
     else
         LA.mul!(out, plan.bwd, coeffs)
     end
-    return out
-end
-
-function FFS._synthesize(::SpectralBackends.AbstractFFTSpectralBackend,
-        exec::ComputationalBackends.AbstractExecutionBackend,
-        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        coeffs::AbstractArray{Complex{RT}}, ms::NTuple{D, Int};
-        real_output::Bool = true, iflag::Int = 1, ks = nothing, kwargs...) where {RT, D}
-    FlowGeometries.Grids.isuniform(g) || throw(ArgumentError(
-        "FFTSpectralBackend needs a uniform axis in every direction; got a stretched axis."))
-    ns = size(g)
-    Tuple(ms) == ns || throw(ArgumentError(
-        "FFTSpectralBackend requires ms == size(grid) = $ns (got $(Tuple(ms))); FFT is a full transform."))
-    nth = FFS._backend_nthreads(exec)
-    batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
-    if real_output
-        pms = FTB.packed_size(ns, Val(true))
-        size(coeffs)[1:D] == pms || throw(DimensionMismatch(
-            "real_output=true expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D]). " *
-            "Pass real_output=false for a full native spectrum $(ns)."))
-        scratch = iflag < 0 ? conj.(coeffs) : copy(coeffs)   # a real field's iflag=-1 half is conjugated
-        out = Array{RT}(undef, ns..., batch...)
-        LA.mul!(out, FFTW.plan_brfft(scratch, ns[1], 1:D; flags = FFTW.ESTIMATE, num_threads = nth),
-                scratch)
-        return out
-    end
-    size(coeffs)[1:D] == ns || throw(DimensionMismatch(
-        "real_output=false expects the full native spectrum $(ns) on the spectral dims; got $(size(coeffs)[1:D])."))
-    out = Array{Complex{RT}}(undef, ns..., batch...)
-    bwd = iflag == 1 ? FFTW.plan_bfft(coeffs, 1:D; flags = FFTW.ESTIMATE, num_threads = nth) :
-                       FFTW.plan_fft(coeffs, 1:D; flags = FFTW.ESTIMATE, num_threads = nth)
-    LA.mul!(out, bwd, coeffs)
     return out
 end
 

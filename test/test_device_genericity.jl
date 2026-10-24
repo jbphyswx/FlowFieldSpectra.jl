@@ -252,3 +252,49 @@ Test.@testset "Spherical direct-sum plans and synthesis on JLArrays" begin
         end
     end
 end
+
+# The reductions of coefficients held in a JLArray against the same reductions of the host copy: radial
+# spectra (both cutoffs, in place), cross, anisotropic, transect and degree spectra, on packed real-field
+# layouts of even and odd length and on a full complex layout, two fields at once. Only the order the
+# device adds a bin's terms in differs.
+Test.@testset "Spectral reductions of JLArray coefficients equal the host reductions" begin
+    Random.seed!(57)
+    for (n, halved) in ((32, true), (33, true), (32, false))
+        g = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, n), dg_uni(2π, n); periodic = (true, true),
+            period = (2π, 2π))
+        ks = FFS.Grids.physical_wavenumbers(g, (n, n), Val(halved))
+        c = randn(ComplexF64, length(ks[1]), length(ks[2]), 2)
+        h = randn(ComplexF64, size(c))
+        cd, hd = dg_dev(c), dg_dev(h)
+        for cutoff in (true, false)
+            kb, E = FFS.isotropic_spectrum(ks, c; cutoff)
+            kbd, Ed = FFS.isotropic_spectrum(ks, cd; cutoff)
+            Test.@test kbd == kb
+            Test.@test dg_rel(Ed, E) < 1e-12
+        end
+        kb, E = FFS.isotropic_spectrum(ks, c)
+        Ei, kbi = zero(E), zero(kb)
+        FFS.isotropic_spectrum!(Ei, kbi, ks, cd)
+        Test.@test kbi ≈ kb && dg_rel(Ei, E) < 1e-12
+        _, S = FFS.cross_spectrum(ks, c, h)
+        _, Sd = FFS.cross_spectrum(ks, cd, hd)
+        Test.@test dg_rel(Sd, S) < 1e-12
+        Test.@test dg_rel(last(FFS.anisotropic_spectrum(ks, cd)), last(FFS.anisotropic_spectrum(ks, c))) < 1e-12
+        for dims in ((1,), (2,))
+            Test.@test dg_rel(last(FFS.transect_spectrum(ks, cd, dims)), last(FFS.transect_spectrum(ks, c, dims))) < 1e-12
+        end
+    end
+    lmax = 12
+    C = randn(lmax + 1, 2lmax + 1, 2)
+    _, El = FFS.spherical_energy_spectrum(C)
+    _, Eld = FFS.spherical_energy_spectrum(dg_dev(C))
+    Test.@test dg_rel(Eld, El) < 1e-12
+    # A device field's one-shot spectrum stays on the device, where the reductions above read it.
+    gc = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, 12), dg_uni(2π, 10); periodic = (true, true),
+        period = (2π, 2π))
+    f = randn(12, 10, 2)
+    cs, ks = FFS.calculate_spectrum(gc, f, (12, 10); transform = DG_DS, execution = DG_SER)
+    cd, _ = FFS.calculate_spectrum(gc, dg_dev(f), (12, 10); transform = DG_DS, execution = DG_JL)
+    Test.@test cd isa JLArrays.JLArray && dg_rel(Array(cd), cs) < 1e-12
+    Test.@test dg_rel(last(FFS.isotropic_spectrum(ks, cd)), last(FFS.isotropic_spectrum(ks, cs))) < 1e-12
+end

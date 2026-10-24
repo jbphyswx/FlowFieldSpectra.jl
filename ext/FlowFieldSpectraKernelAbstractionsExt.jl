@@ -296,7 +296,7 @@ function FFS._gpu_directsum_cartesian(exec::ComputationalBackends.GPUBackend{<:K
     p = FFS.plan_spectrum(SpectralBackends.DirectSumSpectralBackend(), exec, g,
         eltype(field) <: Real ? FT : Complex{FT}, ms; batch = FFS.Grids.field_batch_shape(g, field),
         iflag = iflag, box = box)
-    coeffs = FFS.allocate_coefficients(p)
+    coeffs = FFS._allocate_coefficients_like(field, p)
     return coeffs, FFS.calculate_spectrum!(coeffs, p, field)
 end
 
@@ -445,54 +445,46 @@ end
 
 # =============================================================================
 # Normalized associated Legendre values on the device: the packed table
-# `P[legendre_index(ℓ, m, lmax), j] = P̄_ℓ^m(cos θ_j)`, one thread per (order, node), each running the
-# recurrence `SphericalKernels.fill_legendre!` runs, on the coefficients `legendre_tables` builds, staged
-# once. The spherical kernels read values from it and evaluate none.
+# `P[legendre_index(ℓ, m, lmax), j] = P̄_ℓ^m(cos θ_j)`, one thread per (order, node), each running
+# `SphericalKernels.legendre_order!` on the tables `legendre_tables` builds, staged once, from the starts
+# `legendre_start` forms on the host in `Float64`. The spherical kernels read values from it and evaluate
+# none.
 # =============================================================================
 
 function FFS.SphericalKernels.device_legendre_table(backend::KA.Backend, ::Type{FT}, lmax::Int,
         θ::AbstractVector) where {FT}
-    t = FFS.SphericalKernels.legendre_tables(FT, lmax)
+    SK = FFS.SphericalKernels
+    t = SK.legendre_tables(FT, lmax)
     n = length(θ)
-    P = KA.allocate(backend, FT, FFS.SphericalKernels.legendre_count(lmax), n)
+    P = KA.allocate(backend, FT, SK.legendre_count(lmax), n)
     n == 0 && return P
     θh = FT.(collect(θ))
-    a = KA.allocate(backend, FT, size(t.a)...)
-    copyto!(a, t.a)
-    b = KA.allocate(backend, FT, size(t.b)...)
-    copyto!(b, t.b)
-    _legendre_table_kernel!(backend)(P, _dev_vec(backend, cos.(θh), FT), _dev_vec(backend, sin.(θh), FT),
-        _dev_vec(backend, t.c, FT), _dev_vec(backend, t.d, FT), a, b, t.P00, lmax, n;
-        ndrange = (lmax + 1) * n)
+    Y = Matrix{FT}(undef, lmax + 1, n); K = Matrix{Int32}(undef, lmax + 1, n)
+    pos = Vector{Bool}(undef, n); u = Vector{FT}(undef, n)
+    for j in 1:n
+        x = cos(θh[j]); s = sin(θh[j])
+        pos[j] = x >= 0; u[j] = s^2 / (1 + abs(x))
+        ls = log2(abs(eltype(t.lD)(s)))
+        for m in 0:lmax
+            Y[m + 1, j], K[m + 1, j] = SK.legendre_start(FT, t.lD[m + 1], m, ls)
+        end
+    end
+    dev(a) = copyto!(KA.allocate(backend, eltype(a), size(a)...), a)
+    _legendre_table_kernel!(backend)(P, dev(Y), dev(K), dev(pos), dev(u), dev(t.α), dev(t.c), dev(t.γ),
+        dev(t.nrm), lmax, n; ndrange = (lmax + 1) * n)
     KA.synchronize(backend)
     return P
 end
 
-KA.@kernel function _legendre_table_kernel!(P, @Const(x), @Const(s), @Const(c), @Const(d), @Const(a),
-        @Const(b), P00, lmax::Int, n::Int)
+KA.@kernel function _legendre_table_kernel!(P, @Const(Y), @Const(K), @Const(pos), @Const(u), @Const(α),
+        @Const(c), @Const(γ), @Const(nrm), lmax::Int, n::Int)
     idx = @index(Global)
     if idx <= (lmax + 1) * n
         m = (idx - 1) % (lmax + 1)
         j = (idx - 1) ÷ (lmax + 1) + 1
-        @inbounds begin
-            xj = x[j]
-            sj = s[j]
-            Pl = P00
-            for k in 1:m
-                Pl *= c[k] * sj
-            end
-            r = FFS.SphericalKernels.legendre_index(m, m, lmax)
-            P[r, j] = Pl
-            if m < lmax
-                Pprev = Pl
-                Pl = xj * d[m + 1] * Pl
-                P[r + 1, j] = Pl
-                for l in (m + 2):lmax
-                    Pprev, Pl = Pl, xj * a[l + 1, m + 1] * Pl - b[l + 1, m + 1] * Pprev
-                    P[r + l - m, j] = Pl
-                end
-            end
-        end
+        r0 = FFS.SphericalKernels.legendre_index(m, m, lmax) - m
+        @inbounds FFS.SphericalKernels.legendre_order!(P, ℓ -> CartesianIndex(r0 + ℓ, j), α, c, γ, nrm, m,
+            lmax, Y[m + 1, j], K[m + 1, j], pos[j], u[j])
     end
 end
 
@@ -674,7 +666,7 @@ function FFS._gpu_directsum_spherical(exec::ComputationalBackends.GPUBackend{<:K
     p = FFS.plan_spectrum(SpectralBackends.DirectSumSpectralBackend(), exec, g,
         eltype(field) <: Real ? FT : Complex{FT}, (lmax + 1, 2 * lmax + 1);
         batch = FFS.Grids.field_batch_shape(g, field), sampling, weights, inactive)
-    coeffs = FFS.allocate_coefficients(p)
+    coeffs = FFS._allocate_coefficients_like(field, p)
     return coeffs, FFS.calculate_spectrum!(coeffs, p, field)
 end
 

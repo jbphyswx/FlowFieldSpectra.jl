@@ -254,6 +254,15 @@ function _to_host(a::AbstractArray{T}) where {T}
     return host
 end
 
+# A device one-shot's coefficients, zeroed, where its field lives: a device array for a device field and
+# an `Array` for a host one.
+_allocate_coefficients_like(field::AbstractArray, plan) =
+    fill!(similar(field, Plans.coefficient_type(plan), Plans.coefficient_size(plan)...),
+        zero(Plans.coefficient_type(plan)))
+
+# The device coefficients `c` of a one-shot whose field is `field`, moved to the host for a host field.
+_like_field(field::AbstractArray, c::AbstractArray) = typeof(similar(field, eltype(c), 0)) <: Array ? _to_host(c) : c
+
 _resolve_execution(backend::ComputationalBackends.AbstractExecutionBackend) = ComputationalBackends.resolve_backend(backend)
 function _resolve_execution(::ComputationalBackends.AbstractAutoBackend)
     threaded = Base.get_extension(@__MODULE__, :FlowFieldSpectraOhMyThreadsExt) !== nothing

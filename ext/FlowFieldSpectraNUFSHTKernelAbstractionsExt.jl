@@ -215,7 +215,7 @@ function FFS._calculate_spectrum_nufsht(exec::ComputationalBackends.GPUBackend{<
     plan = _nusht_gpu_plan(FFS.sph_coeff_type(eltype(field), FT), FT, exec, g, ms, batch;
         tol, solve, maxiter, rtol, nufft, batch_chunk, sampling, weights, inactive)
     try
-        coeffs = FFS.allocate_coefficients(plan)
+        coeffs = FFS._allocate_coefficients_like(field, plan)
         return coeffs, FFS.calculate_spectrum!(coeffs, plan, field)
     finally
         FFS.close!(plan)

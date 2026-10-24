@@ -210,7 +210,7 @@ Test.@testset "NUFSHT solve on a masked grid, inactive cells zero-filled or excl
     fz[land] .= 0
     gm = FG.Grids.UnstructuredGrid(geo, (λ, φlat), fill(4π / N, N), sea)
     gs = FG.Grids.UnstructuredGrid(geo, (λ[sea], φlat[sea]), fill(4π / N, count(sea)))
-    kw = (; transform = SP_NU, solve = true, rtol = 1.0e-10, maxiter = 2000)
+    kw = (; transform = SP_NU, solve = true, rtol = 1.0e-12, maxiter = 2000)
     for exec in (SP_SER, CB.GPUBackend(KA.CPU()))
         cz, _ = FFS.calculate_spectrum(gm, fn, ms; execution = exec, kw...)
         cu, _ = FFS.calculate_spectrum(gu, fz, ms; execution = exec, kw...)
@@ -277,6 +277,46 @@ Test.@testset "The device SHT reads every order's longitude bin" begin
     gram = [2π * sum(wq .* P[row(l, m), :] .* P[row(l2, m), :]) - (l == l2)
             for m in 0:lmax for l in m:lmax for l2 in m:lmax]
     Test.@test maximum(abs, gram) < 1e-13
+end
+
+# `P̄_ℓ^m` up to lmax = 512 against the three-term recurrence in 256-bit `BigFloat`, whose exponent range
+# holds `sinᵐθ` at every order: rows next to both poles, mid-latitudes and the equator, host and device,
+# `Float64` and `Float32`. Each order's column lies within `lmax eps` of its largest value, plus the
+# `√((2lmax+1)/4π) 2^{−3K/2}` below which a value is stored as zero. At `θ = 0.467`, `m = 200` starts
+# at `sin²⁰⁰θ ≈ 10⁻⁶⁹`, below the `Float32` range, and the column reaches order one by `ℓ ≈ 444`.
+Test.@testset "normalized Legendre values at lmax = 512 against BigFloat" begin
+    SK = FFS.SphericalKernels
+    lmax = 512
+    ref_column(m, θ) = setprecision(BigFloat, 256) do
+        x = cos(BigFloat(θ)); s = sin(BigFloat(θ))
+        col = zeros(BigFloat, lmax - m + 1)
+        col[1] = prod(k -> -sqrt(BigFloat(2k + 1) / (2k)) * s, 1:m; init = 1 / sqrt(4 * BigFloat(π)))
+        m < lmax && (col[2] = x * sqrt(BigFloat(2m + 3)) * col[1])
+        for l in (m + 2):lmax
+            a = sqrt(BigFloat(4l^2 - 1) / (l^2 - m^2))
+            b = sqrt(BigFloat(2l + 1) * ((l - 1)^2 - m^2) / ((2l - 3) * (l^2 - m^2)))
+            col[l - m + 1] = x * a * col[l - m] - b * col[l - m - 1]
+        end
+        col
+    end
+    for FT in (Float64, Float32)
+        θs = FT[2π / 1030, 0.467, 1.2, π / 2, 2.5, π - 2π / 1030]
+        t = SK.legendre_tables(FT, lmax)
+        Plm = zeros(FT, lmax + 1, lmax + 1)
+        Pd = Array(SK.device_legendre_table(KA.CPU(), FT, lmax, θs))
+        floor = sqrt((2lmax + 1) / 4π) * ldexp(1.0, -3 * SK._span(FT) ÷ 2)
+        for (j, θ) in enumerate(θs)
+            SK.fill_legendre!(Plm, t, cos(θ), sin(θ), lmax)
+            for m in (0, 3, 100, 200, 300, 450, 512)
+                r = ref_column(m, θ)
+                tol = lmax * eps(FT) * Float64(maximum(abs, r)) + floor
+                host = Plm[(m + 1):(lmax + 1), m + 1]
+                dev = [Pd[SK.legendre_index(l, m, lmax), j] for l in m:lmax]
+                Test.@test maximum(abs, Float64.(host) .- Float64.(r)) <= tol
+                Test.@test maximum(abs, Float64.(dev) .- Float64.(r)) <= tol
+            end
+        end
+    end
 end
 
 Test.@testset "The device SHT synthesis evaluates the series at the nodes" begin

@@ -150,7 +150,7 @@ function FFS._calculate_spectrum_gpu_fft(exec::ComputationalBackends.AbstractGPU
     pms = FTB.packed_size(ns, Val(T <: Real))
     coeffs_dev = KA.allocate(exec.backend, Complex{RT}, pms..., batch...)
     ks = FFS.calculate_spectrum!(coeffs_dev, plan, field)
-    return FFS._to_host(coeffs_dev), ks
+    return FFS._like_field(field, coeffs_dev), ks
 end
 
 # The forward's split on a device: all-uniform takes the device FFT plan, uniform-in-some-directions the
@@ -372,7 +372,7 @@ function FFS._calculate_spectrum_gpu_sht(exec::ComputationalBackends.AbstractGPU
     plan = FFS.plan_spectrum(SpectralBackends.FSHTSpectralBackend(), exec, g,
         eltype(field) <: Real ? FT : Complex{FT}, ms; batch = FFS.Grids.field_batch_shape(g, field),
         sampling, weights, inactive)
-    coeffs = FFS.allocate_coefficients(plan)
+    coeffs = FFS._allocate_coefficients_like(field, plan)
     FFS.calculate_spectrum!(coeffs, plan, field)
     return coeffs, plan.ks
 end

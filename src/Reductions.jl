@@ -69,6 +69,42 @@ end
 
 @inline _kbin_centers(num_bins::Int, dk::T) where {T} = [T(0.5) * ((i - 1) * dk + i * dk) for i in 1:num_bins]
 
+# A mode's contribution to its bin from its fold weight `n` and its entry: `½ n P` from a power,
+# `½ n |C|²` from a coefficient, and `½ (X + (n − 1) X̄)` from a cross product, the `n − 1` adding the
+# stored mode's conjugate partner on a halved axis.
+struct _HalfPower end
+struct _HalfAbs2 end
+struct _HalfCross end
+@inline (::_HalfPower)(n, p) = n * p / 2
+@inline (::_HalfAbs2)(n, c) = n * abs2(c) / 2
+@inline (::_HalfCross)(n, x) = (x + (n - one(n)) * conj(x)) / 2
+
+"""
+    _radial_accumulate!(E, nmodes, val, A, ks, dk, k_top, cut) -> E
+
+Add `val(n, A[I, b])` to `E[bin, b]` and `n` to `nmodes[bin]` for every mode `I` of `A`
+`(ms…, batch…)`, `n` its fold weight and `bin` the radial bin of width `dk` holding `|k(I)|`;
+`cut = Val(true)` leaves out `|k| > k_top`. The GPUArraysCore extension runs a device `A` on its device,
+`E` and `nmodes` staying on the host.
+"""
+function _radial_accumulate!(E::AbstractArray, nmodes::AbstractVector{T}, val::V, A::AbstractArray,
+        ks_phys::Tuple, dk::T, k_top::T, ::Val{C}) where {T, V, C}
+    D = length(ks_phys)
+    nb = length(nmodes)
+    bat = CartesianIndices(ntuple(i -> size(A, D + i), Val(ndims(A) - D)))
+    @inbounds for I in CartesianIndices(ntuple(d -> size(A, d), Val(D)))
+        kmag = sqrt(ksq(T, ks_phys, I))
+        C && kmag > k_top && continue
+        bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
+        n = T(FTB.mode_fold(ks_phys, I))
+        nmodes[bin] += n
+        for Ib in bat
+            E[bin, Ib] += val(n, A[I, Ib])
+        end
+    end
+    return E
+end
+
 # Allocating setup (returns the k-bin centers too) for the allocating reductions.
 @inline function _radial_setup(ks_phys::Tuple, num_bins::Int, ::Type{T}, cut::Val = Val(true)) where {T}
     num_bins, dk, k_top = _radial_extent(ks_phys, num_bins, T, cut)
@@ -161,19 +197,9 @@ function _bin_isotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_bins::Int,
         convention::Normalization.SpectralConvention, cut::Val{C}) where {T, NP, C}
     D = length(ks_phys)
     num_bins, dk, k_top, k_bins = _radial_setup(ks_phys, num_bins, T, cut)
-    bat = CartesianIndices(ntuple(i -> size(P, D + i), Val(NP - D)))
-    E = zeros(T, num_bins, size(bat)...)
+    E = zeros(T, num_bins, ntuple(i -> size(P, D + i), Val(NP - D))...)
     nmodes = zeros(T, num_bins)
-    @inbounds for I in CartesianIndices(ntuple(d -> size(P, d), Val(D)))
-        kmag = sqrt(ksq(T, ks_phys, I))
-        C && kmag > k_top && continue
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
-        n = T(FTB.mode_fold(ks_phys, I))
-        nmodes[bin] += n
-        for Ib in bat
-            E[bin, Ib] += T(0.5) * n * P[I, Ib]
-        end
-    end
+    _radial_accumulate!(E, nmodes, _HalfPower(), P, ks_phys, dk, k_top, cut)
     _shell_values!(E, nmodes, dk, ks_phys, convention.estimator)
     _scale_bins!(E, dk, convention.scaling)
     return k_bins, E
@@ -224,21 +250,10 @@ end
 function _fill_isotropic!(E::AbstractArray{T}, k_bins::AbstractVector{T}, ks_phys::Tuple,
         coeffs::AbstractArray{Complex{T}, N}, convention::Normalization.SpectralConvention, req::Int,
         cut::Val{C}) where {T, N, C}
-    D = length(ks_phys)
     nb, dk, k_top = _radial_extent(ks_phys, req, T, cut)
     fill!(E, zero(T))
     fill!(k_bins, zero(T))
-    bat = CartesianIndices(ntuple(i -> size(coeffs, D + i), Val(N - D)))
-    @inbounds for I in CartesianIndices(ntuple(d -> size(coeffs, d), Val(D)))
-        kmag = sqrt(ksq(T, ks_phys, I))
-        C && kmag > k_top && continue
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, nb)
-        n = T(FTB.mode_fold(ks_phys, I))
-        k_bins[bin] += n
-        for Ib in bat
-            E[bin, Ib] += T(0.5) * n * abs2(coeffs[CartesianIndex(I, Ib)])
-        end
-    end
+    _radial_accumulate!(E, k_bins, _HalfAbs2(), coeffs, ks_phys, dk, k_top, cut)
     _shell_values!(E, k_bins, dk, ks_phys, convention.estimator)
     _scale_bins!(E, dk, convention.scaling)
     @inbounds for i in 1:nb
@@ -280,9 +295,26 @@ function _bin_anisotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_k_bins::I
     dθ = T(2π) / num_θ_bins
     k_bins = [T(0.5) * dk + (i - 1) * dk for i in 1:num_k_bins]
     θ_bins = [-T(π) + (j - T(0.5)) * dθ for j in 1:num_θ_bins]
-    bat = CartesianIndices(ntuple(i -> size(P, 2 + i), Val(NP - 2)))
-    E = zeros(T, num_k_bins, num_θ_bins, size(bat)...)
+    E = zeros(T, num_k_bins, num_θ_bins, ntuple(i -> size(P, 2 + i), Val(NP - 2))...)
     nmodes = zeros(T, num_k_bins, num_θ_bins)
+    _sector_accumulate!(E, nmodes, P, ks_phys, dk, dθ, k_max)
+    _sector_values!(E, nmodes, dk, dθ, ks_phys, convention.estimator)
+    _scale_bins!(E, dk * dθ, convention.scaling)
+    return k_bins, θ_bins, E
+end
+
+"""
+    _sector_accumulate!(E, nmodes, P, ks, dk, dθ, k_max) -> E
+
+Add `½ P[I, b]` to `E[ik, iθ, b]` and one to `nmodes[ik, iθ]` for every mode `I` of the 2D power `P`
+up to `k_max`, `(ik, iθ)` the bin of its magnitude and angle; a halved-axis mode's partner at `−k` lands
+in the opposite angle, and `k = 0` is spread evenly over the angles of the first bin. The GPUArraysCore
+extension runs a device `P` on its device.
+"""
+function _sector_accumulate!(E::AbstractArray{T}, nmodes::AbstractMatrix{T}, P::AbstractArray, ks_phys::Tuple,
+        dk::T, dθ::T, k_max::T) where {T}
+    num_k_bins, num_θ_bins = size(nmodes)
+    bat = CartesianIndices(ntuple(i -> size(P, 2 + i), Val(ndims(P) - 2)))
     @inbounds for I in CartesianIndices((size(P, 1), size(P, 2)))
         kx = T(ks_phys[1][I[1]])
         ky = T(ks_phys[2][I[2]])
@@ -320,9 +352,7 @@ function _bin_anisotropic(ks_phys::Tuple, P::AbstractArray{T, NP}, num_k_bins::I
             end
         end
     end
-    _sector_values!(E, nmodes, dk, dθ, ks_phys, convention.estimator)
-    _scale_bins!(E, dk * dθ, convention.scaling)
-    return k_bins, θ_bins, E
+    return E
 end
 
 _sector_values!(E, nmodes, dk, dθ, ks::Tuple, ::Normalization.ShellSum) = E
@@ -368,23 +398,9 @@ function _bin_cross(ks_phys::Tuple, P::AbstractArray{Complex{T}, NP}, num_bins::
         convention::Normalization.SpectralConvention) where {T, NP}
     D = length(ks_phys)
     num_bins, dk, k_max, k_bins = _radial_setup(ks_phys, num_bins, T)
-    bat = CartesianIndices(ntuple(i -> size(P, D + i), Val(NP - D)))
-    S = zeros(Complex{T}, num_bins, size(bat)...)
+    S = zeros(Complex{T}, num_bins, ntuple(i -> size(P, D + i), Val(NP - D))...)
     nmodes = zeros(T, num_bins)
-    @inbounds for I in CartesianIndices(ntuple(d -> size(P, d), Val(D)))
-        kmag = sqrt(ksq(T, ks_phys, I))
-        kmag > k_max && continue
-        bin = clamp(floor(Int, kmag / dk) + 1, 1, num_bins)
-        # A halved-axis interior mode's conjugate partner at −k is stored once; the two-sided cross bin
-        # is X + conj(X). `mode_fold` is 2 there and 1 at dc/Nyquist and on a full layout (where the −k
-        # mode is stored separately), so `(w−1)` selects the partner term without a branch.
-        w = T(FTB.mode_fold(ks_phys, I))
-        nmodes[bin] += w
-        for Ib in bat
-            x = P[I, Ib]
-            S[bin, Ib] += T(0.5) * (x + (w - one(w)) * conj(x))
-        end
-    end
+    _radial_accumulate!(S, nmodes, _HalfCross(), P, ks_phys, dk, k_max, Val(true))
     _shell_values!(S, nmodes, dk, ks_phys, convention.estimator)
     _scale_bins!(S, dk, convention.scaling)
     return k_bins, S
@@ -440,6 +456,20 @@ function transect_spectrum!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
     all(d -> 1 <= d <= D, dims) || throw(ArgumentError("transect dims must be spectral (1:$D)"))
     dk_prod = dk_product(T, ks_phys, dims)
     fill!(E_reduced, zero(T))
+    _transect_accumulate!(E_reduced, ks_phys, coeffs, dims)
+    E_reduced .*= dk_prod
+    return nothing
+end
+
+"""
+    _transect_accumulate!(E_reduced, ks, coeffs, dims) -> E_reduced
+
+Add `½|C|²` of every entry of `coeffs` to the entry of `E_reduced` its kept indices name, with the fold
+weights and partners of a halved axis. The GPUArraysCore extension runs a device `coeffs` on its device.
+"""
+function _transect_accumulate!(E_reduced::AbstractArray{T}, ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N},
+        dims::Tuple) where {T, N}
+    D = length(ks_phys)
     # Column-major linear index into E_reduced (kept spectral dims + all batch dims), built inline so
     # the reduction over the summed spectral dims is allocation-free.
     halved_out = FTB.is_halved(ks_phys[1]) && (1 in dims)
@@ -470,8 +500,7 @@ function transect_spectrum!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
             E_reduced[lin] += w * T(0.5) * abs2(coeffs[I])
         end
     end
-    E_reduced .*= dk_prod
-    return nothing
+    return E_reduced
 end
 
 # =============================================================================

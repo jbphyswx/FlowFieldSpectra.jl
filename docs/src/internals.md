@@ -167,6 +167,8 @@ FlowFieldSpectra.Reductions._shell_values!
 FlowFieldSpectra.SphericalKernels.LegendreTables
 FlowFieldSpectra.SphericalKernels.legendre_tables
 FlowFieldSpectra.SphericalKernels.fill_legendre!
+FlowFieldSpectra.SphericalKernels.legendre_start
+FlowFieldSpectra.SphericalKernels.legendre_order!
 FlowFieldSpectra.SphericalKernels.legendre_index
 FlowFieldSpectra.SphericalKernels.legendre_count
 FlowFieldSpectra.SphericalKernels.device_legendre_table

@@ -30,6 +30,7 @@ struct RFFTPlan{RT, D, NB, P, KS} <: FFS.AbstractSpectralPlan
     norm::RT                      # 1/prod(ns)
     neg::Bool
     ks_phys::KS
+    nthreads::Int                 # the transform's threads, which the scaling pass runs on too
 end
 
 # Complex-input plan: C2C fft (or bfft) over dims 1:D, writing the full native spectrum.
@@ -39,6 +40,7 @@ struct CFFTPlan{RT, D, NB, P, KS} <: FFS.AbstractSpectralPlan
     batch::NTuple{NB, Int}
     norm::RT
     ks_phys::KS
+    nthreads::Int
 end
 
 # One line each: a default `show` prints the FFTW plan, whose own `show` spans several lines.
@@ -65,7 +67,7 @@ function _fftw_plan(::Type{T}, g, ns::NTuple{D, Int}, a::AbstractArray, nthreads
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(true))
     bt = _batch_of(a, Val(D))
     return RFFTPlan{T, D, length(bt), typeof(fwd), typeof(ks)}(
-        fwd, ns, bt, one(T) / prod(ns), iflag < 0, ks)
+        fwd, ns, bt, one(T) / prod(ns), iflag < 0, ks, nthreads)
 end
 
 # The batch shape the plan was built over: whatever trails the `D` spatial dims of the planning array.
@@ -77,7 +79,7 @@ function _fftw_plan(::Type{Complex{RT}}, g, ns::NTuple{D, Int}, a::AbstractArray
                        FFTW.plan_bfft(a, 1:D; flags = flags, num_threads = nthreads)
     ks = FFS.Grids.physical_wavenumbers(g, ns, Val(false))
     bt = _batch_of(a, Val(D))
-    return CFFTPlan{RT, D, length(bt), typeof(fwd), typeof(ks)}(fwd, ns, bt, one(RT) / prod(ns), ks)
+    return CFFTPlan{RT, D, length(bt), typeof(fwd), typeof(ks)}(fwd, ns, bt, one(RT) / prod(ns), ks, nthreads)
 end
 
 """
@@ -90,9 +92,28 @@ in steady state.
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::RFFTPlan{RT, D}, field) where {RT, D}
     FFS.Plans._check_coefficients(coeffs, plan)
     LA.mul!(coeffs, plan.fwd, field)
-    LA.rmul!(coeffs, plan.norm)
-    plan.neg && (coeffs .= conj.(coeffs))
+    plan.neg ? _scale!(c -> conj(c) * plan.norm, coeffs, plan.nthreads) :
+               _scale!(c -> c * plan.norm, coeffs, plan.nthreads)
     return plan.ks_phys
+end
+
+# `c[i] = f(c[i])` over the whole array, split across `nthreads` threads where it is large enough to pay
+# for them.
+function _scale!(f::F, c::AbstractArray, nthreads::Int) where {F}
+    n = length(c)
+    k = min(nthreads, cld(n, 1 << 15))
+    if k <= 1
+        @inbounds @simd for i in eachindex(c)
+            c[i] = f(c[i])
+        end
+        return c
+    end
+    Threads.@threads for t in 1:k
+        @inbounds @simd for i in (div((t - 1) * n, k) + 1):div(t * n, k)
+            c[i] = f(c[i])
+        end
+    end
+    return c
 end
 
 """
@@ -104,7 +125,7 @@ into `coeffs`, scaled by `1/∏N`.
 function FFS.calculate_spectrum!(coeffs::AbstractArray{Complex{RT}}, plan::CFFTPlan{RT, D}, field) where {RT, D}
     FFS.Plans._check_coefficients(coeffs, plan)
     LA.mul!(coeffs, plan.fwd, field)
-    LA.rmul!(coeffs, plan.norm)
+    _scale!(c -> c * plan.norm, coeffs, plan.nthreads)
     return plan.ks_phys
 end
 
@@ -165,6 +186,29 @@ function FFS._calculate_spectrum_fft(exec::FFS._HostExec,
         coeffs = Array{Complex{RT}}(undef, ns..., batch...)
     end
     ks = FFS.calculate_spectrum!(coeffs, plan, f)
+    return coeffs, ks
+end
+
+# Several fields of one shape and type, the coefficients of field `k` the slice `k` of a new trailing axis:
+# one plan on the first field, executed on each into its slice, so no stacked copy of the fields is made.
+function FFS._calculate_spectrum_fft(exec::FFS._HostExec,
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        fields::Tuple, ms::Tuple; iflag::Int = 1, kwargs...)
+    f1 = first(fields)
+    ns, batch = _fft_setup(g, f1, ms)
+    T = eltype(f1)
+    RT = real(T)
+    csize = T <: Real ? FTB.packed_size(ns, Val(true)) : ns
+    # FFTW plans for the 16-byte alignment of the array they are built on; a slice past a misaligned
+    # offset needs a plan that takes any.
+    aligned = (prod(csize) * prod(batch; init = 1) * sizeof(Complex{RT})) % 16 == 0
+    flags = aligned ? FFTW.ESTIMATE : FFTW.ESTIMATE | FFTW.UNALIGNED
+    plan = _fftw_plan(T, g, ns, f1, FFS._backend_nthreads(exec), flags; iflag = iflag)
+    coeffs = Array{Complex{RT}}(undef, csize..., batch..., length(fields))
+    ks = plan.ks_phys
+    for (k, f) in enumerate(fields)
+        ks = FFS.calculate_spectrum!(selectdim(coeffs, ndims(coeffs), k), plan, f)
+    end
     return coeffs, ks
 end
 

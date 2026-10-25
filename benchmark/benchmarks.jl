@@ -9,6 +9,7 @@ using NUFSHT: NUFSHT
 using Random: Random
 using SpectralBackends: SpectralBackends as SB
 using FlowGeometries: FlowGeometries as FG
+using LinearAlgebra: LinearAlgebra
 
 const SUITE = BenchmarkGroup()
 const CARTGEOM = FG.Geometry.CartesianGeometry{Float64}()
@@ -72,7 +73,7 @@ for lmax in [16, 32, 64]
 end
 
 # =============================================================================
-# Spherical scattered grid: NUFSHT (adjoint + CG solve).
+# Spherical scattered grid: NUFSHT (adjoint and least-squares fit).
 # =============================================================================
 SUITE["spherical_scattered"] = BenchmarkGroup()
 for lmax in [8, 16, 32]
@@ -93,7 +94,7 @@ for lmax in [8, 16, 32]
     g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (φ, π / 2 .- θ), ones(N_pts))
     SUITE["spherical_scattered"]["lmax=$lmax"]["nufsht_adjoint"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.NUFSHTSpectralBackend(), solve = false, tol = 1e-8)
-    lmax <= 16 && (SUITE["spherical_scattered"]["lmax=$lmax"]["nufsht_cg"] =
+    lmax <= 16 && (SUITE["spherical_scattered"]["lmax=$lmax"]["nufsht_fit"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.NUFSHTSpectralBackend(), solve = true, rtol = 1e-6, maxiter = 500))
 end
 
@@ -130,11 +131,8 @@ end
 # FFTW's plan, a NUFFT's point sorting, a spherical grid's nodes and quadrature. `BenchmarkTools` records
 # the allocations alongside the time, which is the quantity a time loop actually feels.
 #
-# A group's timing can differ several-fold between a whole-suite run and that group run alone — the
-# NUFSHT plan measured 5.5 ms in a multi-group run against 0.32 ms alone and 0.14 ms outside the suite
-# entirely, while its memory was identical in all three. FFTW's thread count is process-global
-# and every group here holds live FFTW/FINUFFT plans; which of those carries across was not established.
-# Re-run a single group before believing a surprising time from it.
+# A group's timing can differ several-fold between a whole-suite run and that group run alone, its memory
+# unchanged; re-run a single group before believing a surprising time from it.
 # =============================================================================
 SUITE["plans"] = BenchmarkGroup()
 
@@ -280,8 +278,39 @@ for lmax in [16, 32]
     SUITE["plans"]["nufsht_lmax=$lmax"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
 end
 
+# =============================================================================
+# `calculate_spectrum` with every setting at its default, beside the operation it is built from at the
+# same thread count: one real FFT of the grid for the spectrum of `(u, v)` (two are needed), one type-1
+# NUFFT of both fields at the same modes for a point cloud. The ratio of a row to its `unit` row is the
+# number of those operations the call costs.
+# =============================================================================
+SUITE["defaults"] = BenchmarkGroup()
+let nt = Threads.nthreads()
+    N, L = 1024, 10.0
+    xs = _uaxis(L, N)
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; periodic = (true, true), period = (L, L))
+    Random.seed!(3)
+    u, v = randn(N, N), randn(N, N)
+    pr = FFTW.plan_rfft(u; num_threads = nt)
+    y = pr * u
+    SUITE["defaults"]["spectrum_uv/$(N)x$(N)"] = @benchmarkable FFS.calculate_spectrum($g, ($u, $v), ($N, $N))
+    SUITE["defaults"]["unit/rfft/$(N)x$(N)"] = @benchmarkable LinearAlgebra.mul!($y, $pr, $u)
+
+    M, m, Lc = 100_000, 128, 1000e3
+    xv, yv = Lc .* rand(M), Lc .* rand(M)
+    gc = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(Lc^2 / M, M); periodic = (true, true), period = (Lc, Lc))
+    uc, vc = randn(M), randn(M)
+    p = FTB.plan_nufft(FTB.NonuniformFFTsBackend(), Float64, (xv, yv), (m, m); period = Lc, ntrans = 2, nthreads = nt)
+    F, c = FTB.allocate_modes(p), FTB.allocate_values(p)
+    c[:, 1] .= uc
+    c[:, 2] .= vc
+    SUITE["defaults"]["spectrum_uv/cloud-$M/$(m)x$(m)"] = @benchmarkable FFS.calculate_spectrum($gc, ($uc, $vc), ($m, $m))
+    SUITE["defaults"]["unit/nufft_type1/cloud-$M/$(m)x$(m)"] = @benchmarkable FTB.nufft_type1!($F, $p, $c)
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
     println("Running FlowFieldSpectra.jl benchmarks...")
+    println("Julia threads ", Threads.nthreads(), ", FFTW threads ", FFTW.get_num_threads())
     tune!(SUITE)
     results = run(SUITE; verbose = true)
     println("\n" * "="^60 * "\nBENCHMARK RESULTS\n" * "="^60)

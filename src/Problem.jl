@@ -69,14 +69,21 @@ Convenience for the multi-field call form: stack equal-shaped field arrays along
 batch axis** (`(spatial…, batch…, NU)`). This materializes a combined array — pass a single
 `(spatial…, batch…)` array to avoid the copy.
 """
-function stack_fields(fields::Tuple)
+stack_fields(fields::Tuple) = (check_same_shape(fields); stack(fields))
+
+"""
+    check_same_shape(fields::Tuple) -> fields
+
+Raises unless there is at least one field and every field has the first one's shape.
+"""
+function check_same_shape(fields::Tuple)
     length(fields) >= 1 || throw(ArgumentError("need at least one field"))
     sz = size(fields[1])
     @inbounds for u in 2:length(fields)
         size(fields[u]) == sz ||
             throw(DimensionMismatch("all fields must share shape (field $u is $(size(fields[u])), field 1 is $sz)"))
     end
-    return stack(fields)
+    return fields
 end
 
 end # module Problem

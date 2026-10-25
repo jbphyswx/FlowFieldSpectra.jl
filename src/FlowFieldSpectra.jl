@@ -30,7 +30,7 @@ using .Grids: Grids, physical_wavenumbers, AbstractInactiveCells, ZeroFill, Excl
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling,
     AbstractShellEstimator, ShellSum, ModeAverage, SpectralConvention
-using .Problem: Problem, TransformProblem, batch_shape, stack_fields
+using .Problem: Problem, TransformProblem, batch_shape, stack_fields, check_same_shape
 using .Plans: Plans, AbstractSpectralPlan, plan_spectrum,
     coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
     AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
@@ -431,9 +431,23 @@ end
 _quadrature_keywords(kw::NamedTuple) =
     (; sampling = get(kw, :sampling, nothing), weights = get(kw, :weights, nothing))
 
-# Multi-field convenience: stack equal-shaped arrays along a new trailing batch axis.
-calculate_spectrum(grid::FlowGeometries.Grids.AbstractGrid, fields::Tuple, ms::Tuple; kwargs...) =
-    calculate_spectrum(grid, stack_fields(fields), ms; kwargs...)
+# Multi-field convenience: equal-shaped arrays as a new trailing batch axis. A transform that takes the
+# fields one at a time (the FFT on the host) writes each into its slice of the coefficients; every other
+# one transforms them stacked.
+function calculate_spectrum(grid::FlowGeometries.Grids.AbstractGrid, fields::Tuple, ms::Tuple;
+        transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
+        execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
+        preprocess::Union{Nothing, Preprocess} = nothing, kwargs...)
+    preprocess === nothing || return calculate_spectrum(grid, stack_fields(fields), ms; transform, execution,
+        preprocess, kwargs...)
+    check_same_shape(fields)
+    e = _resolve_execution(execution)
+    return calculate_spectrum(_resolve_transform(transform, grid, ms, e), e, grid, fields, ms; kwargs...)
+end
+
+calculate_spectrum(t::SpectralBackends.AbstractSpectralBackend, e::ComputationalBackends.AbstractExecutionBackend,
+    g::FlowGeometries.Grids.AbstractGrid, fields::Tuple, ms::Tuple; kwargs...) =
+    calculate_spectrum(t, e, g, stack_fields(fields), ms; kwargs...)
 
 # =============================================================================
 # Canonical two-axis dispatch: calculate_spectrum(transform, execution, grid, field, ms; …). The NUFFT
@@ -501,6 +515,14 @@ function calculate_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec:
     return _calculate_spectrum_hybrid(_resolve_nufft_provider(nufft), exec, g, field,
         NTuple{D, Int}(Tuple(ms)), umask; kwargs...)
 end
+function calculate_spectrum(t::SpectralBackends.AbstractFFTSpectralBackend, exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, fields::Tuple, ms::Tuple;
+        kwargs...)
+    all(_uniform_mask(g, Val(ndims(g)))) && _fieldwise(fields) && return _calculate_spectrum_fft(exec, g, fields, ms; kwargs...)
+    return calculate_spectrum(t, exec, g, stack_fields(fields), ms; kwargs...)
+end
+
+# Fields an FFT plan built on the first one executes on unchanged: `Array`s of one floating-point type.
+_fieldwise(fields::Tuple) = all(f -> f isa Array{eltype(first(fields))}, fields) && eltype(first(fields)) <: Union{AbstractFloat, Complex{<:AbstractFloat}}
 function calculate_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, field::AbstractArray, ms::Tuple;
         nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(), kwargs...)
     D = ndims(g)

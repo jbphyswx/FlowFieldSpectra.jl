@@ -11,13 +11,14 @@ function run_cartesian_example()
     println("--- Running Cartesian Grid Spectra Example ---")
 
     # 1. Uniform Cartesian grid — a FlowGeometries StructuredGrid over a CartesianGeometry, defined by
-    #    its axes (ranges) and marked periodic (the Fourier domain). Fields are plain (Nx, Ny) tensors.
+    #    its axes (ranges) and periodic in both directions (the Fourier domain). Fields are plain (Nx, Ny)
+    #    tensors.
     L = 2π
     N = 64
     xs = range(0.0, L; length = N + 1)[1:N]
     ys = range(0.0, L; length = N + 1)[1:N]
     grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 
     # Taylor–Green vortex velocity field (u, v) as tensors — no flattening.
     u = [cos(2x) * sin(2y) for x in xs, y in ys]
@@ -40,7 +41,7 @@ function run_cartesian_example()
     us = @. cos(2 * xj) * sin(2 * yj)
     vs = @. -sin(2 * xj) * cos(2 * yj)
     gscat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xj, yj), ones(N^2);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     c_nu, k_nu = FFS.calculate_spectrum(gscat, (us, vs), (N, N); transform = FTB.FINUFFTBackend())
     k_bins_s, E_k_s = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 32, dims = 3)
 

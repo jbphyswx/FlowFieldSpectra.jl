@@ -50,9 +50,7 @@ Test.@testset "The library spherical backends agree on the real layout" begin
     ms = (lmax + 1, 2 * lmax + 1)
     sph = FG.Geometry.SphericalGeometry(1.0)
 
-    Θ, Φ = FSH.sph_points(lmax + 1)
-    gcc = FG.Grids.StructuredGrid(sph, collect(Φ), Float64(π) / 2 .- collect(Θ);
-        periodic = (true, false), period = (2π, 0.0))
+    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), lmax + 1)
     cf, _ = FFS.calculate_spectrum(gcc, randn(size(gcc)...), ms; transform = SB.FSHTSpectralBackend(),
         execution = RS_SER)
     Test.@test eltype(cf) === Float64

@@ -1,6 +1,6 @@
-# Every steady-state in-place / prebuilt-plan path allocates exactly zero, on a 16² and a 32² grid, so no
-# count grows with the grid. Each probe goes through a function barrier and is warmed up first. (Grid
-# constructors + CB/SB aliases come from runtests.jl.)
+# Every steady-state in-place / prebuilt-plan path allocates exactly zero on SerialBackend, on a 16² and a
+# 32² grid, so no count grows with the grid. Each probe goes through a function barrier and is warmed up
+# first. (Grid constructors + CB/SB aliases come from runtests.jl.)
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
@@ -8,15 +8,17 @@ using FlowTransformBindings: FlowTransformBindings as FTB
 using FFTW: FFTW
 using FINUFFT: FINUFFT
 
-_a_iso!(Ek, kb, ks, c, nb) = @allocated FFS.isotropic_spectrum!(Ek, kb, ks, c; num_bins = nb)
-_a_sph!(El, C, l) = @allocated FFS.spherical_energy_spectrum!(El, C; lmax = l)
-_a_tr!(Er, ks, c, dims) = @allocated FFS.transect_spectrum!(Er, ks, c, dims)
+const _A_SER = CB.SerialBackend()
+_a_iso!(Ek, kb, ks, c, nb) = @allocated FFS.isotropic_spectrum!(Ek, kb, ks, c; num_bins = nb, execution = _A_SER)
+_a_sph!(El, C, l) = @allocated FFS.spherical_energy_spectrum!(El, C; lmax = l, execution = _A_SER)
+_a_tr!(Er, ks, c, dims) = @allocated FFS.transect_spectrum!(Er, ks, c, dims; execution = _A_SER)
 _a_planexec(out, plan, f) = @allocated FFS.calculate_spectrum!(out, plan, f)
 _a_synth!(out, plan, c) = @allocated FFS.synthesize!(out, plan, c)
 _a_div!(o, ks, c) = @allocated FFS.spectral_divergence!(o, ks, c)
 _a_vort!(o, ks, c) = @allocated FFS.spectral_vorticity!(o, ks, c)
-_a_welch!(Ek, kb, ks, c, nb) = @allocated FFS.welch_power_spectrum!(Ek, kb, ks, c; num_bins = nb)
-_a_coh!(g2, ph, kb, ks, cf, cg, nb) = @allocated FFS.coherence_spectrum!(g2, ph, kb, ks, cf, cg; num_bins = nb)
+_a_welch!(Ek, kb, ks, c, nb) = @allocated FFS.welch_power_spectrum!(Ek, kb, ks, c; num_bins = nb, execution = _A_SER)
+_a_coh!(g2, ph, kb, ks, cf, cg, nb) =
+    @allocated FFS.coherence_spectrum!(g2, ph, kb, ks, cf, cg; num_bins = nb, execution = _A_SER)
 _a_lomb!(P, t, y, freqs) = @allocated FFS.lomb_scargle!(P, t, y, freqs)
 
 function _zero_profile(N::Int)
@@ -49,7 +51,7 @@ function _zero_profile(N::Int)
     tr = _a_tr!(Er, ks, c, (1,))
 
     # Every plan names SerialBackend: the zero-allocation contract is the serial path's.
-    pms = FTB.packed_size(ms, Val(true))                      # real fields ⇒ packed half on axis 1
+    pms = FTB.packed_size(Real, ms)                           # real fields ⇒ packed half on axis 1
 
     fplan = FFS.plan_spectrum(ug, Float64, ms; transform = SB.FFTSpectralBackend(), execution = CB.SerialBackend())
     cf = zeros(ComplexF64, pms...)

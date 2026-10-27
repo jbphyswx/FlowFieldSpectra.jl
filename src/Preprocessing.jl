@@ -1,6 +1,7 @@
 module Preprocessing
 
 using LinearAlgebra: SymTridiagonal, eigen, pinv
+using ..Grids: Grids
 
 export AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey,
     AbstractDetrend, NoDetrend, Demean, LinearDetrend,
@@ -239,14 +240,14 @@ Multiply every batch slice of `field` point by point by the window `τ` of [`poi
 entry per spatial point of the leading `nsp` dims in column-major order.
 """
 function apply_window!(field::AbstractArray, τ::AbstractVector, nsp::Int)
-    N = prod(ntuple(d -> size(field, d), nsp))
+    N = _npoints(field, nsp)
     length(τ) == N || throw(DimensionMismatch("a window of $(length(τ)) entries for $N points"))
-    B = length(field) ÷ N
-    @inbounds for b in 1:B, j in 1:N
-        field[(b - 1) * N + j] *= τ[j]
-    end
+    reshape(field, N, length(field) ÷ N) .*= Grids._colocated(field, τ)
     return field
 end
+
+# The spatial points of the leading `nsp` dims.
+_npoints(field::AbstractArray, nsp::Int) = prod(d -> size(field, d), 1:nsp; init = 1)
 
 """
     detrend_spatial!(field, ::Demean, nsp, w)
@@ -262,71 +263,36 @@ leaves the residual orthogonal under `w` to the constant and to every coordinate
 """
 detrend_spatial!(field, ::NoDetrend, nsp::Int, args...) = field
 
+# `w f` per point and slice, zero at a point of zero weight whatever `f` holds there.
+_weighted(F::AbstractMatrix{T}, wd::AbstractVector) where {T} = ifelse.(iszero.(wd), zero(T), wd .* F)
+
 function detrend_spatial!(field::AbstractArray{T}, ::Demean, nsp::Int, w) where {T}
-    N = prod(ntuple(d -> size(field, d), nsp))
+    N = _npoints(field, nsp)
     length(w) == N || throw(DimensionMismatch("$(length(w)) weights for $N points"))
     R = real(float(T))
-    B = length(field) ÷ N
-    @inbounds for b in 1:B
-        off = (b - 1) * N
-        s = zero(T)
-        W = zero(R)
-        for j in 1:N
-            wj = R(w[j])
-            iszero(wj) && continue
-            s += wj * field[off + j]
-            W += wj
-        end
-        m = s / W
-        for j in 1:N
-            field[off + j] -= m
-        end
-    end
+    F = reshape(field, N, length(field) ÷ N)
+    wd = Grids._colocated(field, collect(R, w))
+    F .-= sum(_weighted(F, wd); dims = 1) ./ sum(wd)
     return field
 end
 
 function detrend_spatial!(field::AbstractArray{T}, ::LinearDetrend, nsp::Int, w, xs::Tuple) where {T}
-    N = prod(ntuple(d -> size(field, d), nsp))
+    N = _npoints(field, nsp)
     length(w) == N || throw(DimensionMismatch("$(length(w)) weights for $N points"))
     all(x -> length(x) == N, xs) || throw(DimensionMismatch("every coordinate needs one value per point"))
     R = real(float(T))
-    K = length(xs)
+    wh = collect(R, w)
+    W = sum(wh)
     # The coordinates centred on their weighted means, so the constant separates from the slopes, and
     # their weighted Gram matrix, shared by every slice.
-    W = sum(j -> iszero(w[j]) ? zero(R) : R(w[j]), 1:N)
-    x̄ = [sum(j -> iszero(w[j]) ? zero(R) : R(w[j]) * R(x[j]), 1:N) / W for x in xs]
-    G = zeros(R, K, K)
-    @inbounds for j in 1:N
-        iszero(w[j]) && continue
-        for a in 1:K, c in 1:K
-            G[a, c] += R(w[j]) * (R(xs[a][j]) - x̄[a]) * (R(xs[c][j]) - x̄[c])
-        end
-    end
-    Gp = pinv(G)
-    B = length(field) ÷ N
-    r = zeros(T, K)
-    @inbounds for b in 1:B
-        off = (b - 1) * N
-        fill!(r, zero(T))
-        s = zero(T)
-        for j in 1:N
-            iszero(w[j]) && continue
-            v = R(w[j]) * field[off + j]
-            s += v
-            for a in 1:K
-                r[a] += v * (R(xs[a][j]) - x̄[a])
-            end
-        end
-        m = s / W
-        slope = Gp * r
-        for j in 1:N
-            t = m
-            for a in 1:K
-                t += slope[a] * (R(xs[a][j]) - x̄[a])
-            end
-            field[off + j] -= t
-        end
-    end
+    Xc = hcat(map(x -> (xr = collect(R, x); xr .- sum(wh .* xr) / W), xs)...)
+    Gp = pinv(Xc' * (wh .* Xc))
+    F = reshape(field, N, length(field) ÷ N)
+    wd = Grids._colocated(field, wh)
+    Xd = Grids._colocated(field, Xc)
+    Fw = _weighted(F, wd)
+    slope = Grids._colocated(field, Gp) * (Xd' * Fw)
+    F .-= sum(Fw; dims = 1) ./ W .+ Xd * slope
     return field
 end
 
@@ -335,7 +301,7 @@ end
 # =============================================================================
 
 """
-    dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2NW) - 1); T = Float64) -> Matrix{T}
+    dpss([T = Float64,] N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2NW) - 1)) -> Matrix{T}
 
 Discrete prolate spheroidal sequences (Slepian tapers): the `K` length-`N` sequences with maximal
 spectral concentration in the half-bandwidth `W = NW/N`, returned as an `N×K` matrix whose column `k` is
@@ -345,10 +311,11 @@ time–bandwidth product (typical `2.5`–`4`); `K ≈ 2·NW − 1` tapers are u
 
 The tapers are the eigenvectors of a symmetric tridiagonal matrix (Percival & Walden). A multitaper
 estimate transforms the `K` tapered copies as a batch and averages their periodograms with
-[`welch_power_spectrum`](@ref).
+[`welch_power_spectrum`](@ref FlowFieldSpectra.Averaging.welch_power_spectrum).
 """
-function dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1);
-        T::Type = Float64)
+dpss(N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1)) = dpss(Float64, N, NW, K)
+
+function dpss(::Type{T}, N::Integer, NW::Real, K::Integer = max(1, floor(Int, 2 * NW) - 1)) where {T <: AbstractFloat}
     N >= 2 || throw(ArgumentError("N must be ≥ 2"))
     1 <= K <= N || throw(ArgumentError("need 1 ≤ K ≤ N"))
     W = T(NW) / N

@@ -29,16 +29,16 @@ Test.@testset "Auto picks the fast Cartesian transform and agrees with the direc
     L = 2π
     N = 8
     cart = FG.Geometry.CartesianGeometry{Float64}()
-    gu = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N); periodic = (true, true), period = (L, L))
-    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); periodic = (true, true), period = (L, L))
-    gs = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_unif(L, N); periodic = (true, true), period = (L, L))
-    ga = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_stretch(L, N); periodic = (true, true), period = (L, L))
+    gu = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gs = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    ga = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     cloud = FG.Grids.UnstructuredGrid(cart, (L .* rand(50), L .* rand(50)), fill(L^2 / 50, 50);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     X = [L * (i - 1) / N + 0.1 * L / N * sinpi(2 * (j - 1) / N) for i in 1:N, j in 1:N]
     Y = [L * (j - 1) / N + 0.1 * L / N * cospi(2 * (i - 1) / N) for i in 1:N, j in 1:N]
     gc = FG.Grids.CurvilinearGrid(cart, X, Y, trues(N, N); measure = fill(1.0, N, N),
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 
     # Uniform and asked for its own length: the FFT. Uniform in axis 1 and stretched in axis 2: the
     # hybrid composite, which the FFT tag selects. Axis 1 stretched, every axis stretched, a node cloud and
@@ -59,11 +59,9 @@ Test.@testset "Auto picks the fast spherical transform and agrees with the direc
     lmax = 4
     ms = (lmax + 1, 2 * lmax + 1)
 
-    # FastTransforms' own Clenshaw–Curtis grid at the matching size: the FSHT analysis. A Gauss–Legendre
-    # grid, a ring layout and a point cloud: NUFSHT.
-    Θ, Φ = FSH.sph_points(lmax + 1)
-    gcc = FG.Grids.StructuredGrid(FG.Geometry.SphericalGeometry(1.0), collect(Φ),
-        Float64(π) / 2 .- collect(Θ); periodic = (true, false), period = (2π, 0.0))
+    # FastTransforms' own grid (Fejér's first rule) at the matching size: the FSHT analysis. A
+    # Gauss–Legendre grid, a ring layout and a point cloud: NUFSHT.
+    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), lmax + 1)
     Test.@test at_auto(gcc, ms) isa SB.AbstractFSHTSpectralBackend
     Test.@test at_auto(gcc, (lmax + 2, 2 * lmax + 3)) isa SB.AbstractNUFSHTSpectralBackend
     ggl = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.GaussLegendreSampling(), lmax + 1)
@@ -87,11 +85,11 @@ Test.@testset "Auto on the in-place and plan entries" begin
     L = 2π
     N = 8
     cart = FG.Geometry.CartesianGeometry{Float64}()
-    g = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N); periodic = (true, true), period = (L, L))
-    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     M = 60
     cloud = FG.Grids.UnstructuredGrid(cart, (L .* rand(M), L .* rand(M)), fill(L^2 / M, M);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     f = randn(N, N)
     fcl = randn(M)
     cd, _ = FFS.calculate_spectrum(g, f, (N, N); transform = AT_DS, execution = AT_SER)

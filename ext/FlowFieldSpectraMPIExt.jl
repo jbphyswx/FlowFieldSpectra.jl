@@ -28,7 +28,7 @@ function _mpi_pointsum(b::ComputationalBackends.MPIBackend, transform, g::FlowGe
     comm = _comm(b)
     rank = MPI.Comm_rank(comm)
     nrank = MPI.Comm_size(comm)
-    Nglob = prod(ntuple(d -> size(field, d), ndims(g)))
+    Nglob = prod(size(g))
     fieldP = reshape(field, Nglob, FFS.Grids.field_batch_shape(g, field)...)
     idx = (rank + 1):nrank:Nglob                      # round-robin point share
     sg = FFS._subgrid(g, idx)
@@ -40,7 +40,7 @@ function _mpi_pointsum(b::ComputationalBackends.MPIBackend, transform, g::FlowGe
     coeffs = Array{eltype(cw)}(undef, size(cw))        # contiguous buffer for in-place Allreduce
     coeffs .= α .* Array(cw)
     MPI.Allreduce!(coeffs, +, comm)
-    return coeffs, FFS._partition_ks(g, ms, eltype(field) <: Real)
+    return coeffs, FFS._partition_ks(g, ms, float(eltype(field)))
 end
 
 # ---- batch-partition: disjoint batch slices Allreduced into a zero buffer ----
@@ -49,14 +49,14 @@ function _mpi_batch(b::ComputationalBackends.MPIBackend, transform, g::FlowGeome
     rank = MPI.Comm_rank(comm)
     nrank = MPI.Comm_size(comm)
     ns = ndims(g)
-    sp = ntuple(d -> size(field, d), ns)
-    batch = ntuple(i -> size(field, ns + i), ndims(field) - ns)
+    sp = size(g)
+    batch = FFS.Grids.field_batch_shape(g, field)
     B = prod(batch; init = 1)
     fieldB = reshape(field, sp..., B)
     bc = (rank * B ÷ nrank + 1):((rank + 1) * B ÷ nrank)   # this rank's disjoint batch range
-    FT = real(float(eltype(field)))
-    R = eltype(field) <: Real
-    spatial_out = FFS._coeff_spatial(g, ms, R)
+    E = float(eltype(field))
+    FT = real(E)
+    spatial_out = FFS._coeff_spatial(g, ms, E)
     coeffsB = zeros(FFS._coeff_eltype(g, eltype(field), FT), spatial_out..., B)
     if !isempty(bc)
         fslice = collect(selectdim(fieldB, ns + 1, bc))
@@ -64,7 +64,7 @@ function _mpi_batch(b::ComputationalBackends.MPIBackend, transform, g::FlowGeome
         @inbounds selectdim(coeffsB, ndims(coeffsB), bc) .= reshape(Array(cw), spatial_out..., length(bc))
     end
     MPI.Allreduce!(coeffsB, +, comm)                   # disjoint slices ⇒ sum assembles the full array
-    return reshape(coeffsB, spatial_out..., batch...), FFS._partition_ks(g, ms, R)
+    return reshape(coeffsB, spatial_out..., batch...), FFS._partition_ks(g, ms, E)
 end
 
 function FFS._calculate_spectrum_mpi(transform, exec::ComputationalBackends.MPIBackend,
@@ -119,7 +119,6 @@ function FFS._plan_spectrum_mpi(t::SpectralBackends.AbstractSpectralBackend,
     comm = _comm(exec)
     inner = ComputationalBackends.local_backend(exec)
     FT = real(float(T))
-    R = T <: Real
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
     sp = size(g)
@@ -137,8 +136,8 @@ function FFS._plan_spectrum_mpi(t::SpectralBackends.AbstractSpectralBackend,
     end
     cbuf = plan === nothing ? nothing : FFS.allocate_coefficients(plan)
     α = points ? FT(FFS._partition_weight(g, share, get(kwargs, :weights, nothing))) : nothing
-    so = FFS._coeff_spatial(g, ms, R)
-    ks = FFS._partition_ks(g, ms, R)
+    so = FFS._coeff_spatial(g, ms, T)
+    ks = FFS._partition_ks(g, ms, T)
     return MPISpectralPlan{FFS._coeff_eltype(g, T, FT), length(so), length(bt), typeof(ks), typeof(plan),
             typeof(fbuf), typeof(cbuf), typeof(share), typeof(α), typeof(comm), typeof(sp)}(
         plan, fbuf, cbuf, share, α, comm, sp, so, bt, Nglob, B, ks)
@@ -194,7 +193,6 @@ struct MPISynthesisPlan{OT, NB, LP, OB, SH, C, SP <: Tuple} <: FFS.AbstractSynth
     points::Bool
     comm::C
     spatial::SP
-    nspec::Int                    # spectral dims of the coefficients
     batch::NTuple{NB, Int}
     Nglob::Int
     B::Int
@@ -232,7 +230,7 @@ function FFS._plan_synthesis_mpi(t::SpectralBackends.AbstractSpectralBackend,
     FT = real(float(eltype(g)))
     OT = T <: Real ? FT : Complex{FT}
     return MPISynthesisPlan{OT, length(bt), typeof(plan), typeof(obuf), typeof(share), typeof(comm), typeof(sp)}(
-        plan, obuf, share, points, comm, sp, length(FFS._coeff_spatial(g, ms, T <: Real)), bt, Nglob, B)
+        plan, obuf, share, points, comm, sp, bt, Nglob, B)
 end
 
 """
@@ -241,7 +239,8 @@ end
 Evaluate the series `coeffs` at the grid's points into `out` on every rank: this rank evaluates its
 share, and `MPI.Allreduce!` assembles the disjoint shares.
 """
-function FFS.Plans.synthesize!(out::AbstractArray, p::MPISynthesisPlan, coeffs::AbstractArray)
+function FFS.Plans.synthesize!(out::AbstractArray, p::MPISynthesisPlan{OT, NB},
+        coeffs::AbstractArray) where {OT, NB}
     size(out) == FFS.Plans.field_size(p) || throw(DimensionMismatch(
         "out is $(size(out)); this plan writes $(FFS.Plans.field_size(p))"))
     fill!(out, zero(eltype(out)))
@@ -250,8 +249,9 @@ function FFS.Plans.synthesize!(out::AbstractArray, p::MPISynthesisPlan, coeffs::
             FFS.Plans.synthesize!(p.obuf, p.plan, coeffs)
             reshape(out, p.Nglob, p.B)[p.share, :] .= reshape(p.obuf, length(p.share), p.B)
         else
-            spec = ntuple(i -> size(coeffs, i), p.nspec)
-            c = collect(selectdim(reshape(coeffs, spec..., p.B), p.nspec + 1, p.share))
+            # The coefficients' spectral dims precede the plan's `NB` batch dims.
+            spec = ntuple(i -> size(coeffs, i), Val(ndims(coeffs) - NB))
+            c = collect(selectdim(reshape(coeffs, spec..., p.B), length(spec) + 1, p.share))
             FFS.Plans.synthesize!(p.obuf, p.plan, c)
             selectdim(reshape(out, p.spatial..., p.B), length(p.spatial) + 1, p.share) .=
                 reshape(p.obuf, p.spatial..., length(p.share))

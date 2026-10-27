@@ -14,9 +14,28 @@ using FlowGeometries: FlowGeometries
 # points. The batch is the inner contiguous loop.
 # =============================================================================
 
+FFS._available(::FFS._Threads) = true
+FFS._auto_execution(::FFS._Threads) =
+    (Threads.nthreads()) > 1 ? ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
+
 # Contiguous chunks of `1:n`, one per task.
 _task_chunks(n::Int) =
     (nt = max(1, min(Threads.nthreads(), n)); [(div((c - 1) * n, nt) + 1):div(c * n, nt) for c in 1:nt])
+
+# ---- Reductions: each task adds its contiguous range into zeroed copies of the accumulators ----
+function FFS.Reductions._split_sum!(f!::F, ::ComputationalBackends.AbstractThreadedBackend, accs::Tuple,
+        n::Int) where {F}
+    nt = max(1, min(Threads.nthreads(), n))
+    nt == 1 && return (f!(accs, 1:n); accs)
+    parts = [map(a -> fill!(similar(a), zero(eltype(a))), accs) for _ in 1:nt]
+    OMT.tforeach(1:nt; scheduler = OMT.StaticScheduler()) do t
+        f!(parts[t], (div((t - 1) * n, nt) + 1):div(t * n, nt))
+    end
+    for p in parts
+        foreach((a, q) -> (a .+= q), accs, p)
+    end
+    return accs
+end
 
 # ---- Cartesian forward (unstructured / scattered) ----
 # A point cloud does not factorize over a shared axis; each task takes a block of the last axis's modes,
@@ -57,45 +76,47 @@ function _sum_accumulators!(coeffs::AbstractArray, accs, lmax::Int, B::Int)
     return (0:lmax, -lmax:lmax)
 end
 
-# Tensor product: one longitude DFT for every latitude, then the θ contraction over latitude chunks.
+# The orders `0:lmax` over the tasks, task `t` taking orders `t-1, t-1+nt, …` and column `t` of the plan's
+# `Plm` for its degree recurrence. Each order owns its coefficient columns, so the tasks write disjoint
+# coefficients.
+function _by_orders(f::F, lmax::Int) where {F}
+    nt = max(1, min(Threads.nthreads(), lmax + 1))
+    OMT.tforeach(1:nt; scheduler = OMT.StaticScheduler()) do t
+        f((t - 1):nt:lmax, t)
+    end
+    return nothing
+end
+
+# Tensor product: one longitude DFT for every latitude, which BLAS threads, then the θ contraction by orders.
 function FFS._sph_run!(::ComputationalBackends.AbstractThreadedBackend, ::FlowGeometries.Grids.TensorRings,
         coeffs::AbstractArray{CT}, s, field::AbstractArray, lmax::Int, B::Int) where {CT <: Number}
-    FT = real(float(CT))
     FFS.DirectSum._sph_longitude_dft!(s.fhat, s.Wφ, field, s.nlon, s.nlat, B)
     FFS.DirectSum._sph_longitude_dft!(s.fhat2, s.Wφc, field, s.nlon, s.nlat, B)
     fill!(coeffs, zero(CT))
-    s.nlat == 0 && return (0:lmax, -lmax:lmax)
-    accs = OMT.tmap(_task_chunks(s.nlat)) do rows
-        acc = zeros(CT, lmax + 1, 2 * lmax + 1, B)
-        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
-        FFS.DirectSum._sph_theta_accumulate!(acc, s.fhat, s.fhat2, s.θ, s.wθ, s.tables, rows, lmax, B, Plm)
-        return acc
+    _by_orders(lmax) do orders, t
+        FFS.DirectSum._sph_order_accumulate!(coeffs, s.fhat, s.fhat2, s.θ, s.wθ, s.ys, s.ks, s.tables, orders,
+            lmax, B, view(s.Plm, :, t))
     end
-    return _sum_accumulators!(coeffs, accs, lmax, B)
+    return (0:lmax, -lmax:lmax)
 end
 
-# Iso-latitude rings: each task stages a `(lmax+1, |rows|, B)` block covering only the rings it owns, sums
-# their longitudes into it, and contracts that block.
+# Iso-latitude rings: the longitude sums with the rings split across tasks, each ring owning its columns of
+# the plan's sums, then the θ contraction by orders.
 function FFS._sph_run!(::ComputationalBackends.AbstractThreadedBackend, ::FlowGeometries.Grids.IsoLatitudeRings,
         coeffs::AbstractArray{CT}, s, field::AbstractArray, lmax::Int, B::Int) where {CT <: Number}
     FT = real(float(CT))
-    rt = s.rt
-    F = reshape(field, s.N, B)
     fill!(coeffs, zero(CT))
-    s.nr == 0 && return (0:lmax, -lmax:lmax)
-    accs = OMT.tmap(_task_chunks(s.nr)) do rows
-        acc = zeros(CT, lmax + 1, 2 * lmax + 1, B)
-        Plm = Matrix{FT}(undef, lmax + 1, lmax + 1)
-        nrows = length(rows)
-        fh = zeros(Complex{FT}, lmax + 1, nrows, B)
-        fh2 = FFS.DirectSum._partner_buffer(CT, FT, lmax + 1, nrows, B)
-        FFS.DirectSum._fill_partner!(fh2)
-        FFS.DirectSum._sph_ring_longitude!(fh, fh2, F, rt, rows, lmax, B, FT)
-        FFS.DirectSum._sph_theta_accumulate!(acc, fh, fh2, view(rt.θ, rows), nothing, s.tables,
-            1:nrows, lmax, B, Plm)
-        return acc
+    nr = s.nr
+    nt = max(1, min(Threads.nthreads(), nr))
+    OMT.tforeach(1:nt; scheduler = OMT.StaticScheduler()) do t
+        rows = (div((t - 1) * nr, nt) + 1):div(t * nr, nt)
+        FFS.DirectSum._sph_ring_longitude!(s.fhat, s.fhat2, field, s.N, s.rt, rows, lmax, B, FT)
     end
-    return _sum_accumulators!(coeffs, accs, lmax, B)
+    _by_orders(lmax) do orders, t
+        FFS.DirectSum._sph_order_accumulate!(coeffs, s.fhat, s.fhat2, s.rt.θ, nothing, s.ys, s.ks, s.tables,
+            orders, lmax, B, view(s.Plm, :, t))
+    end
+    return (0:lmax, -lmax:lmax)
 end
 
 # No rings: point chunks, each task projecting its points into its own accumulator.

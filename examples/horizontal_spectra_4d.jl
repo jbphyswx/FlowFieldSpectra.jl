@@ -29,7 +29,7 @@ function run_horizontal_spectra_4d_example()
     xv = rand(npts) .* L
     yv = rand(npts) .* L
     hgrid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(npts);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 
     # f(x, y, z, t) as a real (Npts, nz, nt) tensor — the (z, t) batch is the trailing axes.
     f = Array{Float64}(undef, npts, nz, nt)

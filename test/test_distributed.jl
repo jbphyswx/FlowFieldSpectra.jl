@@ -40,7 +40,7 @@ Test.@testset "Distributed spectrum parity" begin
     # The round-robin shares carry different mean measures (1 on odd points, 3 on even ones), so each
     # share's coefficients weigh in by its measure total, and the measure changes the coefficients.
     meas = [isodd(j) ? 1.0 : 3.0 for j in 1:N]
-    scw = FG.Grids.UnstructuredGrid(_cg(Float64), (xv, yv), meas; periodic = (true, true), period = (L, L))
+    scw = FG.Grids.UnstructuredGrid(_cg(Float64), (xv, yv), meas; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     for t in (SB.DirectSumSpectralBackend(), FTB.FINUFFTBackend())
         kw = t isa FTB.FINUFFTBackend ? (; eps = 1e-12) : (;)
         cw, _ = FFS.calculate_spectrum(scw, f, ms; transform = t, execution = CB.SerialBackend(), kw...)

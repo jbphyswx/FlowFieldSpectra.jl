@@ -21,9 +21,9 @@ Test.@testset "Cartesian direct-sum plan reuses its setup" begin
     L = 2π
     N = 8
     ms = (N, N)
-    gs = FG.Grids.StructuredGrid(dp_cart(), dp_str(L, N), dp_str(L, N); periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(dp_cart(), dp_str(L, N), dp_str(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     gc = FG.Grids.UnstructuredGrid(dp_cart(), (L .* rand(40), L .* rand(40)), fill(L^2 / 40, 40);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 
     for (g, n) in ((gs, (N, N)), (gc, (40,)))
         p = FFS.plan_spectrum(g, Float64, ms; transform = DP_DS, execution = DP_SER)
@@ -50,14 +50,14 @@ Test.@testset "A uniform grid transformed below its own length widens its even a
     L = 2π
     N = 12
     ax = range(0.0, L; length = N + 1)[1:N]
-    g = FG.Grids.StructuredGrid(dp_cart(), ax, ax; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(dp_cart(), ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     f = randn(N, N)
     for (ms, box) in (((8, 8), (9, 9)), ((7, 8), (7, 9)), ((8, 6), (9, 7)))
         c, ks = FFS.calculate_spectrum(g, f, ms; transform = DP_DS, execution = DP_SER)
         Test.@test FTB.full_size(ks) == box
         cf, _ = FFS.calculate_spectrum(g, complex.(f), box; transform = DP_DS, execution = DP_SER)
         Test.@test maximum(abs, FTB.unpacked(c, box) .- cf) < 1e-13
-        sf = FFS.synthesize(g, cf, box; transform = DP_DS, execution = DP_SER, real_output = false)
+        sf = FFS.synthesize(ComplexF64, g, cf, box; transform = DP_DS, execution = DP_SER)
         Test.@test maximum(abs, FFS.synthesize(g, c, ms; transform = DP_DS, execution = DP_SER) .- real.(sf)) <
             1e-12
     end
@@ -74,9 +74,9 @@ Test.@testset "Direct-sum plans under ThreadedBackend" begin
     L = 2π
     N = 8
     ms = (N, N)
-    gs = FG.Grids.StructuredGrid(dp_cart(), dp_str(L, N), dp_str(L, N); periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(dp_cart(), dp_str(L, N), dp_str(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     gc = FG.Grids.UnstructuredGrid(dp_cart(), (L .* rand(40), L .* rand(40)), fill(L^2 / 40, 40);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     for (g, n) in ((gs, (N, N)), (gc, (40,))), (T, batch) in cases
         p = FFS.plan_spectrum(g, T, ms; transform = DP_DS, execution = thr, batch = batch)
         buf = FFS.allocate_coefficients(p)

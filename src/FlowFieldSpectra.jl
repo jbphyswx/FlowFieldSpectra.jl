@@ -26,13 +26,14 @@ include("Operators.jl")
 include("Averaging.jl")
 include("LombScargle.jl")
 
-using .Grids: Grids, physical_wavenumbers, AbstractInactiveCells, ZeroFill, Exclude
+using .Grids: Grids, physical_wavenumbers, AbstractInactiveCells, ZeroFill, Exclude, AbstractAnalysis,
+    Quadrature, LeastSquares
 using .Preprocessing: AbstractWindow, NoWindow, Hann, Hamming, Blackman, Tukey, AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 using .Normalization: AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling,
     AbstractShellEstimator, ShellSum, ModeAverage, SpectralConvention
 using .Problem: Problem, TransformProblem, batch_shape, stack_fields, check_same_shape
 using .Plans: Plans, AbstractSpectralPlan, plan_spectrum,
-    coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
+    coefficient_size, coefficient_type, wavenumbers, allocate_coefficients, analysis_status,
     AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 using .DirectSum: DirectSum, sph_mode_index
 using .Reductions: isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, cross_spectrum, cospectrum, quadspectrum, anisotropic_spectrum
@@ -48,9 +49,9 @@ export AbstractDetrend, NoDetrend, Demean, LinearDetrend, Preprocess, dpss
 export AbstractSidedness, OneSided, TwoSided, AbstractScaling, DensityScaling, PowerScaling,
     AbstractShellEstimator, ShellSum, ModeAverage, SpectralConvention
 export TransformProblem
-export AbstractInactiveCells, ZeroFill, Exclude
+export AbstractInactiveCells, ZeroFill, Exclude, AbstractAnalysis, Quadrature, LeastSquares
 export AbstractSpectralPlan, plan_spectrum, preprocess_field
-export coefficient_size, coefficient_type, wavenumbers, allocate_coefficients
+export coefficient_size, coefficient_type, wavenumbers, allocate_coefficients, analysis_status
 export AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 # APIs
 export calculate_spectrum, calculate_spectrum!, synthesize, isotropic_spectrum, isotropic_spectrum!, transect_spectrum, transect_spectrum!, spherical_energy_spectrum, spherical_energy_spectrum!, sph_mode_index, sph_coeff_type
@@ -148,23 +149,18 @@ _window(g::FlowGeometries.Grids.AbstractGrid, ::Type{FT}, win, w) where {FT} = t
 # `ms`.
 function _padded(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, pad::Float64)
-    D = ndims(g)
-    all(d -> FlowGeometries.Grids.isuniform(g, d) && size(g, d) >= 2, 1:D) || return _padded_points(g, field, pad)
+    isempty(last(_axis_split(g))) || return _padded_points(g, field, pad)
     FT = eltype(g)
-    ns = ntuple(d -> size(g, d), D)
-    np = ntuple(d -> max(ns[d], round(Int, pad * ns[d])), D)
-    axs = ntuple(D) do d
-        ax = FlowGeometries.Grids.coordinates(g, d)
-        δ = FT(ax[2]) - FT(ax[1])
-        range(FT(ax[1]); step = δ, length = np[d])
-    end
-    per = ntuple(d -> FT(FlowGeometries.Grids.period(g, d)) * FT(np[d]) / FT(ns[d]), D)
+    ns = size(g)
+    np = map(n -> max(n, round(Int, pad * n)), ns)
+    axs = map((ax, n) -> range(FT(first(ax)); step = FT(step(ax)), length = n), FlowGeometries.Grids.coordinates(g),
+        np)
+    per = ntuple(d -> FT(FlowGeometries.Grids.period(g, d)) * FT(np[d]) / FT(ns[d]), Val(ndims(g)))
     gp = FlowGeometries.Grids.StructuredGrid(FlowGeometries.Grids.grid_geometry(g), axs...;
-        periodic = FlowGeometries.Grids.periodic_flags(g), period = per)
-    batch = ntuple(i -> size(field, D + i), ndims(field) - D)
-    out = zeros(eltype(field), np..., batch...)
-    copyto!(view(out, ntuple(d -> 1:ns[d], D)..., ntuple(_ -> Colon(), length(batch))...),
-        reshape(field, ns..., batch...))
+        topology = FlowGeometries.Grids.topology(g), period = per)
+    batch = Grids.field_batch_shape(g, field)
+    out = fill!(similar(field, eltype(field), np..., batch...), zero(eltype(field)))
+    copyto!(view(out, map(n -> 1:n, ns)..., map(_ -> Colon(), batch)...), reshape(field, ns..., batch...))
     return (gp, out, pad)
 end
 
@@ -177,15 +173,15 @@ _padded(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractC
 
 function _padded_points(g, field::AbstractArray, pad::Float64)
     FT = eltype(g)
-    D = FlowGeometries.Grids.ncoordinates(g)
     pts = FlowGeometries.Grids.materialize(g)
+    D = Val(length(pts))
     N = length(first(pts))
     per = ntuple(d -> FT(pad) * FT(FlowGeometries.Grids.domain_length(g, d)), D)
     gp = FlowGeometries.Grids.UnstructuredGrid(FlowGeometries.Grids.grid_geometry(g), pts,
         vec(FlowGeometries.Grids.measure_array(g)), _submask(FlowGeometries.Grids.mask(g), 1:N);
-        periodic = ntuple(_ -> true, D), period = per)
+        topology = ntuple(_ -> FlowGeometries.Grids.Periodic(), D), period = per)
     out = reshape(field, N, Grids.field_batch_shape(g, field)...)
-    out .*= inv(FT(pad))^D
+    out .*= inv(FT(pad))^length(pts)
     return (gp, out, pad)
 end
 
@@ -205,15 +201,11 @@ equal weight.
 """
 function quadrature_weighted(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray)
-    D = ndims(g)
-    N = prod(ntuple(d -> size(field, d), D))
+    N = prod(size(g))
     α = Grids.quadrature_scale(g, real(float(eltype(field))), N)
     α === nothing && return field
     out = similar(field, float(eltype(field)))
-    B = length(field) ÷ N
-    @inbounds for b in 1:B, j in 1:N
-        out[j + (b - 1) * N] = field[j + (b - 1) * N] * α[j]
-    end
+    quadrature_weighted_into!(reshape(out, N, length(field) ÷ N), field, Grids._colocated(field, α))
     return out
 end
 
@@ -223,9 +215,25 @@ quadrature_weighted(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmoni
     field::AbstractArray) = field
 
 # =============================================================================
-# Execution-backend resolution. `AutoBackend` resolves to `ThreadedBackend` when the OhMyThreads
-# extension is loaded and `Threads.nthreads() > 1`, else to `SerialBackend`. GPU, Distributed and MPI
-# backends need an explicit device or process context and are never selected automatically.
+# What the loaded packages provide to `AutoBackend` and `AutoSpectralBackend`: `_available(capability)` is
+# `false` here and `true` from an extension that implements it.
+# =============================================================================
+
+abstract type _Capability end
+struct _Threads <: _Capability end          # threaded runs
+struct _HostFFT <: _Capability end          # an AbstractFFTs implementation for host arrays
+struct _DeviceFFT <: _Capability end        # FFTs of device arrays through their AbstractFFTs implementation
+struct _DeviceKernels <: _Capability end    # device kernels
+struct _HostFSHT <: _Capability end         # FastSphericalHarmonics on its own grid
+struct _HostNUFSHT <: _Capability end       # NUFSHT plans over host nodes
+struct _DeviceNUFSHT <: _Capability end     # NUFSHT plans over device nodes
+
+_available(::_Capability) = false
+
+# =============================================================================
+# Execution-backend resolution. `AutoBackend` resolves to `ThreadedBackend` when threaded runs are
+# available and Julia has more than one thread, else to `SerialBackend`. GPU, Distributed and MPI backends
+# need an explicit device or process context and are never selected automatically.
 # =============================================================================
 """
     _backend_nthreads(exec) -> Int
@@ -260,14 +268,17 @@ _allocate_coefficients_like(field::AbstractArray, plan) =
     fill!(similar(field, Plans.coefficient_type(plan), Plans.coefficient_size(plan)...),
         zero(Plans.coefficient_type(plan)))
 
+# A one-shot synthesis's field, zeroed, where its coefficients live.
+_allocate_field_like(coeffs::AbstractArray, plan) =
+    fill!(similar(coeffs, Plans.field_type(plan), Plans.field_size(plan)...), zero(Plans.field_type(plan)))
+
 # The device coefficients `c` of a one-shot whose field is `field`, moved to the host for a host field.
 _like_field(field::AbstractArray, c::AbstractArray) = typeof(similar(field, eltype(c), 0)) <: Array ? _to_host(c) : c
 
 _resolve_execution(backend::ComputationalBackends.AbstractExecutionBackend) = ComputationalBackends.resolve_backend(backend)
-function _resolve_execution(::ComputationalBackends.AbstractAutoBackend)
-    threaded = Base.get_extension(@__MODULE__, :FlowFieldSpectraOhMyThreadsExt) !== nothing
-    return (threaded && Threads.nthreads() > 1) ? ComputationalBackends.ThreadedBackend() : ComputationalBackends.SerialBackend()
-end
+_resolve_execution(::ComputationalBackends.AbstractAutoBackend) = _auto_execution(_Threads())
+
+_auto_execution(::_Capability) = ComputationalBackends.SerialBackend()
 
 # =============================================================================
 # Transform resolution. `AutoSpectralBackend` resolves to the fastest loaded transform whose
@@ -279,12 +290,14 @@ end
 # axis; the hybrid also needs axis 1 uniform. Both are checked here.
 # =============================================================================
 
-_ext_loaded(name::Symbol) = Base.get_extension(@__MODULE__, name) !== nothing
-
 # A distributed run's transform is chosen for the backend each worker runs locally.
 _auto_exec(e::ComputationalBackends.AbstractExecutionBackend) = e
 _auto_exec(e::ComputationalBackends.AbstractDistributedBackend) = ComputationalBackends.local_backend(e)
 _auto_exec(e::ComputationalBackends.AbstractMPIBackend) = ComputationalBackends.local_backend(e)
+
+# A reduction runs on the calling process's own backend.
+Reductions._reduction_execution(e::ComputationalBackends.AbstractExecutionBackend) =
+    _auto_exec(_resolve_execution(e))
 
 # The NUFFT library available for this execution backend, or `nothing`: NonuniformFFTs, then FINUFFT. A
 # device plan's arrays come from the KernelAbstractions extension.
@@ -294,22 +307,19 @@ function _auto_nufft(::ComputationalBackends.AbstractExecutionBackend)
     return nothing
 end
 _auto_nufft(::ComputationalBackends.AbstractGPUBackend) =
-    _ext_loaded(:FlowFieldSpectraKernelAbstractionsExt) ? _auto_nufft(ComputationalBackends.SerialBackend()) :
-    nothing
+    _available(_DeviceKernels()) ? _auto_nufft(ComputationalBackends.SerialBackend()) : nothing
 
 # The FFT provider for this execution backend; the hybrid composite's uniform-axis pass takes the same one.
-_auto_fft(::ComputationalBackends.AbstractExecutionBackend) = _ext_loaded(:FlowFieldSpectraFFTWExt)
-_auto_fft(::ComputationalBackends.AbstractGPUBackend) = _ext_loaded(:FlowFieldSpectraKernelAbstractionsAbstractFFTsExt)
+_auto_fft(::ComputationalBackends.AbstractExecutionBackend) = _available(_HostFFT())
+_auto_fft(::ComputationalBackends.AbstractGPUBackend) = _available(_DeviceFFT())
 
 # FastSphericalHarmonics is a host library. The device-generic SHT carries its own grid requirement and is
 # selected explicitly.
-_auto_fsht(::ComputationalBackends.AbstractExecutionBackend) =
-    _ext_loaded(:FlowFieldSpectraFastSphericalHarmonicsExt)
+_auto_fsht(::ComputationalBackends.AbstractExecutionBackend) = _available(_HostFSHT())
 _auto_fsht(::ComputationalBackends.AbstractGPUBackend) = false
 
-_auto_nufsht(::ComputationalBackends.AbstractExecutionBackend) = _ext_loaded(:FlowFieldSpectraNUFSHTExt)
-_auto_nufsht(::ComputationalBackends.AbstractGPUBackend) =
-    _ext_loaded(:FlowFieldSpectraNUFSHTKernelAbstractionsExt)
+_auto_nufsht(::ComputationalBackends.AbstractExecutionBackend) = _available(_HostNUFSHT())
+_auto_nufsht(::ComputationalBackends.AbstractGPUBackend) = _available(_DeviceNUFSHT())
 
 """
     _sht_applicable(grid, ms) -> Bool
@@ -328,13 +338,13 @@ function _auto_transform(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGe
         ms::Tuple, exec)
     D = ndims(g)
     length(ms) == D || return SpectralBackends.DirectSumSpectralBackend()
-    umask = _uniform_mask(g, Val(D))
-    full = all(ntuple(d -> !umask[d] || ms[d] == size(g, d), D))
-    all(umask) && full && _auto_fft(exec) && return SpectralBackends.FFTSpectralBackend()
+    udims, sdims = _axis_split(g)
+    full = all(d -> ms[d] == size(g, d), udims)
+    isempty(sdims) && full && _auto_fft(exec) && return SpectralBackends.FFTSpectralBackend()
     nu = _auto_nufft(exec)
     # Mixed uniform/stretched: the hybrid runs one FFT over the uniform axes and a 1-D NUFFT per
     # stretched axis, so it needs both providers and axis 1 uniform.
-    umask[1] && !all(umask) && full && _auto_fft(exec) && nu !== nothing &&
+    FlowGeometries.Grids.isuniform(g, 1) && !isempty(sdims) && full && _auto_fft(exec) && nu !== nothing &&
         return SpectralBackends.FFTSpectralBackend()
     nu === nothing || return nu
     return _auto_fallback(g, "using FFTW, NonuniformFFTs or FINUFFT")
@@ -424,8 +434,21 @@ function calculate_spectrum(grid::FlowGeometries.Grids.AbstractGrid, field::Abst
     # Zero padding returns a lengthened grid, and the mode counts scale with it.
     gp, fp, scale = preprocess_field(grid, field, preprocess; _quadrature_keywords(values(kwargs))...)
     msp = scale == 1 ? ms : map(m -> max(1, round(Int, scale * m)), ms)
-    return calculate_spectrum(_resolve_transform(transform, gp, msp, e), e, gp, fp, msp; kwargs...)
+    t = _resolve_transform(transform, gp, msp, e)
+    return calculate_spectrum(t, e, gp, fp, msp; _analysis_kwargs(t, kwargs)...)
 end
+
+# The keywords a transform receives. Every transform computes the quadrature; NUFSHT alone also fits, so it
+# alone takes `analysis`.
+_analysis_kwargs(t::SpectralBackends.AbstractSpectralBackend, kwargs) =
+    _analysis_kwargs(t, get(kwargs, :analysis, Quadrature()), values(kwargs))
+_analysis_kwargs(::SpectralBackends.AbstractNUFSHTSpectralBackend, ::Quadrature, kw::NamedTuple) = kw
+_analysis_kwargs(::SpectralBackends.AbstractNUFSHTSpectralBackend, ::LeastSquares, kw::NamedTuple) = kw
+_analysis_kwargs(::SpectralBackends.AbstractSpectralBackend, ::Quadrature, kw::NamedTuple) =
+    Base.structdiff(kw, NamedTuple{(:analysis,)})
+_analysis_kwargs(t::SpectralBackends.AbstractSpectralBackend, ::LeastSquares, ::NamedTuple) =
+    throw(ArgumentError("$(nameof(typeof(t))) computes the quadrature; the least-squares fit " *
+        "(`analysis = LeastSquares()`) is NUFSHTSpectralBackend's"))
 
 # The spherical quadrature among a transform's keywords, which the preprocessing fits run under too.
 _quadrature_keywords(kw::NamedTuple) =
@@ -442,7 +465,8 @@ function calculate_spectrum(grid::FlowGeometries.Grids.AbstractGrid, fields::Tup
         preprocess, kwargs...)
     check_same_shape(fields)
     e = _resolve_execution(execution)
-    return calculate_spectrum(_resolve_transform(transform, grid, ms, e), e, grid, fields, ms; kwargs...)
+    t = _resolve_transform(transform, grid, ms, e)
+    return calculate_spectrum(t, e, grid, fields, ms; _analysis_kwargs(t, kwargs)...)
 end
 
 calculate_spectrum(t::SpectralBackends.AbstractSpectralBackend, e::ComputationalBackends.AbstractExecutionBackend,
@@ -478,8 +502,8 @@ function calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, box = nothing, kwargs...) where {D}
     prob = TransformProblem(g, field)
-    R = Val(eltype(field) <: Real)
-    pms = FTB.packed_size(Grids.mode_box(g, ms, R), R)
+    E = eltype(field)
+    pms = FTB.packed_size(E, Grids.mode_box(g, ms, E))
     coeffs = zeros(Complex{eltype(g)}, pms..., batch_shape(prob)...)
     ks = _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag, box)
     return coeffs, ks
@@ -503,35 +527,28 @@ calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend, exec::Co
 calculate_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, field::AbstractArray, ms::NTuple{2, Int}; kwargs...) =
     _gpu_directsum_spherical(exec, g, field, ms[1] - 1; kwargs...)
 
-# ---- Level 2: FFT (FFTW ext CPU; device-generic GPU FFT). Structured Cartesian. A grid uniform in
-# every direction takes the pure FFT; one uniform in some directions and stretched in others takes the
-# hybrid composite below. ----
-function calculate_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, field::AbstractArray, ms::Tuple;
+# ---- Level 2: FFT through AbstractFFTs (the AbstractFFTs extension), on host or device arrays.
+# Structured Cartesian. A grid uniform in every direction takes the pure FFT; one uniform in some
+# directions and stretched in others takes the hybrid composite below. ----
+function calculate_spectrum(::SpectralBackends.AbstractFFTSpectralBackend,
+        exec::Union{_HostExec, ComputationalBackends.AbstractGPUBackend},
+        g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+        field::AbstractArray, ms::Tuple;
         nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(), kwargs...)
-    D = ndims(g)
-    umask = _uniform_mask(g, Val(D))
-    all(umask) && return _calculate_spectrum_fft(exec, g, field, ms; kwargs...)
-    any(umask) || _all_stretched_fft()
+    udims, sdims = _axis_split(g)
+    isempty(sdims) && return _calculate_spectrum_fft(exec, g, field, ms; kwargs...)
+    isempty(udims) && _all_stretched_fft()
     return _calculate_spectrum_hybrid(_resolve_nufft_provider(nufft), exec, g, field,
-        NTuple{D, Int}(Tuple(ms)), umask; kwargs...)
+        NTuple{ndims(g), Int}(Tuple(ms)); kwargs...)
 end
 function calculate_spectrum(t::SpectralBackends.AbstractFFTSpectralBackend, exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend}, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, fields::Tuple, ms::Tuple;
         kwargs...)
-    all(_uniform_mask(g, Val(ndims(g)))) && _fieldwise(fields) && return _calculate_spectrum_fft(exec, g, fields, ms; kwargs...)
+    isempty(last(_axis_split(g))) && _fieldwise(fields) && return _calculate_spectrum_fft(exec, g, fields, ms; kwargs...)
     return calculate_spectrum(t, exec, g, stack_fields(fields), ms; kwargs...)
 end
 
 # Fields an FFT plan built on the first one executes on unchanged: `Array`s of one floating-point type.
 _fieldwise(fields::Tuple) = all(f -> f isa Array{eltype(first(fields))}, fields) && eltype(first(fields)) <: Union{AbstractFloat, Complex{<:AbstractFloat}}
-function calculate_spectrum(::SpectralBackends.AbstractFFTSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, field::AbstractArray, ms::Tuple;
-        nufft::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(), kwargs...)
-    D = ndims(g)
-    umask = _uniform_mask(g, Val(D))
-    all(umask) && return _calculate_spectrum_gpu_fft(exec, g, field, ms; kwargs...)
-    any(umask) || _all_stretched_fft()
-    return _calculate_spectrum_hybrid(_resolve_nufft_provider(nufft), exec, g, field,
-        NTuple{D, Int}(Tuple(ms)), umask; kwargs...)
-end
 
 # The FFT transforms the uniform axes of a grid, the hybrid composite needing at least one.
 @noinline _all_stretched_fft() = throw(ArgumentError(
@@ -562,20 +579,38 @@ calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::Compu
 # therefore pays the NUFFT only along z. The passes run on the execution backend's arrays: host arrays
 # through FFTW, device arrays through the device's AbstractFFTs provider.
 #
-# Axis 1 must be uniform, at its own length. The packed publish then reads `+N₁/2` at the native `−N₁/2`,
-# the same coefficient under uniform sampling. A stretched even axis `d ≥ 2` widens the coefficient box
-# (`Grids.mode_box`), whose modes at `+N_d/2` are conjugate reads of computed modes with `k₁ ≤ 0`; the FFT
-# pass is then complex, keeping the full `k₁` range, and otherwise it is an `rfft` halving axis 1.
+# Axis 1 must be uniform, at its own length, so the packed half's row `+N₁/2` is the native `−N₁/2`, the
+# same coefficient under uniform sampling. A real field's FFT pass is an `rfft`, halving axis 1, and the
+# stretched passes run on the `k₁ ≥ 0` lines alone. Each stretched axis transforms to its coefficient box's
+# modes (`Grids.mode_box`), the odd count `−N_d/2 … N_d/2` where an even axis widens, so the modes at
+# `+N_d/2` are computed directly ([`NUFFTAxisPass`](@ref)) and the last pass writes the coefficients in
+# their packed layout.
 #
-# Every pass leaves the unnormalized transform in native order, measured from each direction's origin
-# (the FFT axes' first sample, the NUFFT axes' folding origin); the `1/∏N_d` normalization is applied
-# once, by the packed-layout gather the NUFFT plans publish with (`_publish!`). The per-axis sign is
-# `Σ e^{-ikx}` for both providers, so `iflag = -1` is one conjugation of the whole product.
+# Every pass leaves the transform in native order, measured from each direction's origin (the FFT axes'
+# first sample, the NUFFT axes' folding origin); the `1/∏N_d` normalization rides on the quadrature weights
+# the field is staged with. The per-axis sign is `Σ e^{-ikx}` for both providers, so `iflag = -1` is one
+# conjugation of the whole product.
 # =============================================================================
 
-# Per-axis uniformity, answered from each axis's type. The `Val` length makes the result an
-# `NTuple{D,Bool}`, so the all-uniform and mixed branches resolve at compile time.
-_uniform_mask(g, ::Val{D}) where {D} = ntuple(d -> FlowGeometries.Grids.isuniform(g, d), Val(D))
+# Each direction's spacing trait, read from its axis type.
+_spacing_traits(g::FlowGeometries.Grids.AbstractStructuredGrid) =
+    map(FlowGeometries.Axes.spacing_trait, FlowGeometries.Grids.coordinates(g))
+
+# The entries of `xs` at the directions whose trait is an `S`, in order. Selected by dispatch on the traits,
+# so the result's length is fixed by the grid's type.
+_select(::Type{S}, ::Tuple{}, ::Tuple{}) where {S} = ()
+_select(::Type{S}, traits::Tuple, xs::Tuple) where {S} =
+    (_keep(S, first(traits), first(xs))..., _select(S, Base.tail(traits), Base.tail(xs))...)
+_keep(::Type{S}, ::S, x) where {S} = (x,)
+_keep(::Type, _, _) = ()
+
+# The uniform directions of a structured grid and its stretched ones, ascending.
+function _axis_split(g::FlowGeometries.Grids.AbstractStructuredGrid)
+    traits = _spacing_traits(g)
+    dims = ntuple(identity, Val(length(traits)))
+    return _select(FlowGeometries.Axes.UniformSpacing, traits, dims),
+        _select(FlowGeometries.Axes.NonuniformSpacing, traits, dims)
+end
 
 # The library that transforms the stretched axes. `AutoSpectralBackend` takes NonuniformFFTs when it is
 # loaded and FINUFFT when only it is; an explicit one is honoured as given.
@@ -590,35 +625,33 @@ function _resolve_nufft_provider(::SpectralBackends.AbstractAutoSpectralBackend)
 end
 
 """
-    _hybrid_derive(grid, ::Type{Tr}, ms, umask, R, iflag, eps) -> NamedTuple
+    _hybrid_derive(grid, ::Type{Tr}, ms, ::Type{T}, iflag, eps) -> NamedTuple
 
-Everything the hybrid composite needs before any transform runs: the per-axis coordinates, origins and
-Fourier lengths, which dims the FFT takes and which the NUFFT takes, the coefficient box and whether the
-FFT pass halves axis 1, the spectrum extents entering the publish, its sign, and the wavenumber axes.
+Everything the hybrid composite needs before any transform runs: the stretched axes, every axis's origin
+and Fourier length, which dims the FFT takes and which the NUFFT takes (tuples whose lengths the grid's
+axis types fix), the coefficient box, the coefficients' extents, its sign, and the wavenumber axes.
 """
-function _hybrid_derive(g, ::Type{Tr}, ms::NTuple{D, Int}, umask::NTuple{D, Bool}, R::Bool,
-        iflag::Int, eps::Union{Nothing, Real}) where {Tr, D}
-    umask[1] || throw(ArgumentError(
+function _hybrid_derive(g, ::Type{Tr}, ms::NTuple{D, Int}, ::Type{T}, iflag::Int,
+        eps::Union{Nothing, Real}) where {Tr, D, T}
+    FlowGeometries.Grids.isuniform(g, 1) || throw(ArgumentError(
         "the hybrid FFT/NUFFT transform needs axis 1 uniform (it carries the real field's halved axis, " *
         "whose Nyquist mode coincides with the native `-N₁/2` only under uniform sampling); axis 1 of " *
         "this grid is stretched. Use a NUFFT (`transform = FlowTransformBindings.NonuniformFFTsBackend()` " *
         "or `FlowTransformBindings.FINUFFTBackend()`), whose separable path transforms every axis."))
     Ns = size(g)
-    axs = ntuple(d -> Tr.(FlowGeometries.Grids.coordinates(g, d)), D)
-    offs_all, ranges = Grids.axis_geometry(Tr, g, D)
-    for d in 1:D
-        (!umask[d] || ms[d] == Ns[d]) || throw(ArgumentError(
+    udims, sdims = _axis_split(g)
+    for d in udims
+        ms[d] == Ns[d] || throw(ArgumentError(
             "axis $d is uniform, so it transforms by FFT and needs ms[$d] == size(grid, $d) = $(Ns[d]); " *
             "got $(ms[d]). Ask for the grid's own length on every uniform axis."))
     end
-    udims = Tuple(d for d in 1:D if umask[d])
-    sdims = Tuple(d for d in 1:D if !umask[d])
-    box = Grids.mode_box(g, ms, Val(R))
-    halve = R && box == ms
-    # Spectrum extents entering the publish: axis 1 is already halved by an `rfft` pass.
-    nsx = ntuple(d -> (d == 1 && halve) ? ms[1] ÷ 2 + 1 : ms[d], Val(D))
-    return (; Ns, npts = prod(Ns), axs, offs_all, ranges, udims, sdims, epsv = _nufft_tol(Tr, eps),
-        box, halve, neg = iflag < 0, nsx, ks_phys = physical_wavenumbers(ranges, box, Val(R)))
+    saxs = _select(FlowGeometries.Axes.NonuniformSpacing, _spacing_traits(g), FlowGeometries.Grids.coordinates(g))
+    offs_all, ranges = Grids.axis_geometry(Tr, g, Val(D))
+    box = Grids.mode_box(g, ms, T)
+    # The coefficients' extents: the box on every axis, a real field's axis 1 halved.
+    nsx = ntuple(d -> (d == 1 && T <: Real) ? ms[1] ÷ 2 + 1 : box[d], Val(D))
+    return (; Ns, npts = prod(Ns), saxs, offs_all, ranges, udims, sdims, epsv = _nufft_tol(Tr, eps),
+        box, neg = iflag < 0, nsx, ks_phys = physical_wavenumbers(ranges, box, T))
 end
 
 # One-shot: a plan for this field's batch shape, its uniform-axis FFT planned without measuring, executed
@@ -626,11 +659,11 @@ end
 function _calculate_spectrum_hybrid(t::SpectralBackends.AbstractNUFFTSpectralBackend,
         exec::Union{_HostExec, ComputationalBackends.AbstractGPUBackend},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        field::AbstractArray, ms::NTuple{D, Int}, umask::NTuple{D, Bool}; kwargs...) where {D}
-    plan = _hybrid_plan(t, exec, g, float(eltype(field)), ms, umask;
+        field::AbstractArray, ms::NTuple{D, Int}; kwargs...) where {D}
+    plan = _hybrid_plan(t, exec, g, float(eltype(field)), ms;
         batch = Grids.field_batch_shape(g, field), measure = false, kwargs...)
     try
-        coeffs = Array{Plans.coefficient_type(plan)}(undef, Plans.coefficient_size(plan)...)
+        coeffs = _allocate_coefficients_like(field, plan)
         return coeffs, calculate_spectrum!(coeffs, plan, field)
     finally
         Plans.close!(plan)
@@ -640,32 +673,29 @@ end
 """
     RegionFFT{P,S,O}
 
-The hybrid composite's FFT over its uniform axes, planned once on the execution backend's arrays.
-`halve` marks the real path, whose `rfft` shortens axis 1 to `n₁÷2+1`; `conj_in` conjugates a complex
-input, carrying `iflag = -1` through the composite. The field is copied into `scratch` and scaled there by
-the grid quadrature, so the caller's array is never mutated.
+The hybrid composite's FFT over its uniform axes, planned once on the execution backend's arrays. A real
+field takes an `rfft`, which shortens axis 1 to `n₁÷2+1`. `conj_in` conjugates a complex input, carrying
+`iflag = -1` through the composite. The field is staged into `scratch` with its quadrature weights, so the
+caller's array is never mutated.
 """
 struct RegionFFT{P, S, O <: Tuple}
     fwd::P
     scratch::S
     outsize::O
-    halve::Bool
     conj_in::Bool
 end
 
-Base.show(io::IO, r::RegionFFT) = print(io, "RegionFFT(", r.halve ? "rfft" : "fft", " → ", r.outsize, ")")
+Base.show(io::IO, r::RegionFFT) =
+    print(io, "RegionFFT(", eltype(r.scratch) <: Real ? "rfft" : "fft", " → ", r.outsize, ")")
 
 # Output shape of the uniform-axis pass, which sizes the working array after it.
 _region_fft_size(r::RegionFFT) = r.outsize
 
-# The uniform-axis pass of `field` into `out`, the field weighted by the per-node quadrature factor `qw`
-# (`nothing` for a constant measure) on its way into the scratch.
-function _region_fft_exec!(out::AbstractArray, r::RegionFFT, field, qw, npts::Int, ntrans::Int)
-    _stage!(r.scratch, field)
-    _scale_points!(r.scratch, qw, npts, ntrans)
-    r.conj_in && (r.scratch .= conj.(r.scratch))
-    LinearAlgebra.mul!(out, r.fwd, r.scratch)
-    return out
+# The uniform-axis pass of `field` into `out`, the field weighted by `w` (`_point_weights`) on its way into
+# the scratch.
+function _region_fft_exec!(out::AbstractArray, r::RegionFFT, field, w, npts::Int, ntrans::Int)
+    _stage_weighted!(r.scratch, field, w, npts, ntrans, r.conj_in)
+    return LinearAlgebra.mul!(out, r.fwd, r.scratch)
 end
 
 """
@@ -673,26 +703,22 @@ end
 
 Reusable plan for a Cartesian grid uniform in some directions and stretched in others, on the host or a
 device: the FFT over the uniform axes ([`RegionFFT`](@ref)), one 1-D type-1 NUFFT per stretched axis, the
-`length(sdims) + 1` working arrays the passes write through, and the table that publishes the coefficient
-box. `R` marks a real field. Execute with `calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref)
-releases the NUFFT library plans.
+`length(sdims) + 1` working arrays the passes write through, the last in the coefficients' layout, and the
+per-point weights the field is staged with. `R` marks a real field. Execute with
+`calculate_spectrum!(coeffs, plan, field)`; [`close!`](@ref) releases the NUFFT library plans.
 """
-struct HybridPlan{T, D, R, NB, FP, AP, W, QW, IX, ST, KS, SD} <: Plans.AbstractSpectralPlan
+struct HybridPlan{T, D, R, NB, FP, AP, W, WP, KS, SD} <: Plans.AbstractSpectralPlan
     region::FP                       # the uniform-axis FFT, planned
     axes::AP                         # one axis pass per stretched dim, in `sdims` order
     sdims::SD
-    work::W                          # working arrays; `work[1]` takes the region output
-    qw::QW                           # (N,) grid quadrature factor on the backend, `nothing` if constant
-    src::IX                          # coefficient → entry of one transform's spectrum (`_packed_src`)
-    stage::ST                        # device staging for the coefficients, or `nothing` on the host
+    work::W                          # working arrays; `work[1]` takes the region output, the last the coefficients
+    w::WP                            # quadrature factor over ∏N_d per point, one number for a constant measure
     ms::NTuple{D, Int}
     box::NTuple{D, Int}              # coefficient box
-    nsx::NTuple{D, Int}              # spectrum extents entering the publish
     batch::NTuple{NB, Int}
     ntrans::Int
     npts::Int
     neg::Bool
-    scale::T                         # 1/∏N_d
     ks::KS
 end
 
@@ -701,12 +727,12 @@ Base.show(io::IO, ::HybridPlan{T, D, R}) where {T, D, R} =
 
 # A real field publishes the packed half of its coefficient box; a complex one keeps every native mode.
 Plans.coefficient_size(p::HybridPlan{T, D, R}) where {T, D, R} =
-    (FTB.packed_size(p.box, Val(R))..., p.batch...)
+    (FTB.packed_size(_layout_type(R), p.box)..., p.batch...)
 Plans.coefficient_type(::HybridPlan{T}) where {T} = Complex{T}
 Plans.wavenumbers(p::HybridPlan) = p.ks
 
 """
-    _hybrid_plan(nufft, exec, grid, ::Type{T}, ms, umask; batch, iflag, eps, measure = true, kwargs...)
+    _hybrid_plan(nufft, exec, grid, ::Type{T}, ms; batch, iflag, eps, measure = true, kwargs...)
 
 A [`HybridPlan`](@ref) on `exec`, a host or a device backend, for a grid uniform in some directions and
 stretched in others. `measure` selects FFTW's measured planning for the uniform axes; the one-shot
@@ -715,36 +741,30 @@ transform passes `false`.
 function _hybrid_plan(nufft::SpectralBackends.AbstractSpectralBackend,
         exec::Union{_HostExec, ComputationalBackends.AbstractGPUBackend},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ::Type{T}, ms::NTuple{D, Int}, umask::NTuple{D, Bool}; batch::Tuple = (), iflag::Int = 1,
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1,
         eps::Union{Nothing, Real} = nothing, measure::Bool = true, kwargs...) where {T, D}
-    t = _resolve_nufft_provider(nufft)
+    t = _planned_library(_resolve_nufft_provider(nufft), exec, measure)
     Tr = real(float(T))
     R = T <: Real
-    h = _hybrid_derive(g, Tr, ms, umask, R, iflag, eps)
+    h = _hybrid_derive(g, Tr, ms, T, iflag, eps)
     bt = NTuple{length(batch), Int}(batch)
     ntrans = prod(bt; init = 1)
-    region = _region_fft_plan(exec, T, (h.Ns..., bt...), h.udims, h.halve, !R && h.neg, measure)
+    region = _region_fft_plan(exec, T, (h.Ns..., bt...), h.udims, !R && h.neg, measure)
     rsize = _region_fft_size(region)
-    # Each stretched axis shortens its own dim: `outs[i]` is the size pass `i` writes and `ins[i]` the
-    # size it reads.
-    outs = accumulate((s, d) -> _axis_out_size(s, d, ms[d]), h.sdims; init = rsize)
+    # Each stretched axis transforms to its box's modes: `outs[i]` is the size pass `i` writes and
+    # `ins[i]` the size it reads.
+    outs = accumulate((s, d) -> _axis_out_size(s, d, h.box[d]), h.sdims; init = rsize)
     ins = (rsize, Base.front(outs)...)
-    axes = _axis_passes(length(h.sdims)) do i
-        d = h.sdims[i]
-        _axis_nufft_plan(t, exec, Tr, ins[i], d, h.axs[d], ms[d], h.ranges[d], h.offs_all[d], h.epsv;
+    axes = _axis_passes(h.sdims, h.saxs, ins) do d, axis, insize
+        _axis_nufft_plan(t, exec, Tr, insize, d, axis, ms[d], h.box[d], h.ranges[d], h.offs_all[d], h.epsv;
             kwargs...)
     end
     return _closing_on_error(axes) do
         work = (_alloc(exec, Complex{Tr}, rsize...), map(s -> _alloc(exec, Complex{Tr}, s...), outs)...)
-        qwh = Grids.quadrature_scale(g, Tr, h.npts)
-        qw = qwh === nothing ? nothing : _to_exec(exec, collect(Tr, qwh))
-        src = _to_exec(exec, _packed_src(ms, h.box, h.nsx, Val(R)))
-        stage = _on_device(exec) ? _alloc(exec, Complex{Tr}, prod(FTB.packed_size(h.box, Val(R))) * ntrans) :
-            nothing
-        HybridPlan{Tr, D, R, length(bt), typeof(region), typeof(axes), typeof(work), typeof(qw), typeof(src),
-                typeof(stage), typeof(h.ks_phys), typeof(h.sdims)}(
-            region, axes, h.sdims, work, qw, src, stage, ms, h.box, h.nsx, bt, ntrans, h.npts, h.neg,
-            one(Tr) / h.npts, h.ks_phys)
+        w = _point_weights(exec, Grids.quadrature_scale(g, Tr, h.npts), Tr, h.npts)
+        HybridPlan{Tr, D, T <: Real, length(bt), typeof(region), typeof(axes), typeof(work), typeof(w),
+                typeof(h.ks_phys), typeof(h.sdims)}(
+            region, axes, h.sdims, work, w, ms, h.box, bt, ntrans, h.npts, h.neg, h.ks_phys)
     end
 end
 
@@ -762,45 +782,42 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, p::HybridPlan{T,
         "field holds $(length(field)) values; this plan was built for $(p.npts * p.ntrans) — pass the " *
         "matching `batch=` to plan_spectrum"))
     Plans._check_coefficients(coeffs, p)
-    W = _region_fft_exec!(first(p.work), p.region, field, p.qw, p.npts, p.ntrans)
-    F = _run_stretched!(W, Base.tail(p.work), p.axes, p.sdims)
-    Pn = prod(p.nsx)
-    _publish!(coeffs, 0, F, 0, Pn, p.src, p.scale, prod(FTB.packed_size(p.box, Val(R))), p.ntrans, p.neg,
-        p.stage)
+    W = _region_fft_exec!(first(p.work), p.region, field, p.w, p.npts, p.ntrans)
+    F = _run_into!(coeffs, W, p.work, p.axes, p.sdims)
+    _finish_coefficients!(coeffs, F, p.ms, p.box, p.neg)
     return p.ks
 end
 
 # =============================================================================
-# The hybrid composite's synthesis, `f(x) = Σ_κ C_κ e^{+iflag·iκ·(x - x₀)}` over the native spectrum. A
-# packed half is written on the host as the native series whose real part is its series over the
-# coefficient box (`DirectSum.native_coefficients!`; axis 1, uniform at its own length, is never widened),
-# and the series then separates: an unnormalized backward FFT over the uniform axes, then a 1-D type-2
-# NUFFT along each stretched axis, every other dim a transform of the batch. The forward's `1/∏N_d` stands
-# on the coefficients, so neither direction rescales. A real field is the real part of the native series.
+# The hybrid composite's synthesis, `f(x) = Σ_κ C_κ e^{+iflag·iκ·(x - x₀)}` over the coefficient box. The
+# series separates: a 1-D type-2 NUFFT along each stretched axis from its box's modes to its points, every
+# other dim a transform of the batch, then an unnormalized backward FFT over the uniform axes. A real
+# field's packed half holds the `k₁ ≥ 0` lines, which the passes keep Hermitian in `k`, so the stretched
+# passes run on those lines alone and the backward FFT is the c2r transform, which writes the real field.
+# The forward's `1/∏N_d` stands on the coefficients, so neither direction rescales. Every step runs in the
+# plan's memory.
 # =============================================================================
 
 """
     HybridSynthesisPlan{T,D,R}
 
 Reusable synthesis for a Cartesian grid uniform in some directions and stretched in others, the
-counterpart of [`HybridPlan`](@ref) on the host or a device: the in-place backward FFT over the uniform
-axes, one 1-D type-2 NUFFT per stretched axis, the working arrays the passes write through, and the host
-native spectrum a packed half is written into. `R` marks a real field. Execute with
+counterpart of [`HybridPlan`](@ref) on the host or a device: one 1-D type-2 NUFFT per stretched axis, the
+backward FFT over the uniform axes (c2r for a real field), the working arrays the passes write through, and
+on a device the field buffer a host array is filled from. `R` marks a real field. Execute with
 `synthesize!(out, plan, coeffs)`; [`close!`](@ref) releases the NUFFT library plans.
 """
-struct HybridSynthesisPlan{T, D, R, NB, FP, AP, W, HF, HC, OB, SD, SP} <: Plans.AbstractSynthesisPlan
-    region::FP                       # in-place backward FFT over the uniform axes of `work[1]`
+struct HybridSynthesisPlan{T, D, R, NB, FP, AP, W, OB, SD, SP} <: Plans.AbstractSynthesisPlan
+    region::FP                       # out-of-place unnormalized backward FFT over the uniform axes
+    neg::Bool                        # `iflag = -1`: the region pass conjugated
     axes::AP                         # one type-2 axis pass per stretched dim, in `sdims` order
     sdims::SD
-    work::W                          # `work[1]` the native spectrum `(ms…, ntrans)`, `work[i+1]` pass `i`'s output
-    full::HF                         # host native spectrum a packed half is written into (`work[1]` on the host)
-    hc::HC                           # host copy of a device packed half, or `nothing`
-    outd::OB                         # a real field on the device, the last pass's real part, or `nothing`
+    work::W                          # `work[1]` the coefficients `(nsx…, batch…)`, `work[i+1]` pass `i`'s output
+    outd::OB                         # device field, `nothing` on the host
     ms::NTuple{D, Int}
     box::NTuple{D, Int}              # coefficient box
     spatial::SP
     batch::NTuple{NB, Int}
-    ntrans::Int
 end
 
 Base.show(io::IO, ::HybridSynthesisPlan{T, D, R}) where {T, D, R} =
@@ -810,7 +827,7 @@ Plans.field_size(p::HybridSynthesisPlan) = (p.spatial..., p.batch...)
 Plans.field_type(::HybridSynthesisPlan{T, D, R}) where {T, D, R} = R ? T : Complex{T}
 
 """
-    _hybrid_synthesis_plan(nufft, exec, grid, ::Type{T}, ms, umask; batch, iflag, eps, measure = true, kwargs...)
+    _hybrid_synthesis_plan(nufft, exec, grid, ::Type{T}, ms; batch, iflag, eps, measure = true, kwargs...)
 
 A [`HybridSynthesisPlan`](@ref) on `exec`, a host or a device backend, for a grid uniform in some
 directions and stretched in others, `T` the field's element type. `measure` selects FFTW's measured
@@ -819,34 +836,28 @@ planning for the uniform axes; a one-shot synthesis passes `false`.
 function _hybrid_synthesis_plan(nufft::SpectralBackends.AbstractSpectralBackend,
         exec::Union{_HostExec, ComputationalBackends.AbstractGPUBackend},
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ::Type{T}, ms::NTuple{D, Int}, umask::NTuple{D, Bool}; batch::Tuple = (), iflag::Int = 1,
+        ::Type{T}, ms::NTuple{D, Int}; batch::Tuple = (), iflag::Int = 1,
         eps::Union{Nothing, Real} = nothing, measure::Bool = true, kwargs...) where {T, D}
-    t = _resolve_nufft_provider(nufft)
+    t = _planned_library(_resolve_nufft_provider(nufft), exec, measure)
     Tr = real(float(T))
-    R = T <: Real
-    h = _hybrid_derive(g, Tr, ms, umask, R, iflag, eps)
+    h = _hybrid_derive(g, Tr, ms, T, iflag, eps)
     bt = NTuple{length(batch), Int}(batch)
-    ntrans = prod(bt; init = 1)
-    # Each stretched axis grows its own dim from `ms[d]` modes to `Ns[d]` points: `outs[i]` is the size
-    # pass `i` writes.
-    s0 = (ms..., ntrans)
+    # The coefficients enter at their own shape, the packed half for a real field, and each stretched axis
+    # grows its own dim from its box's modes to `Ns[d]` points: `outs[i]` is the size pass `i` writes.
+    s0 = (h.nsx..., bt...)
     outs = accumulate((s, d) -> _axis_out_size(s, d, h.Ns[d]), h.sdims; init = s0)
     # The type 2 evaluates `Σ û e^{-iflag'·iκy}`, FlowTransformBindings' sign `iflag' = -iflag`.
-    axes = _axis_passes(length(h.sdims)) do i
-        d = h.sdims[i]
-        _axis_nufft_plan(t, exec, Tr, outs[i], d, h.axs[d], ms[d], h.ranges[d], h.offs_all[d], h.epsv;
+    axes = _axis_passes(h.sdims, h.saxs, outs) do d, axis, outsize
+        _axis_nufft_plan(t, exec, Tr, outsize, d, axis, ms[d], h.box[d], h.ranges[d], h.offs_all[d], h.epsv;
             iflag = -iflag, kwargs...)
     end
     return _closing_on_error(axes) do
         work = (_alloc(exec, Complex{Tr}, s0...), map(s -> _alloc(exec, Complex{Tr}, s...), outs)...)
-        region = _region_bfft_plan(exec, first(work), h.udims, iflag, measure)
-        dev = _on_device(exec)
-        full = !R ? nothing : dev ? Array{Complex{Tr}}(undef, s0...) : first(work)
-        hc = (R && dev) ? Array{Complex{Tr}}(undef, FTB.packed_size(h.box, Val(true))..., ntrans) : nothing
-        outd = (dev && R) ? _alloc(exec, Tr, h.Ns..., ntrans) : nothing
-        HybridSynthesisPlan{Tr, D, R, length(bt), typeof(region), typeof(axes), typeof(work), typeof(full),
-                typeof(hc), typeof(outd), typeof(h.sdims), typeof(h.Ns)}(
-            region, axes, h.sdims, work, full, hc, outd, ms, h.box, h.Ns, bt, ntrans)
+        region = _region_bfft_plan(exec, T, last(work), h.Ns[1], h.udims, measure)
+        outd = _device_buffer(exec, float(T), h.Ns..., bt...)
+        HybridSynthesisPlan{Tr, D, T <: Real, length(bt), typeof(region), typeof(axes), typeof(work),
+                typeof(outd), typeof(h.sdims), typeof(h.Ns)}(
+            region, iflag < 0, axes, h.sdims, work, outd, ms, h.box, h.Ns, bt)
     end
 end
 
@@ -860,37 +871,24 @@ function Plans.synthesize!(out::AbstractArray, p::HybridSynthesisPlan{T, D, R},
         coeffs::AbstractArray) where {T, D, R}
     size(out) == Plans.field_size(p) || throw(DimensionMismatch(
         "out is $(size(out)); this plan writes $(Plans.field_size(p))"))
-    sz = FTB.packed_size(p.box, Val(R))
-    size(coeffs) == (sz..., p.batch...) || throw(DimensionMismatch(
-        "coeffs is $(size(coeffs)); this plan reads $((sz..., p.batch...))"))
     W = first(p.work)
-    if R
-        half = p.hc === nothing ? reshape(coeffs, sz..., p.ntrans) : copyto!(p.hc, coeffs)
-        DirectSum.native_coefficients!(p.full, half, p.ms, p.box)
-        p.full === W || copyto!(W, p.full)
-    else
-        copyto!(W, coeffs)
-    end
-    p.region * W
+    size(coeffs) == size(W) || throw(DimensionMismatch(
+        "coeffs is $(size(coeffs)); this plan reads $(size(W))"))
+    _stage!(W, coeffs)
     F = _run_stretched_synthesis!(W, Base.tail(p.work), p.axes, p.sdims)
-    return _hybrid_field!(out, F, p.outd, Val(R))
-end
-
-# The field from the last pass's array `F`, its real part for a real field, taken on the device into
-# `outd` where `F` lives there.
-_hybrid_field!(out, F, outd, ::Val{false}) = copyto!(out, F)
-function _hybrid_field!(out, F, outd, ::Val{true})
-    dst = outd === nothing ? reshape(out, size(F)) : outd
-    dst .= real.(F)
-    outd === nothing || copyto!(out, outd)
+    # `Σ G e^{-ikx}` over the uniform axes is `conj(Σ conj(G) e^{+ikx})`, and real for a real field.
+    p.neg && (F .= conj.(F))
+    dst = _output_in(p.outd, out)
+    LinearAlgebra.mul!(dst, p.region, F)
+    !R && p.neg && (dst .= conj.(dst))
+    dst === out || copyto!(out, dst)
     return out
 end
 
-# `field` scaled by the per-node factor `α` into `out`.
-function quadrature_weighted_into!(out, field, α, npts::Int, ntrans::Int)
-    @inbounds for b in 1:ntrans, j in 1:npts
-        out[j + (b - 1) * npts] = field[j + (b - 1) * npts] * α[j]
-    end
+# `field` scaled by the per-node factor `α` into the `(npts, batch)` matrix `out`, all three in one memory.
+function quadrature_weighted_into!(out::AbstractMatrix, field::AbstractArray, α::AbstractVector)
+    copyto!(out, field)
+    out .*= α
     return out
 end
 
@@ -913,17 +911,18 @@ end
 # =============================================================================
 
 """
-    synthesize(grid, coeffs, ms::Tuple; transform=AutoSpectralBackend(), execution=AutoBackend(),
-               real_output=true, iflag=1)
+    synthesize([T,] grid, coeffs, ms::Tuple; transform=AutoSpectralBackend(), execution=AutoBackend(),
+               iflag=1)
 
-The series with coefficients `coeffs` evaluated at the `grid` points: `f_j = Σ_k C_k e^{+iflag·ik·(x_j −
+The series with coefficients `coeffs` evaluated at the `grid` points, a field of element type `T`
+(positional, as for `zeros(T, …)`; `real(eltype(coeffs))` when omitted): `f_j = Σ_k C_k e^{+iflag·ik·(x_j −
 x₀)}` on a Cartesian grid, with `x₀` each direction's smallest coordinate, and `f_j = Σ_{l,m} C_lm
-Y_lm(x_j)` on a sphere. `real_output=true` consumes the packed half a real Cartesian field transforms to,
-over the coefficient box of an `ms`-mode transform on `grid` (see [`calculate_spectrum`](@ref)), and
-writes a **real** array directly: the sum runs over the whole box, each stored mode `k₁ > 0` with its
-conjugate partner. `real_output=false` consumes the full native spectrum `(ms…, batch…)` and returns it
-complex. Spherical coefficients are `(Nθ, Nφ, batch…)` either way. Returns an array `(spatial…, batch…)`
-shaped as the forward's input.
+Y_lm(x_j)` on a sphere. A real `T` consumes the packed half a real Cartesian field transforms to, over the
+coefficient box of an `ms`-mode transform on `grid` (see [`calculate_spectrum`](@ref)), and writes a
+**real** array directly: the sum runs over the whole box, each stored mode `k₁ > 0` with its conjugate
+partner. A complex `T` consumes the full native spectrum `(ms…, batch…)`. Spherical coefficients are
+`(Nθ, Nφ, batch…)` either way, a real `T` taking the real part of a complex series. Returns an array
+`(spatial…, batch…)` shaped as the forward's input.
 
 `synthesize` is the adjoint of [`calculate_spectrum`](@ref) under the grid's quadrature:
 `Σ_k conj(C_k)·F(f)_k = Σ_j w_j conj(S(C)_j) f_j`, with `w` the weights the forward integrates with
@@ -931,64 +930,63 @@ shaped as the forward's input.
 It inverts `calculate_spectrum` where that quadrature is exact on the series: a uniform periodic grid
 with `ms == size(grid)`, and FastSphericalHarmonics on its own grid. On a stretched or scattered grid
 the composition is not the identity; recovering the coefficients a field was synthesized from is a
-least-squares fit (`solve = true` with `NUFSHTSpectralBackend`).
+least-squares fit (`analysis = LeastSquares()` with `NUFSHTSpectralBackend`).
 
 `transform` selects the synthesis the same way [`calculate_spectrum`](@ref) selects the forward, and
 `AutoSpectralBackend` resolves it by the same rules; the direct sum serves any grid.
 """
-function synthesize(g::FlowGeometries.Grids.AbstractGrid, coeffs::AbstractArray, ms::Tuple;
+function synthesize(::Type{T}, g::FlowGeometries.Grids.AbstractGrid, coeffs::AbstractArray, ms::Tuple;
         transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
         execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-        real_output::Bool = true, iflag::Int = 1, kwargs...)
+        iflag::Int = 1, kwargs...) where {T <: Number}
     e = _resolve_execution(execution)
-    return _synthesize(_resolve_transform(transform, g, ms, e), e, g, coeffs, ms;
-        real_output = real_output, iflag = iflag, kwargs...)
+    return _synthesize(_resolve_transform(transform, g, ms, e), e, g, T, coeffs, ms; iflag = iflag, kwargs...)
+end
+
+synthesize(g::FlowGeometries.Grids.AbstractGrid, coeffs::AbstractArray, ms::Tuple; kwargs...) =
+    synthesize(real(eltype(coeffs)), g, coeffs, ms; kwargs...)
+
+# The packed half on the spectral dims for a real field, the full native spectrum for a complex one.
+function _check_series(coeffs, sz::Tuple, ::Type{T}) where {T}
+    D = length(sz)
+    size(coeffs)[1:D] == sz || throw(DimensionMismatch(
+        "a field of element type $T reads $(T <: Real ? "the packed half" : "the full native spectrum") " *
+        "$sz on the spectral dims; got $(size(coeffs)[1:D])"))
+    return nothing
 end
 
 function _synthesize(::SpectralBackends.AbstractDirectSumSpectralBackend,
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        coeffs::AbstractArray, ms::NTuple{D, Int}; real_output::Bool = true, iflag::Int = 1,
-        kwargs...) where {D}
-    ss = size(g)
+        ::Type{T}, coeffs::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {T, D}
     FT = eltype(g)
-    if real_output
-        pms = FTB.packed_size(Grids.mode_box(g, ms, Val(true)), Val(true))
-        size(coeffs)[1:D] == pms || throw(DimensionMismatch(
-            "real_output=true expects the packed half $(pms) on the spectral dims; got $(size(coeffs)[1:D]). " *
-            "Pass real_output=false for a full native spectrum $(ms)."))
-        batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
-        out = Array{FT}(undef, ss..., batch...)
-        _synthesize_packed!(exec, out, g, coeffs, ms, iflag)
-        return out
-    end
-    size(coeffs)[1:D] == ms || throw(DimensionMismatch(
-        "real_output=false expects the full native spectrum $(ms) on the spectral dims; got $(size(coeffs)[1:D])."))
-    batch = ntuple(i -> size(coeffs, D + i), ndims(coeffs) - D)
-    out = Array{Complex{FT}}(undef, ss..., batch...)
-    _synthesize_cartesian!(exec, out, g, coeffs, ms, iflag)
-    return out
+    _check_series(coeffs, FTB.packed_size(T, Grids.mode_box(g, ms, T)), T)
+    batch = ntuple(i -> size(coeffs, D + i), Val(ndims(coeffs) - D))
+    out = Array{T <: Real ? FT : Complex{FT}}(undef, size(g)..., batch...)
+    return _synthesize_direct!(exec, out, g, coeffs, ms, iflag)
 end
 
+_synthesize_direct!(exec, out::AbstractArray{<:Real}, g, coeffs, ms, iflag) =
+    (_synthesize_packed!(exec, out, g, coeffs, ms, iflag); out)
+_synthesize_direct!(exec, out::AbstractArray{<:Complex}, g, coeffs, ms, iflag) =
+    (_synthesize_cartesian!(exec, out, g, coeffs, ms, iflag); out)
+
+# A real coefficient array evaluates to a real field directly; a complex one asked for a real field takes
+# its real part.
 function _synthesize(::SpectralBackends.AbstractDirectSumSpectralBackend,
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry},
-        coeffs::AbstractArray, ms::NTuple{2, Int}; real_output::Bool = true, iflag::Int = 1,
-        kwargs...)
-    ss = size(g)
-    batch = ntuple(i -> size(coeffs, 2 + i), ndims(coeffs) - 2)
-    # A real coefficient array evaluates to a real field directly, so `real_output` needs no complex
-    # intermediate; a complex one asked for a real output takes its real part.
+        ::Type{T}, coeffs::AbstractArray, ms::NTuple{2, Int}; iflag::Int = 1, kwargs...) where {T}
     FT = eltype(g)
-    if real_output && eltype(coeffs) <: Real
-        out = Array{FT}(undef, ss..., batch...)
-        _synthesize_spherical!(exec, out, g, coeffs, ms[1] - 1)
-        return out
-    end
-    out = Array{Complex{FT}}(undef, ss..., batch...)
+    batch = ntuple(i -> size(coeffs, 2 + i), Val(ndims(coeffs) - 2))
+    out = Array{(T <: Real && eltype(coeffs) <: Real) ? FT : Complex{FT}}(undef, size(g)..., batch...)
     _synthesize_spherical!(exec, out, g, coeffs, ms[1] - 1)
-    return real_output ? real.(out) : out
+    return _as_field(T, out)
 end
+
+_as_field(::Type{<:Real}, out::AbstractArray{<:Real}) = out
+_as_field(::Type{<:Real}, out::AbstractArray{<:Complex}) = real.(out)
+_as_field(::Type{<:Complex}, out::AbstractArray) = out
 
 """
     DirectSumSynthesisPlan{FT}
@@ -1054,7 +1052,8 @@ function _synthesize_into!(out::AbstractArray, plan::DirectSumSynthesisPlan{FT, 
     g = plan.grid
     ms = plan.ms
     D = length(ms)
-    pms = FTB.packed_size(Grids.mode_box(g, ms, Val(R)), Val(R))
+    L = _layout_type(R)
+    pms = FTB.packed_size(L, Grids.mode_box(g, ms, L))
     length(coeffs) == prod(pms) * prod(plan.batch; init = 1) ||
         throw(DimensionMismatch(
             "coeffs holds $(length(coeffs)) values; this plan reads the batch $(plan.batch) — pass the " *
@@ -1093,22 +1092,19 @@ _one_call(::SpectralBackends.AbstractSpectralBackend) = (;)
 # Every other synthesis: a plan for these coefficients' batch shape, executed once and released. A pair
 # with no synthesis plan raises in `plan_synthesis`.
 function _synthesize(t::SpectralBackends.AbstractSpectralBackend, e::ComputationalBackends.AbstractExecutionBackend,
-        g::_TransformGrid, coeffs::AbstractArray, ms::Tuple; real_output::Bool = true, iflag::Int = 1,
-        kwargs...)
-    FT = real(float(eltype(coeffs)))
-    nsp = length(_coeff_spatial(g, ms, real_output))
-    batch = ntuple(i -> size(coeffs, nsp + i), ndims(coeffs) - nsp)
-    plan = Plans.plan_synthesis(t, e, g, real_output ? FT : Complex{FT}, ms; batch = batch, iflag = iflag,
-        _one_call(t)..., kwargs...)
+        g::_TransformGrid, ::Type{T}, coeffs::AbstractArray, ms::Tuple; iflag::Int = 1, kwargs...) where {T}
+    # The coefficients' spectral dims are one per entry of `ms`, Cartesian or spherical.
+    batch = ntuple(i -> size(coeffs, length(ms) + i), Val(ndims(coeffs) - length(ms)))
+    plan = Plans.plan_synthesis(t, e, g, T, ms; batch = batch, iflag = iflag, _one_call(t)..., kwargs...)
     try
-        return Plans.synthesize!(Plans.allocate_field(plan), plan, coeffs)
+        return Plans.synthesize!(_allocate_field_like(coeffs, plan), plan, coeffs)
     finally
         Plans.close!(plan)
     end
 end
 
 function _synthesize(t::SpectralBackends.AbstractSpectralBackend, e::ComputationalBackends.AbstractExecutionBackend,
-        g::FlowGeometries.Grids.AbstractGrid, coeffs::AbstractArray, ms::Tuple; kwargs...)
+        g::FlowGeometries.Grids.AbstractGrid, ::Type, coeffs::AbstractArray, ms::Tuple; kwargs...)
     throw(ArgumentError(
         "$(nameof(typeof(t))) has no synthesis on a $(nameof(typeof(g))) over " *
         "$(nameof(typeof(FlowGeometries.Grids.grid_geometry(g)))): the transforms act on Cartesian and " *
@@ -1120,30 +1116,30 @@ end
 # =============================================================================
 
 """
-    calculate_spectrum!(coeffs, grid, field, ms; transform=DirectSumSpectralBackend(), execution=AutoBackend(), kwargs...)
+    calculate_spectrum!(coeffs, grid, field, ms; transform=AutoSpectralBackend(), execution=AutoBackend(), kwargs...)
 
 In-place [`calculate_spectrum`](@ref): write the coefficients into the preallocated `coeffs`, shaped as
-`calculate_spectrum` returns them, and return `ks_phys`. The direct sum on `SerialBackend`/`ThreadedBackend` writes into `coeffs`
-directly. Every other transform, `AutoSpectralBackend` included (resolved as `calculate_spectrum`
-resolves it), runs through a plan built for this call and released after it, an FFT planned with FFTW's
-`ESTIMATE` as `calculate_spectrum` plans it; a repeated caller holds one, built with
+`calculate_spectrum` returns them, and return `ks_phys`. `transform` resolves as `calculate_spectrum`
+resolves it. The direct sum on `SerialBackend`/`ThreadedBackend` writes into `coeffs` directly; every
+other transform runs through a plan built for this call and released after it, an FFT planned without
+measurement as `calculate_spectrum` plans it. A repeated caller holds one, built with
 [`plan_spectrum`](@ref) and run with `calculate_spectrum!(coeffs, plan, field)`.
 """
 function calculate_spectrum!(coeffs::AbstractArray{<:Number}, grid::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple;
-        transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.DirectSumSpectralBackend(),
+        transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
         execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(), kwargs...)
     e = _resolve_execution(execution)
-    return _calculate_spectrum!(coeffs, _resolve_transform(transform, grid, ms, e), e, grid, field, ms;
-        kwargs...)
+    t = _resolve_transform(transform, grid, ms, e)
+    return _calculate_spectrum!(coeffs, t, e, grid, field, ms; _analysis_kwargs(t, kwargs)...)
 end
 
 function _calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, ::SpectralBackends.AbstractDirectSumSpectralBackend,
         exec::Union{ComputationalBackends.AbstractSerialBackend, ComputationalBackends.AbstractThreadedBackend},
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
         field::AbstractArray, ms::NTuple{D, Int}; iflag::Int = 1, kwargs...) where {T, D}
-    R = Val(eltype(field) <: Real)
+    E = eltype(field)
     Plans._check_coefficients(coeffs,
-        (FTB.packed_size(Grids.mode_box(g, ms, R), R)..., Grids.field_batch_shape(g, field)...))
+        (FTB.packed_size(E, Grids.mode_box(g, ms, E))..., Grids.field_batch_shape(g, field)...))
     return _directsum_cartesian!(exec, coeffs, g, quadrature_weighted(g, field), ms, iflag)
 end
 
@@ -1180,7 +1176,8 @@ function Plans.plan_spectrum(grid::FlowGeometries.Grids.AbstractGrid, ::Type{T},
         execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
         batch::Tuple = (), kwargs...) where {T}
     e = _resolve_execution(execution)
-    return Plans.plan_spectrum(_resolve_transform(transform, grid, ms, e), e, grid, T, ms; batch = batch, kwargs...)
+    t = _resolve_transform(transform, grid, ms, e)
+    return Plans.plan_spectrum(t, e, grid, T, ms; batch = batch, _analysis_kwargs(t, kwargs)...)
 end
 
 """
@@ -1217,24 +1214,23 @@ const _NO_APPLY = "the transform does not apply to that grid. DirectSumSpectralB
 const _DEVICE_FFT = "`using KernelAbstractions` and the device's AbstractFFTs provider (`FFTW` for " *
     "`KA.CPU()`, `CUDA` for `CUDABackend`, …)"
 
-_needs(ext::Symbol, load::String) = _ext_loaded(ext) ? _NO_APPLY : "it needs $load."
+_needs(c::_Capability, load::String) = _available(c) ? _NO_APPLY : "it needs $load."
 
 _plan_hint(::SpectralBackends.AbstractSpectralBackend, ::ComputationalBackends.AbstractExecutionBackend) =
     _NO_APPLY
-_plan_hint(::SpectralBackends.AbstractFFTSpectralBackend, ::_HostExec) =
-    _needs(:FlowFieldSpectraFFTWExt, "`using FFTW`")
+_plan_hint(::SpectralBackends.AbstractFFTSpectralBackend, ::_HostExec) = _needs(_HostFFT(), "`using FFTW`")
 _plan_hint(::SpectralBackends.AbstractFFTSpectralBackend, ::ComputationalBackends.AbstractGPUBackend) =
-    _needs(:FlowFieldSpectraKernelAbstractionsAbstractFFTsExt, _DEVICE_FFT)
+    _needs(_DeviceFFT(), _DEVICE_FFT)
 _plan_hint(::SpectralBackends.AbstractFSHTSpectralBackend, ::_HostExec) =
-    _needs(:FlowFieldSpectraFastSphericalHarmonicsExt, "`using FastSphericalHarmonics`")
+    _needs(_HostFSHT(), "`using FastSphericalHarmonics`")
 _plan_hint(::SpectralBackends.AbstractFSHTSpectralBackend, ::ComputationalBackends.AbstractGPUBackend) =
-    _needs(:FlowFieldSpectraKernelAbstractionsAbstractFFTsExt, _DEVICE_FFT)
+    _needs(_DeviceFFT(), _DEVICE_FFT)
 _plan_hint(::SpectralBackends.AbstractNUFSHTSpectralBackend, ::_HostExec) =
-    _needs(:FlowFieldSpectraNUFSHTExt, "`using NUFSHT`")
+    _needs(_HostNUFSHT(), "`using NUFSHT`")
 _plan_hint(::SpectralBackends.AbstractNUFSHTSpectralBackend, ::ComputationalBackends.AbstractGPUBackend) =
-    _needs(:FlowFieldSpectraNUFSHTKernelAbstractionsExt, "`using NUFSHT` and `using KernelAbstractions`")
+    _needs(_DeviceNUFSHT(), "`using NUFSHT` and `using KernelAbstractions`")
 _plan_hint(::SpectralBackends.AbstractDirectSumSpectralBackend, ::ComputationalBackends.AbstractGPUBackend) =
-    _needs(:FlowFieldSpectraKernelAbstractionsExt, "`using KernelAbstractions`")
+    _needs(_DeviceKernels(), "`using KernelAbstractions`")
 _plan_hint(::SpectralBackends.AbstractNUFFTSpectralBackend, ::ComputationalBackends.AbstractExecutionBackend) =
     "it names no NUFFT library. Pass FlowTransformBindings.NonuniformFFTsBackend() (`using NonuniformFFTs`) " *
     "or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`)."
@@ -1356,8 +1352,7 @@ function calculate_spectrum!(coeffs::AbstractArray{Complex{T}}, plan::DirectSumC
         "matching `batch=` to plan_spectrum"))
     Plans._check_coefficients(coeffs, plan)
     # Scaled into the plan's buffer; the caller's field is untouched.
-    f = plan.qbuf === nothing ? field :
-        quadrature_weighted_into!(plan.qbuf, field, plan.qw, plan.npts, plan.B)
+    f = plan.qbuf === nothing ? field : quadrature_weighted_into!(plan.qbuf, field, plan.qw)
     return _cart_run!(plan.execution, plan.layout, coeffs, plan.setup, f)
 end
 
@@ -1427,28 +1422,35 @@ _gpu_directsum_spherical(args...; kwargs...) = throw(ArgumentError("GPUBackend i
 # Fast device-generic structured SHT (φ-DFT + θ-Legendre contraction), KernelAbstractions ext.
 _calculate_spectrum_gpu_sht(args...; kwargs...) = throw(ArgumentError("GPU SHT requires `using KernelAbstractions`."))
 
-# GPU FFT is device-generic via AbstractFFTs; the GPU NUFFT is `NUFFT.jl` on FlowTransformBindings' tags.
-_calculate_spectrum_gpu_fft(args...; kwargs...) = throw(ArgumentError("GPU FFT requires `using KernelAbstractions` plus an AbstractFFTs provider (`FFTW` for `KA.CPU()`, `CUDA` for `CUDABackend`, …)."))
+# The GPU NUFFT is `NUFFT.jl` on FlowTransformBindings' tags.
 _calculate_spectrum_gpu_nufft(t::SpectralBackends.AbstractNUFFTSpectralBackend, args...; kwargs...) = throw(ArgumentError(
     "$(nameof(typeof(t))) names no NUFFT library — pass transform=FlowTransformBindings.NonuniformFFTsBackend() " *
     "(`using NonuniformFFTs`) or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`, `using CUDA` for CuArrays)."))
 
 # The hybrid composite's passes, held by `HybridPlan` and `HybridSynthesisPlan`: `_region_fft_plan` builds
 # the FFT over the uniform axes on the execution backend's arrays (a `RegionFFT`), `_region_bfft_plan(exec,
-# A, dims, iflag, measure)` the synthesis's in-place backward FFT over them on `A`, and `_axis_nufft_plan`
-# one stretched axis's 1-D NUFFT with its own buffers.
-_region_fft_plan(::_HostExec, args...) = throw(ArgumentError(
-    "The hybrid FFT/NUFFT transform needs an FFT provider. Run `using FFTW`."))
-_region_fft_plan(::ComputationalBackends.AbstractGPUBackend, args...) = throw(ArgumentError(
-    "The hybrid FFT/NUFFT transform on a GPUBackend takes its FFT through AbstractFFTs. Run $_DEVICE_FFT."))
+# T, A, n₁, dims, measure)` the synthesis's unnormalized backward FFT over them from `A` to a field of
+# element type `T`, and `_axis_nufft_plan` one stretched axis's 1-D NUFFT with its own buffers.
+_region_fft_plan(::ComputationalBackends.AbstractExecutionBackend, args...) = throw(ArgumentError(
+    "The hybrid FFT/NUFFT transform takes its FFT through AbstractFFTs. Load an implementation for the " *
+    "field's arrays: `using FFTW` (or another AbstractFFTs implementation) for host arrays, $_DEVICE_FFT " *
+    "for device ones."))
 _region_bfft_plan(exec::ComputationalBackends.AbstractExecutionBackend, args...) = _region_fft_plan(exec)
+
+# The planner options the FFT implementation for the execution backend's arrays takes, `(;)` for one
+# that takes none. `measure` asks for a plan tuned by timing the transform, which a plan held across
+# executions pays for; `aligned` is whether every array the plan will execute on starts where the one it
+# was planned on does.
+_fft_options(::ComputationalBackends.AbstractExecutionBackend, measure::Bool, aligned::Bool) = (;)
 _axis_nufft_plan(t::SpectralBackends.AbstractSpectralBackend, args...; kwargs...) = throw(ArgumentError(
     "The hybrid FFT/NUFFT transform needs a NUFFT library for the stretched axes (got " *
     "$(nameof(typeof(t)))). Run `using NonuniformFFTs` or `using FINUFFT`, and pass " *
     "`nufft = FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()`."))
 
 # CPU transform libraries (extensions). A NUFFT names its library: the abstract NUFFTSpectralBackend names none.
-_calculate_spectrum_fft(args...; kwargs...) = throw(ArgumentError("FFTSpectralBackend is not loaded. Run `using FFTW`."))
+_calculate_spectrum_fft(args...; kwargs...) = throw(ArgumentError(
+    "FFTSpectralBackend takes its FFT through AbstractFFTs. Load an implementation for the field's arrays: " *
+    "`using FFTW` (or another AbstractFFTs implementation) for host arrays, $_DEVICE_FFT for device ones."))
 _calculate_spectrum_nufft(t::SpectralBackends.AbstractNUFFTSpectralBackend, args...; kwargs...) = throw(ArgumentError(
     "$(nameof(typeof(t))) names no NUFFT library — pass transform=FlowTransformBindings.NonuniformFFTsBackend() " *
     "(`using NonuniformFFTs`) or FlowTransformBindings.FINUFFTBackend() (`using FINUFFT`)."))
@@ -1488,13 +1490,11 @@ Plans.plan_synthesis(t::SpectralBackends.AbstractSpectralBackend, e::Computation
 function _subgrid(g::Union{FlowGeometries.Grids.AbstractUnstructuredGrid,
             FlowGeometries.Grids.AbstractCurvilinearGrid}, idx)
     geom = FlowGeometries.Grids.grid_geometry(g)
-    D = length(FlowGeometries.Grids.coordinates(g))
-    coords = ntuple(d -> view(FlowGeometries.Grids.coordinates(g, d), idx), D)
+    coords = map(c -> view(c, idx), FlowGeometries.Grids.coordinates(g))
     meas = view(FlowGeometries.Grids.measure_array(g), idx)
-    per = FlowGeometries.Grids.periodic_flags(g)
-    prd = ntuple(d -> FlowGeometries.Grids.period(g, d), D)
+    prd = ntuple(d -> FlowGeometries.Grids.period(g, d), Val(length(coords)))
     return FlowGeometries.Grids.UnstructuredGrid(geom, coords, meas,
-        _submask(FlowGeometries.Grids.mask(g), idx); periodic = per, period = prd)
+        _submask(FlowGeometries.Grids.mask(g), idx); topology = FlowGeometries.Grids.topology(g), period = prd)
 end
 
 _submask(::FlowGeometries.Grids.AllActive, idx) = FlowGeometries.Grids.AllActive((length(idx),))
@@ -1524,7 +1524,7 @@ function _partition_kwargs(kwargs, g, idx)
 end
 
 _partition_box(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}) =
-    (; box = Grids.axis_geometry(eltype(g), g, FlowGeometries.Grids.ncoordinates(g)))
+    (; box = Grids.axis_geometry(eltype(g), g, Val(FlowGeometries.Grids.ncoordinates(g))))
 _partition_box(::FlowGeometries.Grids.AbstractGrid) = (;)
 
 # Transforms whose coefficients are additive over a disjoint point partition.
@@ -1549,22 +1549,23 @@ fields). The points split where the transform is additive over them and the grid
 NUFSHT solve couples every point, so it splits the batch.
 """
 _point_partition(t::SpectralBackends.AbstractSpectralBackend, g, kwargs) =
-    _partitionable(t) && _is_scattered(g) && !_couples_points(t, kwargs)
-_couples_points(::SpectralBackends.AbstractNUFSHTSpectralBackend, kwargs) = get(kwargs, :solve, false)
-_couples_points(::SpectralBackends.AbstractSpectralBackend, kwargs) = false
+    _partitionable(t) && _is_scattered(g) && !_couples_points(get(kwargs, :analysis, Quadrature()))
+_couples_points(::Quadrature) = false
+_couples_points(::LeastSquares) = true
 
 # A synthesis evaluates the series at each point on its own, so it splits the points of a point set for
 # any partitionable transform.
 _point_partition_synthesis(t::SpectralBackends.AbstractSpectralBackend, g) = _partitionable(t) && _is_scattered(g)
 
-# Spatial (spectral) shape of the coefficient array for a grid + `ms`, given whether the field is real:
-# the coefficient box, axis 1 halved for a real Cartesian field.
+# Spatial (spectral) shape of the coefficient array for a grid + `ms` and a field of element type `T`: the
+# coefficient box, axis 1 halved for a real Cartesian field.
 function _coeff_spatial(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ms, R::Bool)
+        ms, ::Type{T}) where {T}
     n = NTuple{length(ms), Int}(Tuple(ms))
-    return FTB.packed_size(Grids.mode_box(g, n, Val(R)), Val(R))
+    return FTB.packed_size(T, Grids.mode_box(g, n, T))
 end
-_coeff_spatial(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ms, ::Bool) = (ms[1], 2 * (ms[1] - 1) + 1)
+_coeff_spatial(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ms, ::Type) =
+    (ms[1], 2 * (ms[1] - 1) + 1)
 
 # Element type of the coefficient array for a grid + field element type, without running a transform: a
 # distributed rank holding no batch columns still allocates its share of the gather buffer.
@@ -1574,9 +1575,10 @@ _coeff_eltype(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeome
     ::Type{T}, ::Type{FT}) where {T, FT} = sph_coeff_type(T, FT)
 
 # Wavenumber coordinate returned alongside the coefficients.
-_partition_ks(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, ms, R::Bool) =
-    physical_wavenumbers(g, NTuple{length(ms), Int}(Tuple(ms)), Val(R))
-_partition_ks(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ms, ::Bool) = (0:(ms[1] - 1), -(ms[1] - 1):(ms[1] - 1))
+_partition_ks(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry}, ms,
+    ::Type{T}) where {T} = physical_wavenumbers(g, NTuple{length(ms), Int}(Tuple(ms)), T)
+_partition_ks(::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, ms, ::Type) =
+    (0:(ms[1] - 1), -(ms[1] - 1):(ms[1] - 1))
 
 include("NUFFT.jl")
 
@@ -1619,7 +1621,8 @@ PrecompileTools.@setup_workload begin
         # Cartesian 2D DirectSum on a uniform grid with a small batch.
         ax = range(zero(T), T(10); length = 9)[1:8]
         cart = FlowGeometries.Grids.StructuredGrid(FlowGeometries.Geometry.CartesianGeometry{T}(), ax, ax;
-            periodic = (true, true), period = (T(10), T(10)))
+            topology = (FlowGeometries.Grids.Periodic(), FlowGeometries.Grids.Periodic()),
+            period = (T(10), T(10)))
         u = rand(T, 8, 8, 2)
         c, k = calculate_spectrum(cart, u, (4, 4); transform = SpectralBackends.DirectSumSpectralBackend(), execution = ComputationalBackends.SerialBackend())
         isotropic_spectrum(k, c; num_bins = 2)

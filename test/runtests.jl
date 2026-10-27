@@ -33,30 +33,32 @@ _cg(::Type{T}) where {T} = FG.Geometry.CartesianGeometry{T}()
 parseval(ks::Tuple, c::AbstractArray) =
     sum(I -> FTB.mode_fold(ks, I) * abs2(c[I]), CartesianIndices(c))
 
+# Every direction periodic.
+_periodic(n) = ntuple(_ -> FG.Grids.Periodic(), length(n))
+
 # Uniform Cartesian grid from per-axis point counts + periodic domain lengths.
 function ucg(::Type{T}, domain::Tuple, n::Tuple) where {T}
-    D = length(n)
-    axes = ntuple(d -> range(zero(T), T(domain[d]); length = n[d] + 1)[1:n[d]], D)
-    return FG.Grids.StructuredGrid(_cg(T), axes...; periodic = ntuple(_ -> true, D), period = T.(domain))
+    axes = map((L, m) -> range(zero(T), T(L); length = m + 1)[1:m], domain, n)
+    return FG.Grids.StructuredGrid(_cg(T), axes...; topology = _periodic(n), period = T.(domain))
 end
 ucg(domain::Tuple, n::Tuple) = ucg(Float64, domain, n)
 ucg_axis(::Type{T}, domain, n) where {T} = range(zero(T), T(domain); length = n + 1)[1:n]  # matching axis values
 
 # Nonuniform-gridded Cartesian (stretched axes + periodic domain).
 nucg(::Type{T}, axes::Tuple, domain::Tuple) where {T} =
-    FG.Grids.StructuredGrid(_cg(T), ntuple(d -> collect(T, axes[d]), length(axes))...;
-        periodic = ntuple(_ -> true, length(axes)), period = T.(domain))
+    FG.Grids.StructuredGrid(_cg(T), map(a -> collect(T, a), axes)...; topology = _periodic(axes),
+        period = T.(domain))
 nucg(axes::Tuple, domain::Tuple) = nucg(Float64, axes, domain)
 
 # Scattered Cartesian point cloud (unit per-node measure; periodic domain).
 scg(::Type{T}, coords::Tuple, domain::Tuple) where {T} =
-    FG.Grids.UnstructuredGrid(_cg(T), ntuple(d -> collect(T, coords[d]), length(coords)),
-        ones(T, length(coords[1])); periodic = ntuple(_ -> true, length(coords)), period = T.(domain))
+    FG.Grids.UnstructuredGrid(_cg(T), map(c -> collect(T, c), coords), ones(T, length(coords[1]));
+        topology = _periodic(coords), period = T.(domain))
 scg(coords::Tuple, domain::Tuple) = scg(Float64, coords, domain)
 
-# Structured spherical grids: Clenshaw–Curtis matches FastSphericalHarmonics' grid (SHT); Gauss–Legendre
+# Structured spherical grids: Fejér's first rule is FastSphericalHarmonics' grid (SHT); Gauss–Legendre
 # gives exact weighted-quadrature (DirectSum / GPU SHT with sampling=GaussLegendreSampling()).
-sph_cc(lmax) = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), lmax + 1)
+sph_cc(lmax) = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), lmax + 1)
 sph_gl(lmax) = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.GaussLegendreSampling(), lmax + 1)
 const GL = FG.SphericalSampling.GaussLegendreSampling()
 # Scattered sphere from FFS (θ=colatitude, φ=longitude).
@@ -73,9 +75,10 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         Test.@test (EI.check_no_implicit_imports(FFS); true)
         Test.@test (EI.check_no_stale_explicit_imports(FFS); true)
         for extname in (
-            :FlowFieldSpectraFFTWExt, :FlowFieldSpectraFastSphericalHarmonicsExt, :FlowFieldSpectraNUFSHTExt,
-            :FlowFieldSpectraOhMyThreadsExt, :FlowFieldSpectraKernelAbstractionsExt,
+            :FlowFieldSpectraAbstractFFTsExt, :FlowFieldSpectraFFTWExt, :FlowFieldSpectraFastSphericalHarmonicsExt,
+            :FlowFieldSpectraNUFSHTExt, :FlowFieldSpectraOhMyThreadsExt, :FlowFieldSpectraKernelAbstractionsExt,
             :FlowFieldSpectraKernelAbstractionsAbstractFFTsExt, :FlowFieldSpectraNUFSHTKernelAbstractionsExt,
+            :FlowFieldSpectraGPUArraysCoreExt,
         )
             ext = Base.get_extension(FFS, extname)
             ext === nothing && continue
@@ -404,6 +407,8 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         λ = [V[:, k]' * A * V[:, k] / N for k in 1:K]
         Test.@test maximum(k -> LA.norm(A * V[:, k] .- λ[k] .* V[:, k]), 1:K) < 1e-10 * sqrt(N)
         Test.@test issorted(λ; rev = true) && λ[1] < 1
+        V32 = Test.@inferred FFS.dpss(Float32, N, NW, K)
+        Test.@test eltype(V32) === Float32 && maximum(abs, V32 .- V) < N * eps(Float32)
     end
 
     Test.@testset "Lomb–Scargle (irregular sampling)" begin
@@ -425,14 +430,14 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
         xs = ucg_axis(Float64, L, N); ys = ucg_axis(Float64, L, N)
         g = ucg((L, L), (N, N))
         u = [cos(2x) + 0.5 * sin(3y) - 0.3 * cos(x + 2y) for x in xs, y in ys]
-        # The packed half inverts directly to a real field; the full native spectrum takes
-        # `real_output=false` and returns complex. Both are the direct-sum inverse.
+        # The packed half inverts directly to a real field; the full native spectrum is a complex field's
+        # series. Both are the direct-sum inverse.
         ds = SB.DirectSumSpectralBackend()
         coeffs, _ = FFS.calculate_spectrum(g, u, (N, N); transform = ds)
         urec = FFS.synthesize(g, coeffs, (N, N); transform = ds)
         Test.@test eltype(urec) === Float64
         Test.@test isapprox(urec, u; atol = 1e-12)
-        ufull = FFS.synthesize(g, FTB.unpacked(coeffs, (N, N)), (N, N); transform = ds, real_output = false)
+        ufull = FFS.synthesize(ComplexF64, g, FTB.unpacked(coeffs, (N, N)), (N, N); transform = ds)
         Test.@test isapprox(real.(ufull), u; atol = 1e-12)
         Test.@test_throws DimensionMismatch FFS.synthesize(g, FTB.unpacked(coeffs, (N, N)), (N, N); transform = ds)
 
@@ -465,6 +470,7 @@ Test.@testset "FlowFieldSpectra.jl Test Suite" begin
     include("test_synthesis_plan.jl")
     include("test_device_genericity.jl")
     include("test_allocs.jl")
+    include("test_jet.jl")
     include("test_distributed.jl")
     include("test_mpi.jl")
 end

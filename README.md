@@ -8,7 +8,7 @@
 
 `FlowFieldSpectra.jl` simplifies computing spectral coefficients, energy spectra, and spatial reductions (such as isotropic radial integration or dimension transects) across multi-dimensional grids. It supports **Cartesian** and **Spherical** coordinates on both **structured/uniform** and **unstructured/scattered** grids.
 
-FFT grid shifting, scaling, non-uniform coordinate mapping and Legendre recurrences sit behind a single type-stable call: `calculate_spectrum`.
+Normalization, the packed layout of a real field, non-uniform coordinate mapping and Legendre recurrences sit behind a single type-stable call: `calculate_spectrum`.
 
 ---
 
@@ -21,15 +21,17 @@ FFT grid shifting, scaling, non-uniform coordinate mapping and Legendre recurren
   the sphere. Works for any number of field components (scalar, or 1-/2-/3-component vector flows).
 - **Structured & scattered grids**: uniform/rectilinear grids, and non-uniform / scattered / random
   point clouds (e.g. masked by a coastline) — recovered correctly via non-uniform transforms.
-- **Zero-dependency baseline**: works out-of-the-box via direct-sum (`DirectSumSpectralBackend`) with no heavy
-  C/C++ libraries; load `FFTW` / `FINUFFT` / `FastSphericalHarmonics` / `NUFSHT` to activate the fast
-  `O(N log N)` transforms.
+- **Library-free baseline**: the direct sum (`DirectSumSpectralBackend`) serves every grid with no
+  transform library; load an FFT, NUFFT or spherical-harmonic library to run the fast `O(N log N)`
+  transforms (table below).
 - **Two orthogonal backend axes**: a `transform=` axis (the spectral math above) and an
-  independent `execution=` axis — `SerialBackend`, `ThreadedBackend` (`OhMyThreads`),
-  `GPUBackend` (`KernelAbstractions`: device-generic FFT via `AbstractFFTs` — CUFFT / rocFFT /
-  CPU-FFTW — the hybrid FFT/NUFFT composite, NonuniformFFTs on any KA device and cuFINUFFT on CUDA,
-  the spherical transforms, and portable direct-sum kernels on *any* KA device), `DistributedBackend`
-  (`Distributed`), and `MPIBackend` (`MPI`, incl. multi-GPU) — that compose freely.
+  independent `execution=` axis — `SerialBackend`, `ThreadedBackend` (`using OhMyThreads`; the default
+  `AutoBackend()` resolves to it once OhMyThreads is loaded and Julia has more than one thread),
+  `GPUBackend` (`KernelAbstractions`: FFTs
+  through the device array's `AbstractFFTs` implementation — cuFFT, rocFFT, … — the hybrid FFT/NUFFT
+  composite, NonuniformFFTs on any KA device and cuFINUFFT on CUDA, the spherical transforms, and
+  portable direct-sum kernels on *any* KA device), `DistributedBackend` (`Distributed`), and
+  `MPIBackend` (`MPI`, incl. multi-GPU) — that compose freely.
 - **Reductions**: isotropic/radial binning, transects/slices, anisotropy-resolved `E(k, θ)`,
   wavenumber–frequency `E(k, ω)`, spherical degree spectra, compensated `kᵖE(k)` and band-integrated energy.
 - **Cross-analysis**: cross-/co-/quadrature spectra (flux by scale, e.g. `⟨u'w'⟩`), magnitude-squared
@@ -39,9 +41,9 @@ FFT grid shifting, scaling, non-uniform coordinate mapping and Legendre recurren
 - **Irregular sampling**: Lomb–Scargle periodogram for unevenly-sampled series (moorings, drifters, tracks).
 - **Synthesis & filtering**: first-class synthesis for spectral filtering and round-trip validation; it
   inverts the transform on a uniform periodic grid and is its adjoint under the grid's quadrature on any grid.
-- **Performance**: reusable FFTW/FINUFFT plans with batched trailing axes (build once, reuse across
-  z/t/components), transparent real-input `rfft` fast path, cached spherical Legendre tables, and `Float32`
-  support end-to-end.
+- **Performance**: a reusable plan for every transform, forward and synthesis, with batched trailing axes
+  (build once, reuse across z/t/components) and allocation-free execution; the real-input `rfft` path for
+  real fields; held spherical Legendre tables; `Float32` end to end.
 - **Plotting**: `CairoMakie` extension for spectra and backend-comparison figures.
 
 ---
@@ -67,11 +69,15 @@ By default, the package runs slow-path direct sums (DFT/SHT, ``O(N \cdot M)`` co
 
 | Grid Type | Coordinate System | Required Library | Backend Type | Description |
 |---|---|---|---|---|
-| **Structured** | Cartesian (ND) | `using FFTW` | `FFTSpectralBackend()` | Fast Fourier Transform via FFTW |
+| **Structured** | Cartesian (ND) | an `AbstractFFTs` implementation, e.g. `using FFTW` | `FFTSpectralBackend()` | Fast Fourier Transform through the `AbstractFFTs` interface |
 | **Scattered / stretched** | Cartesian (ND) | `using NonuniformFFTs` or `using FINUFFT` | `FlowTransformBindings.NonuniformFFTsBackend()` / `FlowTransformBindings.FINUFFTBackend()` | Non-uniform Fast Fourier Transform through [FlowTransformBindings](https://github.com/jbphyswx/FlowTransformBindings.jl) |
-| **Structured** | Spherical (2D) | `using FastSphericalHarmonics` | `FSHTSpectralBackend()` | Fast SHT on Clenshaw-Curtis grids |
-| **Scattered** | Spherical (2D) | `using NUFSHT` | `NUFSHTSpectralBackend()` | Non-uniform Fast SHT |
+| **Structured** | Spherical (2D) | `using FastSphericalHarmonics` | `FSHTSpectralBackend()` | Fast SHT on FastTransforms' grid: Fejér first-rule latitudes (`Fejer1Sampling`) and a periodic longitude axis of `2nlat − 1` points |
+| **Scattered** | Spherical (2D) | `using NUFSHT` | `NUFSHTSpectralBackend()` | Non-uniform Fast SHT, by quadrature or least-squares fit (`analysis`) |
 | **Any** | Visualization | `using CairoMakie` | (Plotting Functions) | Enclosing plotting extension |
+
+`FFTSpectralBackend()` runs with whichever `AbstractFFTs` implementation is loaded. `AutoSpectralBackend()`
+picks it where a provider's extension declares a host FFT, as FFTW's does; another implementation declares
+it with a one-method extension, `_available(::_HostFFT) = true`.
 
 ---
 
@@ -86,14 +92,14 @@ using CairoMakie: CairoMakie as Mke       # activates the plotting extension
 using SpectralBackends: SpectralBackends as SB     # transform tags
 using FlowGeometries: FlowGeometries as FG         # grid / geometry types
 
-# 1. A uniform Cartesian grid — a FlowGeometries StructuredGrid over a CartesianGeometry, marked
-#    periodic (the Fourier domain). Defined by its axes; no per-point coordinate arrays.
+# 1. A uniform Cartesian grid — a FlowGeometries StructuredGrid over a CartesianGeometry, periodic in
+#    both directions (the Fourier domain). Defined by its axes; no per-point coordinate arrays.
 L = 10.0
 N = 64
 xs = range(0.0, L; length = N + 1)[1:N]
 ys = range(0.0, L; length = N + 1)[1:N]
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
-    periodic = (true, true), period = (L, L))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 
 # 2. Fields are plain N-D tensors on the grid — here two velocity components (u, v).
 u = [cos(2π * 2 * x / L) + 0.5 * sin(2π * 5 * y / L) for x in xs, y in ys]   # (N, N)
@@ -173,7 +179,7 @@ capability has a runnable, rendered [example in the docs](https://jbphyswx.githu
 
 ![Spherical Spectra](docs/src/assets/spherical_spectra.png)
 
-*Scalar field on a Clenshaw–Curtis grid (left) and its energy per spherical-harmonic degree ℓ (right). Scattered nodes use the NUFSHT backend.*
+*Scalar field on a Fejér first-rule grid (left) and its energy per spherical-harmonic degree ℓ (right). Scattered nodes use the NUFSHT backend.*
 
 ### Backend parity (validation)
 
@@ -196,10 +202,22 @@ See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/)
 ### Spectral calculation
 - `calculate_spectrum(grid, field, ms; transform=SB.AutoSpectralBackend(), execution=CB.AutoBackend(), kwargs...)`: coefficients + physical wavenumber grids. `field` is an N-D `AbstractArray` shaped `(spatial…, batch…)` — the grid fixes the leading spatial dims, every trailing dim is a preserved batch axis (components/levels/time/ensemble); a `Tuple` of equal-shaped arrays stacks them on a new trailing axis. The two backend axes are orthogonal and compose — `transform` (a `SpectralBackends` tag: which spectral math) × `execution` (a `ComputationalBackends` backend: serial/threaded/GPU/distributed/MPI).
 - `calculate_spectrum!(coeffs, plan, field)` / `plan_spectrum(grid, T, ms; transform, execution, batch=())`: reusable plans over a trailing batch shape for allocation-free, copy-free (real FFT) repeated transforms.
-- `synthesize(grid, coeffs, ms)`: the series evaluated at the grid's points (spectral filtering, round
-  trip); the inverse of `calculate_spectrum` on a uniform periodic grid, its adjoint on any grid.
+- `synthesize(grid, coeffs, ms)`, `synthesize!(out, plan, coeffs)` / `plan_synthesis(grid, T, ms; …)`: the
+  series evaluated at the grid's points (spectral filtering, round trip); the inverse of
+  `calculate_spectrum` on a uniform periodic grid, its adjoint under the grid's quadrature on any grid.
+- `analysis = Quadrature()` (default) or `LeastSquares()`: on a scattered sphere, NUFSHT's quadrature
+  projection or its least-squares fit (`maxiter`, `rtol`); `analysis_status(plan)` returns the last call's
+  `(; converged, iterations, residual)`. A fit that stops short still writes its coefficients and reports
+  it there. Backends without a fit raise on `LeastSquares()`.
+- `batch_chunk`: how many batch fields one library execution carries on the NUFFT and NUFSHT paths (`0`
+  for the whole batch). By default a host NonuniformFFTs plan carries four, which keeps its memory
+  independent of the batch; FINUFFT, device plans and NUFSHT carry the whole batch. On a stretched tensor
+  grid's one-dimensional passes it is the lines per execution, four per thread by default.
 
 ### Reductions
+Every reduction takes `execution` (default `CB.AutoBackend()`): `ThreadedBackend` splits its rows over
+threads, `SerialBackend` runs on one and allocates nothing in place, and device coefficients are reduced on
+their device.
 - `isotropic_spectrum(ks, coeffs; num_bins, dims=())`: radial integration to `E(k, batch…)` (batch preserved); `dims` folds designated batch axes (e.g. vector components) into the energy.
 - `transect_spectrum(ks, coeffs, dims)`: integrate out specific dimensions (e.g. a zonal spectrum).
 - `anisotropic_spectrum(ks, coeffs; num_k_bins, num_θ_bins)`: anisotropy-resolved `E(k, θ)`.

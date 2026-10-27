@@ -112,7 +112,7 @@ Test.@testset "Band limit and quadrature exactness come from the sampling" begin
     end
 
     # Clenshaw–Curtis is exact to about half its band limit.
-    let s = SPH_SS.ClenshawCurtisSampling(), nlat = 16
+    let s = SPH_SS.Fejer1Sampling(), nlat = 16
         g = FG.Connectivity.structured_grid(Float64, s, nlat)
         half = (nlat - 1) ÷ 2
         Test.@test roundtrip(g, half, max(1, half - 1), 1; sampling = s) < 1e-10
@@ -225,10 +225,10 @@ Test.@testset "Masks: the active set is what is transformed" begin
     # cell is left out by zeroing its datum. Each must match itself on the unmasked grid with a zeroed
     # field, a NaN in a masked cell included.
     let lmax_f = 5, nlat = lmax_f + 1, nlon = 2 * lmax_f + 1
-        base = FG.Connectivity.structured_grid(Float64, SPH_SS.ClenshawCurtisSampling(), nlat)
+        base = FG.Connectivity.structured_grid(Float64, SPH_SS.Fejer1Sampling(), nlat)
         mk = [!(i > nlon ÷ 2 && j == nlat) for i in 1:nlon, j in 1:nlat]
         gm = FG.Grids.StructuredGrid(sph_geom(), FG.Grids.coordinates(base, 1),
-            FG.Grids.coordinates(base, 2); sampling = SPH_SS.ClenshawCurtisSampling(), mask = mk)
+            FG.Grids.coordinates(base, 2); sampling = SPH_SS.Fejer1Sampling(), mask = mk)
         msf = (nlat, 2nlat - 1)
         f = randn(nlon, nlat)
         fz = ifelse.(mk, f, 0.0)
@@ -236,16 +236,16 @@ Test.@testset "Masks: the active set is what is transformed" begin
         tr = SB.FSHTSpectralBackend()
         # `Exclude` rescales the quadrature from the active cells' share of the latitude rule to the
         # whole sphere's `4π`.
-        wq = SPH_SS.latitude_weights(Float64, SPH_SS.ClenshawCurtisSampling(), nlat)
+        wq = SPH_SS.latitude_weights(Float64, SPH_SS.Fejer1Sampling(), nlat)
         share = sum(mk[i, j] * wq[j] * 2π / nlon for i in 1:nlon, j in 1:nlat)
         for exec in (SPH_SER, CB.GPUBackend(KA.CPU()))
             cu, _ = FFS.calculate_spectrum(base, fz, msf; transform = tr, execution = exec,
-                sampling = SPH_SS.ClenshawCurtisSampling())
+                sampling = SPH_SS.Fejer1Sampling())
             cn, _ = FFS.calculate_spectrum(gm, fn, msf; transform = tr, execution = exec,
-                sampling = SPH_SS.ClenshawCurtisSampling())
+                sampling = SPH_SS.Fejer1Sampling())
             Test.@test sph_rel(cn, cu) < 1e-12
             cd, _ = FFS.calculate_spectrum(gm, fn, msf; transform = tr, execution = exec,
-                sampling = SPH_SS.ClenshawCurtisSampling(), inactive = FFS.Exclude())
+                sampling = SPH_SS.Fejer1Sampling(), inactive = FFS.Exclude())
             Test.@test sph_rel(cd, cu .* (4π / share)) < 1e-12
         end
     end

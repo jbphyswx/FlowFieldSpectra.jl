@@ -44,12 +44,35 @@ function _stage_field!(fld, field, qw)
     return fld
 end
 
+FFS._available(::FFS._DeviceKernels) = true
+
 # =============================================================================
 # The device side of `NUFFT.jl`: a plan's arrays on the execution backend, and its index gathers.
 # =============================================================================
 
 FFS._alloc(exec::ComputationalBackends.GPUBackend{<:KA.Backend}, ::Type{T}, dims::Integer...) where {T} =
     KA.allocate(exec.backend, T, dims...)
+
+# One thread per series coefficient of every field: `DirectSum.native_coefficients!` on the device.
+KA.@kernel function _native_kernel!(full, @Const(half), @Const(src), @Const(wt), M::Int, Mp::Int)
+    k = @index(Global)
+    i = (k - 1) % M + 1
+    b = (k - 1) ÷ M
+    @inbounds begin
+        j = src[i]
+        v = half[abs(j) + b * Mp]
+        full[i + b * M] = wt[i] * (j < 0 ? conj(v) : v)
+    end
+end
+
+function FFS.DirectSum.native_coefficients!(full::AbstractArray, half::AbstractArray, src::AbstractVector{Int},
+        wt::AbstractVector{Int8})
+    M = length(src)
+    B = length(full) ÷ M
+    M * B == 0 && return full
+    _native_kernel!(KA.get_backend(full))(full, half, src, wt, M, length(half) ÷ B; ndrange = M * B)
+    return full
+end
 
 # One thread per entry of every transform: entry `i` of transform `c` reads `src` at `soff + c·sstride +
 # idx[i]` and writes `dst` at `doff + c·n + i`. `w` is an array of per-entry weights or one number for
@@ -120,6 +143,29 @@ function FFS._scatter_each!(dst::AbstractArray, doff::Int, n::Int, srcs::Tuple, 
     _scatter_each_kernel!(backend)(dst, doff, n, srcs, pos, idx, fac, S, neg; ndrange = S * ntr)
     KA.synchronize(backend)
     return dst
+end
+
+# One thread per listed entry of every transform: entry `idx[i]` of `spectra[c]` is coefficient `pos[i]` of
+# transform `c` times `fac[i]`.
+KA.@kernel function _inject_each_kernel!(spectra, @Const(src), soff::Int, sstride::Int, @Const(pos), @Const(idx),
+        @Const(fac), S::Int, neg::Bool)
+    k = @index(Global)
+    i = (k - 1) % S + 1
+    c = (k - 1) ÷ S
+    @inbounds begin
+        v = src[soff + c * sstride + pos[i]]
+        spectra[c + 1][idx[i]] = (neg ? conj(v) : v) * fac[i]
+    end
+end
+
+function FFS._inject_each!(spectra::Tuple, src::AbstractArray, soff::Int, sstride::Int, ntr::Int,
+        pos::AbstractArray{Int}, idx::AbstractArray{Int}, fac::AbstractArray, neg::Bool)
+    S = length(pos)
+    S * ntr == 0 && return spectra
+    backend = KA.get_backend(first(spectra))
+    _inject_each_kernel!(backend)(spectra, src, soff, sstride, pos, idx, fac, S, neg; ndrange = S * ntr)
+    KA.synchronize(backend)
+    return spectra
 end
 
 # Column-major decode of a 1-based linear index `p` into a size-`s` grid (pure ⇒ GPU-safe).
@@ -244,10 +290,10 @@ function FFS.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
     Npts = prod(ss)
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
-    xs, ks_phys = FFS.DirectSum.phase_geometry(g, FT, ms, Val(R), box)
+    xs, ks_phys = FFS.DirectSum.phase_geometry(g, FT, ms, T, box)
     pms = map(length, ks_phys)
     M = prod(pms)
-    outside = R ? FTB.outside_modes(ms, FFS.Grids.mode_box(g, ms, Val(true))) : Int[]
+    outside = FFS.DirectSum._outside(ms, FFS.Grids.mode_box(g, ms, T), T)
     live = _dev_vec(backend, setdiff(1:M, outside), Int)
     xsd = _stage_positions(backend, layout, xs, FT)
     ksd = map(k -> _dev_vec(backend, collect(k), FT), ks_phys)
@@ -302,7 +348,7 @@ end
 
 # =============================================================================
 # Cartesian direct-sum synthesis: `f_p = Σ_k C_k e^{+iflag·i·k·x_p}` over the native spectrum. A real field's
-# packed half is written on the host as the series of `Grids.series_modes` whose real part is its series
+# packed half is written on the device as the series of `Grids.series_modes` whose real part is its series
 # over the coefficient box (`DirectSum.native_coefficients!`), and the device sum keeps the real part of
 # each term.
 # =============================================================================
@@ -358,19 +404,19 @@ end
     DirectSumGPUSynthesisPlan{FT,R}
 
 Reusable Cartesian direct-sum synthesis on a KernelAbstractions device: the positions `x − x₀` and the
-wavenumber axes of the series staged once, the device spectrum and field buffers, and for a real field the
-host buffers its packed half is written through. `R` marks a real field. Execute with
-`synthesize!(out, plan, coeffs)`.
+wavenumber axes of the series staged once, the device coefficient, series and field buffers, and for a real
+field the device `DirectSum.native_table` its packed half is read through. `R` marks a real field. Execute
+with `synthesize!(out, plan, coeffs)`.
 """
-struct DirectSumGPUSynthesisPlan{FT, R, NB, BK, L, X, K, CB, OB, HB, FB, SS, MS} <: FFS.AbstractSynthesisPlan
+struct DirectSumGPUSynthesisPlan{FT, R, NB, BK, L, X, K, CC, CB, OB, NT, SS, MS} <: FFS.AbstractSynthesisPlan
     backend::BK
     layout::L                     # TensorCartesian / CloudCartesian
     xs::X                         # device positions
     ks::K                         # device wavenumber axes of the series
+    cin::CC                       # device coefficients as the caller lays them out
     cd::CB                        # device (M, B) series coefficients
     out::OB                       # device (Npts, B) field
-    hc::HB                        # host packed half, `nothing` for a complex field
-    full::FB                      # host series coefficients it is written into, `nothing` for a complex field
+    native::NT                    # device `(src, wt)` of a real field, `nothing` for a complex one
     ss::SS                        # the grid's shape, which the field takes
     ms::MS
     box::MS                       # coefficient box
@@ -401,19 +447,19 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractDirectSumSpectralBa
     Npts = prod(ss)
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
-    offs, ranges = FFS.Grids.axis_geometry(FT, g, D, box)
+    offs, ranges = FFS.Grids.axis_geometry(FT, g, Val(D), box)
     xsd = _stage_positions(backend, layout, FFS.Grids.relative_coordinates(g, offs), FT)
-    mb = FFS.Grids.mode_box(g, ms, Val(R))
-    ns = FFS.Grids.series_modes(g, ms, Val(R))
-    ksd = map(k -> _dev_vec(backend, collect(k), FT), FFS.Grids.physical_wavenumbers(ranges, ns, Val(false)))
+    mb = FFS.Grids.mode_box(g, ms, T)
+    ns = FFS.Grids.series_modes(g, ms, T)
+    ksd = map(k -> _dev_vec(backend, collect(k), FT), FFS.Grids.physical_wavenumbers(ranges, ns, Complex{FT}))
     M = prod(ns)
+    cin = KA.allocate(backend, Complex{FT}, FTB.packed_size(T, mb)..., bt...)
     cd = KA.allocate(backend, Complex{FT}, M, B)
     out = KA.allocate(backend, R ? FT : Complex{FT}, Npts, B)
-    hc = R ? Array{Complex{FT}}(undef, FTB.packed_size(mb, Val(true))..., B) : nothing
-    full = R ? Array{Complex{FT}}(undef, ns..., B) : nothing
+    native = R ? map(a -> _dev_vec(backend, a, eltype(a)), FFS.DirectSum.native_table(ms, mb)) : nothing
     return DirectSumGPUSynthesisPlan{FT, R, length(bt), typeof(backend), typeof(layout), typeof(xsd), typeof(ksd),
-            typeof(cd), typeof(out), typeof(hc), typeof(full), typeof(ss), typeof(ms)}(
-        backend, layout, xsd, ksd, cd, out, hc, full, ss, ms, mb, ns, Npts, M, B, iflag, bt)
+            typeof(cin), typeof(cd), typeof(out), typeof(native), typeof(ss), typeof(ms)}(
+        backend, layout, xsd, ksd, cin, cd, out, native, ss, ms, mb, ns, Npts, M, B, iflag, bt)
 end
 
 """
@@ -427,15 +473,10 @@ function FFS.Plans.synthesize!(out::AbstractArray, p::DirectSumGPUSynthesisPlan{
         coeffs::AbstractArray) where {FT, R}
     size(out) == FFS.Plans.field_size(p) || throw(DimensionMismatch(
         "out is $(size(out)); this plan writes $(FFS.Plans.field_size(p))"))
-    want = (FTB.packed_size(p.box, Val(R))..., p.batch...)
+    want = size(p.cin)
     size(coeffs) == want || throw(DimensionMismatch("coeffs is $(size(coeffs)); this plan reads $want"))
-    if R
-        copyto!(p.hc, coeffs)
-        FFS.DirectSum.native_coefficients!(p.full, p.hc, p.ms, p.box)
-        copyto!(p.cd, p.full)
-    else
-        copyto!(p.cd, coeffs)
-    end
+    src = FFS._input_in(p.cin, coeffs)
+    R ? FFS.DirectSum.native_coefficients!(p.cd, src, p.native...) : copyto!(p.cd, src)
     fill!(p.out, zero(eltype(p.out)))
     _run_synthesis!(p.out, p.backend, p.layout, p.xs, p.cd, p.ks, p.ss, p.ns, p.Npts, p.M, p.B, p.iflag)
     KA.synchronize(p.backend)
@@ -444,47 +485,70 @@ function FFS.Plans.synthesize!(out::AbstractArray, p::DirectSumGPUSynthesisPlan{
 end
 
 # =============================================================================
-# Normalized associated Legendre values on the device: the packed table
-# `P[legendre_index(ℓ, m, lmax), j] = P̄_ℓ^m(cos θ_j)`, one thread per (order, node), each running
-# `SphericalKernels.legendre_order!` on the tables `legendre_tables` builds, staged once, from the starts
-# `legendre_start` forms on the host in `Float64`. The spherical kernels read values from it and evaluate
-# none.
+# Normalized associated Legendre values on the device, in the field's precision: the packed table
+# `P[legendre_index(ℓ, m, lmax), j] = P̄_ℓ^m(cos θ_j)`. One thread per node forms every order's start by
+# `SphericalKernels.legendre_start_step`, one thread per (order, node) then runs `legendre_order!` on the
+# step coefficients of `legendre_tables`, staged once. The spherical kernels read values from the table
+# and evaluate none.
 # =============================================================================
+
+# What the Legendre tables of the nodes `θ` are computed from, in `backend`'s memory: the colatitudes, the
+# order factors, step coefficients and normalizations of `legendre_tables`, and room for the starts of
+# `ncols` nodes.
+function _legendre_sources(backend::KA.Backend, ::Type{FT}, lmax::Int, θ::AbstractVector,
+        ncols::Int) where {FT}
+    t = FFS.SphericalKernels.legendre_tables(FT, lmax)
+    dev(a) = copyto!(KA.allocate(backend, eltype(a), size(a)...), a)
+    return (; θ = _dev_vec(backend, θ, FT), f = dev(t.f), α = dev(t.α), c = dev(t.c), γ = dev(t.γ),
+        nrm = dev(t.nrm), Y = KA.allocate(backend, FT, lmax + 1, ncols),
+        K = KA.allocate(backend, Int32, lmax + 1, ncols))
+end
+
+# Columns `1 … n` of the packed table `P`: the Legendre values at nodes `p0 + 1 … p0 + n` of `src`.
+function _legendre_fill!(P, backend::KA.Backend, src, lmax::Int, p0::Int, n::Int)
+    _legendre_starts_kernel!(backend)(src.Y, src.K, src.θ, src.f, lmax, p0, n; ndrange = n)
+    _legendre_table_kernel!(backend)(P, src.Y, src.K, src.θ, src.α, src.c, src.γ, src.nrm, lmax, p0, n;
+        ndrange = (lmax + 1) * n)
+    return P
+end
 
 function FFS.SphericalKernels.device_legendre_table(backend::KA.Backend, ::Type{FT}, lmax::Int,
         θ::AbstractVector) where {FT}
-    SK = FFS.SphericalKernels
-    t = SK.legendre_tables(FT, lmax)
     n = length(θ)
-    P = KA.allocate(backend, FT, SK.legendre_count(lmax), n)
+    P = KA.allocate(backend, FT, FFS.SphericalKernels.legendre_count(lmax), n)
     n == 0 && return P
-    θh = FT.(collect(θ))
-    Y = Matrix{FT}(undef, lmax + 1, n); K = Matrix{Int32}(undef, lmax + 1, n)
-    pos = Vector{Bool}(undef, n); u = Vector{FT}(undef, n)
-    for j in 1:n
-        x = cos(θh[j]); s = sin(θh[j])
-        pos[j] = x >= 0; u[j] = s^2 / (1 + abs(x))
-        ls = log2(abs(eltype(t.lD)(s)))
-        for m in 0:lmax
-            Y[m + 1, j], K[m + 1, j] = SK.legendre_start(FT, t.lD[m + 1], m, ls)
-        end
-    end
-    dev(a) = copyto!(KA.allocate(backend, eltype(a), size(a)...), a)
-    _legendre_table_kernel!(backend)(P, dev(Y), dev(K), dev(pos), dev(u), dev(t.α), dev(t.c), dev(t.γ),
-        dev(t.nrm), lmax, n; ndrange = (lmax + 1) * n)
+    _legendre_fill!(P, backend, _legendre_sources(backend, FT, lmax, θ, n), lmax, 0, n)
     KA.synchronize(backend)
     return P
 end
 
-KA.@kernel function _legendre_table_kernel!(P, @Const(Y), @Const(K), @Const(pos), @Const(u), @Const(α),
-        @Const(c), @Const(γ), @Const(nrm), lmax::Int, n::Int)
+# Every order's start at node `p0 + q`, in column `q`.
+KA.@kernel function _legendre_starts_kernel!(Y, Kk, @Const(θ), @Const(f), lmax::Int, p0::Int, n::Int)
+    q = @index(Global)
+    if q <= n
+        s = sin(@inbounds θ[p0 + q])
+        y = one(eltype(Y))
+        k = Int32(0)
+        @inbounds Y[1, q] = y
+        @inbounds Kk[1, q] = k
+        @inbounds for m in 1:lmax
+            y, k = FFS.SphericalKernels.legendre_start_step(y, k, -s * f[m])
+            Y[m + 1, q] = y
+            Kk[m + 1, q] = k
+        end
+    end
+end
+
+KA.@kernel function _legendre_table_kernel!(P, @Const(Y), @Const(Kk), @Const(θ), @Const(α), @Const(c),
+        @Const(γ), @Const(nrm), lmax::Int, p0::Int, n::Int)
     idx = @index(Global)
     if idx <= (lmax + 1) * n
         m = (idx - 1) % (lmax + 1)
         j = (idx - 1) ÷ (lmax + 1) + 1
+        x, s = cos(@inbounds θ[p0 + j]), sin(@inbounds θ[p0 + j])
         r0 = FFS.SphericalKernels.legendre_index(m, m, lmax) - m
         @inbounds FFS.SphericalKernels.legendre_order!(P, ℓ -> CartesianIndex(r0 + ℓ, j), α, c, γ, nrm, m,
-            lmax, Y[m + 1, j], K[m + 1, j], pos[j], u[j])
+            lmax, Y[m + 1, j], Kk[m + 1, j], x >= 0, s^2 / (1 + abs(x)))
     end
 end
 
@@ -492,7 +556,8 @@ end
 # Spherical direct sum and synthesis — the projection runs one thread per (row, col) coefficient slot (owns
 # it across batch, no atomics), the synthesis one thread per node, both reading the Legendre values and
 # each node's longitude factor from tables. The tables hold one column per node, so the nodes are taken in
-# chunks whose tables stay within `_SPH_TABLE_ENTRIES` entries each.
+# chunks whose tables stay within `_SPH_TABLE_ENTRIES` entries each, and both are filled on the device for
+# each chunk from what the plan holds.
 # =============================================================================
 
 const _SPH_TABLE_ENTRIES = 1 << 24
@@ -500,29 +565,31 @@ const _SPH_TABLE_ENTRIES = 1 << 24
 _sph_chunk(lmax::Int, N::Int) =
     clamp(_SPH_TABLE_ENTRIES ÷ max(FFS.SphericalKernels.legendre_count(lmax), 2 * lmax + 1), 1, max(N, 1))
 
-# `Y[col, p] = w_p · s(m) · (m ≥ 0 ? cos(mφ_p) : sin(|m|φ_p))`, the order-`m` factor of the real
-# spherical harmonic (FastSphericalHarmonics convention) times the node's quadrature weight, or times one
-# for `w = nothing`.
-function _weighted_trig(::Type{FT}, φ, w, lmax::Int) where {FT}
-    Y = Matrix{FT}(undef, 2 * lmax + 1, length(φ))
-    r2 = sqrt(FT(2))
-    @inbounds for p in eachindex(φ), col in 1:(2 * lmax + 1)
+# `Y[col, q] = w_p · s(m) · (m ≥ 0 ? cos(mφ_p) : sin(|m|φ_p))` at node `p = p0 + q`, the order-`m` factor of
+# the real spherical harmonic (FastSphericalHarmonics convention) times the node's quadrature weight, or
+# times one for `w = nothing`.
+KA.@kernel function _trig_table_kernel!(Y, @Const(φ), w, lmax::Int, p0::Int, n::Int)
+    idx = @index(Global)
+    ncol = 2 * lmax + 1
+    if idx <= ncol * n
+        col = (idx - 1) % ncol + 1
+        q = (idx - 1) ÷ ncol + 1
+        p = p0 + q
+        FT = eltype(Y)
         m = col == 1 ? 0 : (iseven(col) ? -(col ÷ 2) : (col - 1) ÷ 2)
         am = abs(m)
-        sfac = m == 0 ? one(FT) : (isodd(am) ? -r2 : r2)
-        Y[col, p] = _node_weight(FT, w, p) * sfac * (m >= 0 ? cos(m * FT(φ[p])) : sin(am * FT(φ[p])))
+        sfac = m == 0 ? one(FT) : (isodd(am) ? -sqrt(FT(2)) : sqrt(FT(2)))
+        @inbounds Y[col, q] = _node_weight(FT, w, p) * sfac * (m >= 0 ? cos(m * φ[p]) : sin(am * φ[p]))
     end
-    return Y
 end
 
 @inline _node_weight(::Type{FT}, ::Nothing, p::Int) where {FT} = one(FT)
-@inline _node_weight(::Type{FT}, w, p::Int) where {FT} = FT(w[p])
+@inline _node_weight(::Type{FT}, w, p::Int) where {FT} = FT(@inbounds w[p])
 
-# The tables of the nodes `pts`: the Legendre values on the device, the longitude factors from the host.
-function _node_tables(backend, ::Type{FT}, θ, φ, w, pts, lmax::Int) where {FT}
-    P = FFS.SphericalKernels.device_legendre_table(backend, FT, lmax, view(θ, pts))
-    Y = KA.allocate(backend, FT, 2 * lmax + 1, length(pts))
-    copyto!(Y, _weighted_trig(FT, view(φ, pts), w === nothing ? nothing : view(w, pts), lmax))
+# The tables `P` and `Y` of nodes `p0 + 1 … p0 + n`, in their columns `1 … n`.
+function _node_tables!(P, Y, backend, legendre, φ, w, lmax::Int, p0::Int, n::Int)
+    _legendre_fill!(P, backend, legendre, lmax, p0, n)
+    _trig_table_kernel!(backend)(Y, φ, w, lmax, p0, n; ndrange = (2 * lmax + 1) * n)
     return P, Y
 end
 
@@ -577,19 +644,21 @@ end
 """
     DirectSumGPUSphericalPlan{FT,CT}
 
-Reusable spherical direct sum on a KernelAbstractions device: each node's colatitude, longitude and
-quadrature weight, read from the grid once, with the device weights, field and coefficient buffers. Each
-execution builds the Legendre and longitude tables of one chunk of nodes at a time. `CT` is the coefficient
-element type, real for a real field. Execute with `calculate_spectrum!(coeffs, plan, field)`.
+Reusable spherical direct sum on a KernelAbstractions device: each node's longitude, quadrature weight and
+Legendre starts (`_legendre_sources`), read from the grid once, with the device field and coefficient
+buffers and one chunk's Legendre and longitude tables, which each execution fills on the device a chunk of
+nodes at a time. `CT` is the coefficient element type, real for a real field. Execute with
+`calculate_spectrum!(coeffs, plan, field)`.
 """
-struct DirectSumGPUSphericalPlan{FT, CT, NB, BK, V, W, FB, CB, KS} <: FFS.AbstractSpectralPlan
+struct DirectSumGPUSphericalPlan{FT, CT, NB, BK, LS, V, FB, CB, TB, KS} <: FFS.AbstractSpectralPlan
     backend::BK
-    θ::V                          # host colatitude per node
-    φ::V                          # host longitude per node
-    w::V                          # host quadrature weight per node, an inactive node at zero
-    wd::W                         # device weights
+    legendre::LS                  # device Legendre starts and step coefficients
+    φ::V                          # device longitude per node
+    wd::V                         # device quadrature weight per node, an inactive node at zero
     fld::FB                       # device (N, B) field
     cd::CB                        # device (lmax + 1, 2lmax + 1, B) coefficients
+    P::TB                         # device Legendre table of one chunk
+    Y::TB                         # device longitude table of one chunk
     lmax::Int
     N::Int
     chunk::Int
@@ -617,17 +686,22 @@ function FFS.plan_spectrum(::SpectralBackends.AbstractDirectSumSpectralBackend,
     backend = exec.backend
     θ, φ, wpt = FFS.DirectSum._sph_point_data(g, FT; sampling = sampling,
         weights = FFS.Grids._inactive_weights(inactive, g, FT; sampling, weights))
-    w = collect(FT, wpt)
     N = length(θ)
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
     CT = FFS.sph_coeff_type(T, FT)
-    wd = _dev_vec(backend, w, FT)
+    chunk = _sph_chunk(lmax, N)
+    legendre = _legendre_sources(backend, FT, lmax, θ, chunk)
+    φd = _dev_vec(backend, φ, FT)
+    wd = _dev_vec(backend, wpt, FT)
     fld = KA.allocate(backend, CT <: Real ? FT : Complex{FT}, N, B)
     cd = KA.allocate(backend, CT, lmax + 1, 2 * lmax + 1, B)
+    P = KA.allocate(backend, FT, FFS.SphericalKernels.legendre_count(lmax), chunk)
+    Y = KA.allocate(backend, FT, 2 * lmax + 1, chunk)
     ks = (0:lmax, -lmax:lmax)
-    return DirectSumGPUSphericalPlan{FT, CT, length(bt), typeof(backend), Vector{FT}, typeof(wd), typeof(fld),
-            typeof(cd), typeof(ks)}(backend, θ, φ, w, wd, fld, cd, lmax, N, _sph_chunk(lmax, N), bt, B, ks)
+    return DirectSumGPUSphericalPlan{FT, CT, length(bt), typeof(backend), typeof(legendre), typeof(φd),
+            typeof(fld), typeof(cd), typeof(P), typeof(ks)}(backend, legendre, φd, wd, fld, cd, P, Y, lmax, N,
+        chunk, bt, B, ks)
 end
 
 """
@@ -648,9 +722,9 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, p::DirectSumGP
     _stage_field!(p.fld, field, nothing)
     fill!(p.cd, zero(CT))
     for lo in 1:p.chunk:p.N
-        pts = lo:min(p.N, lo + p.chunk - 1)
-        P, Y = _node_tables(p.backend, FT, p.θ, p.φ, p.w, pts, p.lmax)
-        _spherical_kernel!(p.backend)(p.cd, P, Y, p.fld, p.wd, p.lmax, lo - 1, length(pts), p.B;
+        n = min(p.N, lo + p.chunk - 1) - lo + 1
+        _node_tables!(p.P, p.Y, p.backend, p.legendre, p.φ, p.wd, p.lmax, lo - 1, n)
+        _spherical_kernel!(p.backend)(p.cd, p.P, p.Y, p.fld, p.wd, p.lmax, lo - 1, n, p.B;
             ndrange = (p.lmax + 1) * (2 * p.lmax + 1))
         KA.synchronize(p.backend)
     end
@@ -673,16 +747,19 @@ end
 """
     DirectSumGPUSphericalSynthesisPlan{FT,OT}
 
-Reusable spherical direct-sum synthesis on a KernelAbstractions device: each node's colatitude and
-longitude, read from the grid once, with the device coefficient and field buffers. `OT` is the field's
-element type. Execute with `synthesize!(out, plan, coeffs)`.
+Reusable spherical direct-sum synthesis on a KernelAbstractions device: each node's longitude and Legendre
+starts, read from the grid once, with the device coefficient and field buffers and one chunk's Legendre
+and longitude tables, filled on the device each execution. `OT` is the field's element type. Execute with
+`synthesize!(out, plan, coeffs)`.
 """
-struct DirectSumGPUSphericalSynthesisPlan{FT, OT, NB, BK, V, CB, OB, SP <: Tuple} <: FFS.AbstractSynthesisPlan
+struct DirectSumGPUSphericalSynthesisPlan{FT, OT, NB, BK, LS, V, CB, OB, TB, SP <: Tuple} <: FFS.AbstractSynthesisPlan
     backend::BK
-    θ::V                          # host colatitude per node
-    φ::V                          # host longitude per node
+    legendre::LS                  # device Legendre starts and step coefficients
+    φ::V                          # device longitude per node
     cd::CB                        # device (lmax + 1, 2lmax + 1, B) coefficients of element type `OT`
     out::OB                       # device (N, B) field
+    P::TB                         # device Legendre table of one chunk
+    Y::TB                         # device longitude table of one chunk
     lmax::Int
     N::Int
     chunk::Int
@@ -707,17 +784,21 @@ function FFS.Plans.plan_synthesis(::SpectralBackends.AbstractDirectSumSpectralBa
     lmax = ms[1] - 1
     lmax >= 0 || throw(ArgumentError("ms[1] must be ≥ 1 (lmax = ms[1] - 1); got $(ms[1])"))
     backend = exec.backend
-    θraw, φraw = FFS.Grids._sph_points(g)
-    θ = collect(FT, θraw)
-    φ = collect(FT, φraw)
+    θ, φ = FFS.Grids._sph_points(g)
     N = length(θ)
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
+    chunk = _sph_chunk(lmax, N)
+    legendre = _legendre_sources(backend, FT, lmax, θ, chunk)
+    φd = _dev_vec(backend, φ, FT)
     cd = KA.allocate(backend, OT, lmax + 1, 2 * lmax + 1, B)
     out = KA.allocate(backend, OT, N, B)
+    P = KA.allocate(backend, FT, FFS.SphericalKernels.legendre_count(lmax), chunk)
+    Y = KA.allocate(backend, FT, 2 * lmax + 1, chunk)
     sp = size(g)
-    return DirectSumGPUSphericalSynthesisPlan{FT, OT, length(bt), typeof(backend), Vector{FT}, typeof(cd),
-            typeof(out), typeof(sp)}(backend, θ, φ, cd, out, lmax, N, _sph_chunk(lmax, N), sp, bt, B)
+    return DirectSumGPUSphericalSynthesisPlan{FT, OT, length(bt), typeof(backend), typeof(legendre), typeof(φd),
+            typeof(cd), typeof(out), typeof(P), typeof(sp)}(backend, legendre, φd, cd, out, P, Y, lmax, N, chunk,
+        sp, bt, B)
 end
 
 """
@@ -735,10 +816,9 @@ function FFS.Plans.synthesize!(out::AbstractArray, p::DirectSumGPUSphericalSynth
     size(coeffs) == want || throw(DimensionMismatch("coeffs is $(size(coeffs)); this plan reads $want"))
     copyto!(p.cd, (OT <: Real && eltype(coeffs) <: Complex) ? real.(coeffs) : coeffs)
     for lo in 1:p.chunk:p.N
-        pts = lo:min(p.N, lo + p.chunk - 1)
-        P, Y = _node_tables(p.backend, FT, p.θ, p.φ, nothing, pts, p.lmax)
-        _spherical_synth_kernel!(p.backend)(p.out, P, Y, p.cd, p.lmax, lo - 1, length(pts), p.B;
-            ndrange = length(pts))
+        n = min(p.N, lo + p.chunk - 1) - lo + 1
+        _node_tables!(p.P, p.Y, p.backend, p.legendre, p.φ, nothing, p.lmax, lo - 1, n)
+        _spherical_synth_kernel!(p.backend)(p.out, p.P, p.Y, p.cd, p.lmax, lo - 1, n, p.B; ndrange = n)
         KA.synchronize(p.backend)
     end
     copyto!(out, p.out)

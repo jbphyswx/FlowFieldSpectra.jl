@@ -36,7 +36,7 @@ Test.@testset "Spheroid surface grid transforms against its own directions" begi
     nlon, nlat = 12, 9
     λ = [2π * (i - 1) / nlon for i in 1:nlon]
     φ = [π * (j - 0.5) / nlat - π / 2 for j in 1:nlat]
-    g = FG.Grids.StructuredGrid(geo, λ, φ; periodic = (true, false), period = (2π, 0.0))
+    g = FG.Grids.StructuredGrid(geo, λ, φ; topology = (FG.Grids.Periodic(), FG.Grids.Bounded()), period = (2π, 0.0))
 
     f = [1.0 + 0.5 * sin(a) + 0.3 * cos(2 * b) for a in λ, b in φ]
     c, _ = FFS.calculate_spectrum(g, f, ms; transform = SD_DS, execution = SD_SER)

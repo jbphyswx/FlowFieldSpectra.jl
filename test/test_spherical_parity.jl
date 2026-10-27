@@ -5,8 +5,8 @@
 # grid's weights. A grid whose per-node measures vary is the case that separates a weighted transform from
 # an unweighted one.
 #
-# `solve = true` is the least-squares fit `A c ≈ f`, recovering the coefficients a field was synthesized
-# from.
+# `analysis = LeastSquares()` is the least-squares fit `A c ≈ f`, recovering the coefficients a field was
+# synthesized from.
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
@@ -109,11 +109,28 @@ Test.@testset "NUFSHT solve consumes the raw field" begin
     for w in (fill(4π / N, N), [1.0 + 0.8 * sin(λ[i])^2 for i in 1:N])
         g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φlat), w)
         for exec in (SP_SER, CB.GPUBackend(KA.CPU()))
-            cs, _ = FFS.calculate_spectrum(g, fv, (Nθ, Nφ); transform = SP_NU, execution = exec, solve = true,
-                rtol = 1.0e-10, maxiter = 2000)
+            p = FFS.plan_spectrum(g, Float64, (Nθ, Nφ); transform = SP_NU, execution = exec,
+                analysis = FFS.LeastSquares(), rtol = 1.0e-10, maxiter = 2000)
+            cs = FFS.allocate_coefficients(p)
+            FFS.calculate_spectrum!(cs, p, fv)
             Test.@test maximum(abs, cs .- Cref) < 1e-10
+            st = FFS.analysis_status(p)
+            Test.@test st.converged && 0 < st.iterations <= 2000 && st.residual <= 1.0e-10
+            # A fit capped below its iteration count reports that it stopped short, its coefficients written.
+            q = FFS.plan_spectrum(g, Float64, (Nθ, Nφ); transform = SP_NU, execution = exec,
+                analysis = FFS.LeastSquares(), rtol = 1.0e-14, maxiter = 1)
+            FFS.calculate_spectrum!(cs, q, fv)
+            Test.@test !FFS.analysis_status(q).converged && FFS.analysis_status(q).iterations == 1
+            FFS.close!(p); FFS.close!(q)
         end
     end
+    # The quadrature reports no fit, and a backend computing the quadrature alone refuses the fit.
+    g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φlat), fill(4π / N, N))
+    pq = FFS.plan_spectrum(g, Float64, (Nθ, Nφ); transform = SP_NU)
+    Test.@test FFS.analysis_status(pq) == (; converged = true, iterations = 0, residual = 0.0)
+    FFS.close!(pq)
+    Test.@test_throws ArgumentError FFS.calculate_spectrum(g, fv, (Nθ, Nφ); transform = SP_DS,
+        analysis = FFS.LeastSquares())
 end
 
 Test.@testset "NUFSHT on a structured spherical grid" begin
@@ -144,17 +161,28 @@ function sp_coeffs(lmax, B; cplx = false)
     return C
 end
 
+# FastTransforms' grid, its longitudes `λ₀ + s·2πj/nlon` (origin `λ₀`, step sign `s`).
+function sp_ft_grid(lmax, λ₀, s)
+    base = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), lmax + 1)
+    nlon = 2 * lmax + 1
+    λ = FG.Axes.PeriodicAxis(λ₀, s * 2π, nlon)
+    return FG.Grids.StructuredGrid(FG.Grids.grid_geometry(base), λ, FG.Grids.coordinates(base, 2);
+        sampling = FG.Grids.sampling(base))
+end
+
+sp_field_type(cplx::Bool) = cplx ? ComplexF64 : Float64
+
 Test.@testset "A FastSphericalHarmonics plan recovers the coefficients a field was synthesized from" begin
-    # The analysis is exact on its own Clenshaw–Curtis grid, so a field the direct sum synthesizes from
-    # known coefficients returns them, on one thread and on `Threads.nthreads()`.
+    # The analysis is exact on its own grid, so a field the direct sum synthesizes from known coefficients
+    # returns them, on one thread and on `Threads.nthreads()`, whatever the longitude origin and direction.
     Random.seed!(91)
     lmax = 5
     ms = (lmax + 1, 2 * lmax + 1)
     B = 3
-    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), lmax + 1)
-    for cplx in (false, true), exec in (SP_SER, CB.ThreadedBackend())
+    for (λ₀, s) in ((0.0, 1), (0.37, 1), (1.1, -1)), cplx in (false, true), exec in (SP_SER, CB.ThreadedBackend())
+        gcc = sp_ft_grid(lmax, λ₀, s)
         C = sp_coeffs(lmax, B; cplx = cplx)
-        f = FFS.synthesize(gcc, C, ms; transform = SP_DS, execution = SP_SER, real_output = !cplx)
+        f = FFS.synthesize(sp_field_type(cplx), gcc, C, ms; transform = SP_DS, execution = SP_SER)
         p = FFS.plan_spectrum(gcc, eltype(f), ms; transform = SB.FSHTSpectralBackend(), execution = exec,
             batch = (B,))
         buf = FFS.allocate_coefficients(p)
@@ -166,6 +194,10 @@ Test.@testset "A FastSphericalHarmonics plan recovers the coefficients a field w
         Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(zeros(eltype(buf), ms...), p, f)
         Test.@test_throws DimensionMismatch FFS.calculate_spectrum!(buf, p, f[:, :, 1])
     end
+    # Another sampling at FastTransforms' size is not its grid.
+    ggl = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.GaussLegendreSampling(), lmax + 1)
+    Test.@test_throws ArgumentError FFS.plan_spectrum(ggl, Float64, ms; transform = SB.FSHTSpectralBackend(),
+        execution = SP_SER)
 end
 
 Test.@testset "A FastSphericalHarmonics synthesis plan evaluates the series at the nodes" begin
@@ -175,14 +207,14 @@ Test.@testset "A FastSphericalHarmonics synthesis plan evaluates the series at t
     lmax = 5
     ms = (lmax + 1, 2 * lmax + 1)
     B = 3
-    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), lmax + 1)
-    for cplx in (false, true), exec in (SP_SER, CB.ThreadedBackend())
-        p = FFS.plan_synthesis(gcc, cplx ? ComplexF64 : Float64, ms; transform = SB.FSHTSpectralBackend(),
+    for (λ₀, s) in ((0.0, 1), (0.37, 1), (1.1, -1)), cplx in (false, true), exec in (SP_SER, CB.ThreadedBackend())
+        gcc = sp_ft_grid(lmax, λ₀, s)
+        p = FFS.plan_synthesis(gcc, sp_field_type(cplx), ms; transform = SB.FSHTSpectralBackend(),
             execution = exec, batch = (B,))
         out = FFS.allocate_field(p)
         for _ in 1:2
             C = sp_coeffs(lmax, B; cplx = cplx)
-            fd = FFS.synthesize(gcc, C, ms; transform = SP_DS, execution = SP_SER, real_output = !cplx)
+            fd = FFS.synthesize(sp_field_type(cplx), gcc, C, ms; transform = SP_DS, execution = SP_SER)
             FFS.synthesize!(out, p, C)
             Test.@test sp_rel(out, fd) < 1e-12
         end
@@ -210,7 +242,7 @@ Test.@testset "NUFSHT solve on a masked grid, inactive cells zero-filled or excl
     fz[land] .= 0
     gm = FG.Grids.UnstructuredGrid(geo, (λ, φlat), fill(4π / N, N), sea)
     gs = FG.Grids.UnstructuredGrid(geo, (λ[sea], φlat[sea]), fill(4π / N, count(sea)))
-    kw = (; transform = SP_NU, solve = true, rtol = 1.0e-12, maxiter = 2000)
+    kw = (; transform = SP_NU, analysis = FFS.LeastSquares(), rtol = 1.0e-12, maxiter = 2000)
     for exec in (SP_SER, CB.GPUBackend(KA.CPU()))
         cz, _ = FFS.calculate_spectrum(gm, fn, ms; execution = exec, kw...)
         cu, _ = FFS.calculate_spectrum(gu, fz, ms; execution = exec, kw...)
@@ -304,7 +336,7 @@ Test.@testset "normalized Legendre values at lmax = 512 against BigFloat" begin
         t = SK.legendre_tables(FT, lmax)
         Plm = zeros(FT, lmax + 1, lmax + 1)
         Pd = Array(SK.device_legendre_table(KA.CPU(), FT, lmax, θs))
-        floor = sqrt((2lmax + 1) / 4π) * ldexp(1.0, -3 * SK._span(FT) ÷ 2)
+        floor = sqrt((2lmax + 1) / 4π) * ldexp(1.0, -3 * FTB.wigner_d_span(FT) ÷ 2)
         for (j, θ) in enumerate(θs)
             SK.fill_legendre!(Plm, t, cos(θ), sin(θ), lmax)
             for m in (0, 3, 100, 200, 300, 450, 512)
@@ -331,7 +363,7 @@ Test.@testset "The device SHT synthesis evaluates the series at the nodes" begin
     for nlon in (2 * lmax - 1, 2 * lmax + 1, 2 * lmax + 4), cplx in (false, true)
         g = FG.Connectivity.structured_grid(Float64, GL, lmax + 1; nlon = nlon)
         C = sp_coeffs(lmax, 2; cplx = cplx)
-        fd = FFS.synthesize(g, C, ms; transform = SP_DS, execution = SP_SER, real_output = !cplx)
+        fd = FFS.synthesize(sp_field_type(cplx), g, C, ms; transform = SP_DS, execution = SP_SER)
         p = FFS.plan_synthesis(g, cplx ? ComplexF64 : Float64, ms; transform = SB.FSHTSpectralBackend(),
             execution = gpu, batch = (2,))
         out = FFS.allocate_field(p)
@@ -343,5 +375,21 @@ Test.@testset "The device SHT synthesis evaluates the series at the nodes" begin
             cg, _ = FFS.calculate_spectrum(g, out, ms; transform = SB.FSHTSpectralBackend(), execution = gpu)
             Test.@test sp_rel(cg, C) < 1e-12
         end
+    end
+    # Longitudes from `λ₀` in either direction: the device transforms carry the origin as a phase and the
+    # direction as the bin order, against the direct sum's exact longitude sums.
+    for (λ₀, s) in ((0.37, 1), (1.1, -1)), cplx in (false, true)
+        base = FG.Connectivity.structured_grid(Float64, GL, lmax + 1)
+        g = FG.Grids.StructuredGrid(FG.Grids.grid_geometry(base), FG.Axes.PeriodicAxis(λ₀, s * 2π, 2 * lmax + 1),
+            FG.Grids.coordinates(base, 2); sampling = FG.Grids.sampling(base))
+        C = sp_coeffs(lmax, 2; cplx = cplx)
+        fd = FFS.synthesize(sp_field_type(cplx), g, C, ms; transform = SP_DS, execution = SP_SER)
+        p = FFS.plan_synthesis(g, sp_field_type(cplx), ms; transform = SB.FSHTSpectralBackend(),
+            execution = gpu, batch = (2,))
+        out = FFS.allocate_field(p)
+        FFS.synthesize!(out, p, C)
+        Test.@test sp_rel(out, fd) < 1e-12
+        cg, _ = FFS.calculate_spectrum(g, fd, ms; transform = SB.FSHTSpectralBackend(), execution = gpu)
+        Test.@test sp_rel(cg, C) < 1e-12
     end
 end

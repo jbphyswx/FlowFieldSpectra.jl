@@ -34,12 +34,12 @@ Test.@testset "Factorized direct sum equals an inline naive sum" begin
     L = 2π
     N = 6
     xs = rp_uni(L, N)
-    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     f = randn(N, N)
     ms = (N, N)
     c, ks = FFS.calculate_spectrum(g, f, ms; transform = RP_DS, execution = RP_SER)
 
-    pms = FTB.packed_size(ms, Val(true))
+    pms = FTB.packed_size(Real, ms)
     naive = zeros(ComplexF64, pms...)
     for i1 in 1:pms[1], i2 in 1:pms[2]
         k1 = ks[1][i1]
@@ -56,7 +56,7 @@ Test.@testset "Factorized direct sum equals an inline naive sum" begin
     # grid's own per-node measure, `C[k] = Σ w f e^{-ikx} / Σw`. Both even axes tell `±N/2` apart there, so
     # the box holds `k₁ = 0 … N/2` and `k₂ = -N/2 … N/2`.
     ax = rp_str(L, N)
-    gs = FG.Grids.StructuredGrid(RP_CART, ax, ax; periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(RP_CART, ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     cs, kss = FFS.calculate_spectrum(gs, f, ms; transform = RP_DS, execution = RP_SER)
     w = collect(FG.Grids.measure(gs))
     k1s = 0:(N ÷ 2)
@@ -79,7 +79,7 @@ Test.@testset "Every transform of a point set equals the naive sum over its coef
     for ms in ((6, 6), (4, 6, 4))
         D = length(ms)
         xs = ntuple(_ -> L .* rand(M), D)
-        g = FG.Grids.UnstructuredGrid(RP_CART, xs, fill(1.0, M); periodic = ntuple(_ -> true, D),
+        g = FG.Grids.UnstructuredGrid(RP_CART, xs, fill(1.0, M); topology = ntuple(_ -> FG.Grids.Periodic(), D),
             period = ntuple(_ -> L, D))
         x0 = map(minimum, xs)
         f = randn(M)
@@ -109,7 +109,7 @@ Test.@testset "Two widened axes of a stretched grid: zero outside the computed m
     n = 6
     x1 = rp_uni(L, n)
     ax = rp_str(L, n)
-    g = FG.Grids.StructuredGrid(RP_CART, x1, ax, ax; periodic = (true, true, true), period = (L, L, L))
+    g = FG.Grids.StructuredGrid(RP_CART, x1, ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L, L))
     ms = (n, 6, 4)
     f = randn(n, n, n)
     w = collect(FG.Grids.measure(g))
@@ -139,13 +139,13 @@ Test.@testset "Synthesis from the coefficient box is the real series over the wh
     ax = rp_str(L, 8)
     hybrid = map(((t, kw, tol),) -> (RP_FFT, (; nufft = t, kw...), tol), RP_NUFFTS)
     cases = (
-        (FG.Grids.StructuredGrid(RP_CART, ax, ax; periodic = (true, true), period = (L, L)), (8, 8), ()),
-        (FG.Grids.StructuredGrid(RP_CART, rp_uni(L, 8), ax; periodic = (true, true), period = (L, L)), (8, 8),
+        (FG.Grids.StructuredGrid(RP_CART, ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (8, 8), ()),
+        (FG.Grids.StructuredGrid(RP_CART, rp_uni(L, 8), ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (8, 8),
             hybrid),
         (FG.Grids.UnstructuredGrid(RP_CART, (L .* rand(M), L .* rand(M)), fill(1.0, M);
-            periodic = (true, true), period = (L, L)), (6, 8), ()),
+            topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (6, 8), ()),
         (FG.Grids.UnstructuredGrid(RP_CART, (L .* rand(M), L .* rand(M), L .* rand(M)), fill(1.0, M);
-            periodic = (true, true, true), period = (L, L, L)), (4, 6, 4), ()),
+            topology = (FG.Grids.Periodic(), FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L, L)), (4, 6, 4), ()),
     )
     for (g, ms, extra) in cases, iflag in (1, -1)
         D = length(ms)
@@ -175,7 +175,7 @@ Test.@testset "Synthesis reproduces the band-limited part of a field" begin
     L = 2π
     N = 12
     xs = rp_uni(L, N)
-    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     ms = (6, 6)
     k = -(ms[1] ÷ 2):(ms[1] ÷ 2)
     f = randn(N, N)
@@ -196,7 +196,7 @@ Test.@testset "Inverses that use no direct sum" begin
     L = 2π
     N = 12
     xs = rp_uni(L, N)
-    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(RP_CART, xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     f = randn(N, N)
     ms = (N, N)
 
@@ -206,7 +206,7 @@ Test.@testset "Inverses that use no direct sum" begin
     Test.@test rp_rel(fr, f) < 1e-12
     # And through the complex route.
     cc, _ = FFS.calculate_spectrum(g, ComplexF64.(f), ms; transform = RP_FFT, execution = RP_SER)
-    fcr = FFS.synthesize(g, cc, ms; transform = RP_FFT, execution = RP_SER, real_output = false)
+    fcr = FFS.synthesize(ComplexF64, g, cc, ms; transform = RP_FFT, execution = RP_SER)
     Test.@test rp_rel(real.(fcr), f) < 1e-12
 
     # FastSphericalHarmonics: its analysis and synthesis are an exact pair in the coefficient direction.
@@ -214,7 +214,7 @@ Test.@testset "Inverses that use no direct sum" begin
     # arbitrary grid field is a band-limited projection; the identity is synthesis followed by analysis.
     lmax = 5
     sms = (lmax + 1, 2 * lmax + 1)
-    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), lmax + 1)
+    gcc = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), lmax + 1)
     C = zeros(Float64, sms...)
     for l in 0:lmax, m in -l:l
         C[FFS.sph_mode_index(l, m)] = randn()

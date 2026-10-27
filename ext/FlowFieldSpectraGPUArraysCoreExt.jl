@@ -1,18 +1,21 @@
 module FlowFieldSpectraGPUArraysCoreExt
 
-# Spectral reductions of coefficients held on a device. Each mode adds its contribution to its bin on the
-# device, and only the bins, a few hundred numbers per field, come back to the host, which finishes them
-# as it does a host reduction. The copy of the bins to the host is ordered after the kernel.
+# Spectral reductions of coefficients held on a device, whatever execution backend the call names. Each
+# mode adds its contribution to its bin on the device, and only the bins, a few hundred numbers per field,
+# come back to the host, which finishes them as it does a host reduction. The copy of the bins to the host
+# is ordered after the kernel.
 
 using KernelAbstractions: KernelAbstractions as KA, @index, @Const
 using GPUArraysCore: GPUArraysCore
+using ComputationalBackends: ComputationalBackends as CB
 using FlowFieldSpectra: FlowFieldSpectra as FFS
 using FlowTransformBindings: FlowTransformBindings as FTB
 
 _upload(backend, v::AbstractVector) = copyto!(KA.allocate(backend, eltype(v), length(v)), v)
 
-function FFS.Reductions._radial_accumulate!(E::AbstractArray, nmodes::AbstractVector{T}, val::V,
-        A::GPUArraysCore.AbstractGPUArray, ks_phys::Tuple, dk::T, k_top::T, ::Val{C}) where {T, V, C}
+function FFS.Reductions._radial_accumulate!(::CB.AbstractExecutionBackend, E::AbstractArray,
+        nmodes::AbstractVector{T}, val::V, A::GPUArraysCore.AbstractGPUArray, ks_phys::Tuple, dk::T, k_top::T,
+        cut::Bool) where {T, V}
     D = length(ks_phys)
     backend = KA.get_backend(A)
     ms = ntuple(d -> size(A, d), Val(D))
@@ -27,7 +30,7 @@ function FFS.Reductions._radial_accumulate!(E::AbstractArray, nmodes::AbstractVe
     Ei = KA.zeros(backend, T, cplx ? nb : 1, cplx ? B : 1)
     nm = KA.zeros(backend, T, nb)
     _radial_kernel!(backend)(Er, Ei, nm, val, reshape(A, NM, B), ksd, w1, CartesianIndices(ms), dk, k_top,
-        C, cplx, nb, B; ndrange = NM)
+        cut, cplx, nb, B; ndrange = NM)
     Eh = Array(Er)
     E .+= reshape(cplx ? complex.(Eh, Array(Ei)) : Eh, size(E))
     nmodes .+= Array(nm)
@@ -53,8 +56,8 @@ KA.@kernel function _radial_kernel!(Er, Ei, nm, val, @Const(A), ksd, @Const(w1),
     end
 end
 
-function FFS.Reductions._sector_accumulate!(E::AbstractArray{T}, nmodes::AbstractMatrix{T},
-        P::GPUArraysCore.AbstractGPUArray, ks_phys::Tuple, dk::T, dθ::T, k_max::T) where {T}
+function FFS.Reductions._sector_accumulate!(::CB.AbstractExecutionBackend, E::AbstractArray{T},
+        nmodes::AbstractMatrix{T}, P::GPUArraysCore.AbstractGPUArray, ks_phys::Tuple, dk::T, dθ::T, k_max::T) where {T}
     backend = KA.get_backend(P)
     n1, n2 = size(P, 1), size(P, 2)
     n1 * n2 == 0 && return E
@@ -114,8 +117,8 @@ KA.@kernel function _sector_kernel!(Ed, nm, @Const(P), @Const(kx), @Const(ky), @
     end
 end
 
-function FFS.Reductions._transect_accumulate!(E_reduced::AbstractArray{T}, ks_phys::Tuple,
-        coeffs::GPUArraysCore.AbstractGPUArray{Complex{T}, N}, dims::Tuple) where {T, N}
+function FFS.Reductions._transect_accumulate!(::CB.AbstractExecutionBackend, E_reduced::AbstractArray{T},
+        ks_phys::Tuple, coeffs::GPUArraysCore.AbstractGPUArray{Complex{T}, N}, dims::Tuple) where {T, N}
     D = length(ks_phys)
     length(coeffs) == 0 && return E_reduced
     backend = KA.get_backend(coeffs)
@@ -167,9 +170,39 @@ end
     (@inbounds first(ksd)[I[d]])^2 + _ksq(T, Base.tail(ksd), I, d + 1)
 @inline _ksq(::Type{T}, ::Tuple{}, ::CartesianIndex, ::Int) where {T} = zero(T)
 
+# Each realization binned on the device by `_radial_accumulate!` into its own column of `E` `(nb, R)`, the
+# columns then summed on the host.
+function _binned_realizations(exec, ::Type{E}, nmodes, val, A, ks_phys::Tuple, dk, k_top, cut::Bool) where {E}
+    D = length(ks_phys)
+    ms = ntuple(d -> size(A, d), Val(D))
+    R = length(A) ÷ prod(ms)
+    S = zeros(E, length(nmodes), R)
+    FFS.Reductions._radial_accumulate!(exec, S, nmodes, val, reshape(A, ms..., R), ks_phys, dk, k_top, cut)
+    return vec(sum(S; dims = 2)), R
+end
+
+function FFS.Averaging._welch_accumulate!(exec::CB.AbstractExecutionBackend, E_k::AbstractVector{T},
+        nmodes::AbstractVector{T}, coeffs::GPUArraysCore.AbstractGPUArray{Complex{T}}, ks_phys::Tuple, dk::T,
+        k_top::T, cut::Bool) where {T}
+    s, R = _binned_realizations(exec, T, nmodes, FFS.Reductions._HalfAbs2(), coeffs, ks_phys, dk, k_top, cut)
+    E_k .+= s ./ R
+    return E_k
+end
+
+function FFS.Averaging._coherence_accumulate!(exec::CB.AbstractExecutionBackend, Sff::AbstractVector{T},
+        Sgg::AbstractVector{T}, Sfg::AbstractVector, cf::GPUArraysCore.AbstractGPUArray{Complex{T}},
+        cg::GPUArraysCore.AbstractGPUArray{Complex{T}}, ks_phys::Tuple, dk::T, k_max::T) where {T}
+    nm = zeros(T, length(Sfg))
+    Sff .+= first(_binned_realizations(exec, T, nm, FFS.Reductions._HalfAbs2(), cf, ks_phys, dk, k_max, true))
+    Sgg .+= first(_binned_realizations(exec, T, nm, FFS.Reductions._HalfAbs2(), cg, ks_phys, dk, k_max, true))
+    Sfg .+= first(_binned_realizations(exec, Complex{T}, nm, FFS.Reductions._HalfCross(), cf .* conj.(cg), ks_phys,
+        dk, k_max, true))
+    return Sfg
+end
+
 # The degree spectrum: one thread per degree and field sums `|C_ℓ^m|²` over its orders.
-function FFS.Reductions._accumulate_degree!(E::AbstractArray{T}, coeffs::GPUArraysCore.AbstractGPUArray,
-        lmax::Int) where {T}
+function FFS.Reductions._accumulate_degree!(::CB.AbstractExecutionBackend, E::AbstractArray{T},
+        coeffs::GPUArraysCore.AbstractGPUArray, lmax::Int) where {T}
     backend = KA.get_backend(coeffs)
     Nθ, Nφ = size(coeffs, 1), size(coeffs, 2)
     B = length(coeffs) ÷ (Nθ * Nφ)

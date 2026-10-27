@@ -162,9 +162,10 @@ Test.@testset "Reductions on ThreadedBackend equal the serial ones" begin
         ch = FFS.coherence_spectrum(ks, c, reverse(c; dims = D + 1); thr...)
         cs = FFS.coherence_spectrum(ks, c, reverse(c; dims = D + 1); ser...)
         Test.@test all(map((a, b) -> isapprox(a, b; rtol = 1e-12), ch, cs))
-        for dims in ((1,), (D,), ntuple(identity, D))
-            Test.@test last(FFS.transect_spectrum(ks, c, dims; thr...)) ≈
-                       last(FFS.transect_spectrum(ks, c, dims; ser...)) rtol = 1e-13
+        c1 = c[ntuple(_ -> Colon(), D)..., 1]
+        for dims in ((1,), (D,), ntuple(identity, D)), cc in (c, c1)
+            Test.@test last(FFS.transect_spectrum(ks, cc, dims; thr...)) ≈
+                       last(FFS.transect_spectrum(ks, cc, dims; ser...)) rtol = 1e-13
         end
         if D == 2
             Test.@test last(FFS.anisotropic_spectrum(ks, c; num_θ_bins = 8, thr...)) ≈

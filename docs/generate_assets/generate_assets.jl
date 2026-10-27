@@ -30,6 +30,14 @@ scg(coords::Tuple; L) = FG.Grids.UnstructuredGrid(CART, coords, ones(length(coor
     topology = map(_ -> FG.Grids.Periodic(), coords), period = map(_ -> L, coords))
 _uaxis(L, N) = range(0.0, L; length = N + 1)[1:N]
 
+# A full wavenumber axis in ascending order and `A` permuted to match along dim `d`: the transforms keep
+# FFT order, negative wavenumbers last, and a heatmap needs ascending coordinates.
+function _ascending(k, A, d)
+    kv = collect(k)
+    p = sortperm(kv)
+    return kv[p], selectdim(A, d, p)
+end
+
 # ─── Synthetic broadband fields ────────────────────────────────────────────
 # Discrete-mode test fields give spiky, delta-like spectra that are hard to read. For showcase
 # figures we instead synthesize fields with a *broadband* power-law spectrum, so the recovered
@@ -89,7 +97,7 @@ function generate_cartesian_figure()
     k_bins, E_k = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 40, dims = 3)
 
     fig = Mke.Figure(size = (1500, 460), fontsize = 15)
-    Mke.Label(fig[0, 1:3], "Cartesian 2D spectra — synthetic turbulence with a k⁻⁵ᐟ³ cascade",
+    Mke.Label(fig[0, 1:5], "Cartesian 2D spectra — synthetic turbulence with a k⁻⁵ᐟ³ cascade",
         fontsize = 19, font = :bold)
 
     ax1 = Mke.Axis(fig[1, 1]; title = "A. A velocity component (the flow)", xlabel = "x",
@@ -100,9 +108,10 @@ function generate_cartesian_figure()
 
     ax2 = Mke.Axis(fig[1, 3]; title = "B. 2D spectral energy  log₁₀|C|²", xlabel = "kₓ",
         ylabel = "k_y", aspect = Mke.DataAspect())
-    energy_2d = log10.(0.5 .* (abs2.(c_fft[:, :, 1]) .+ abs2.(c_fft[:, :, 2])) .+ 1e-30)
+    ky, energy_2d = _ascending(k_fft[2],
+        log10.(0.5 .* (abs2.(c_fft[:, :, 1]) .+ abs2.(c_fft[:, :, 2])) .+ 1e-30), 2)
     emax = maximum(energy_2d)
-    hm2 = Mke.heatmap!(ax2, k_fft[1], k_fft[2], energy_2d; colormap = :viridis,
+    hm2 = Mke.heatmap!(ax2, k_fft[1], ky, energy_2d; colormap = :viridis,
         colorrange = (emax - 6, emax))
     Mke.Colorbar(fig[1, 4], hm2)
 
@@ -174,6 +183,9 @@ function generate_parity_figure()
     c_direct, ks = FFS.calculate_spectrum(parity_grid, f, (N, N); transform = SB.DirectSumSpectralBackend())
     c_fft, _ = FFS.calculate_spectrum(parity_grid, f, (N, N); transform = SB.FFTSpectralBackend())
     diff = abs.(c_direct .- c_fft)
+    ky, c_direct = _ascending(ks[2], c_direct, 2)
+    _, c_fft = _ascending(ks[2], c_fft, 2)
+    _, diff = _ascending(ks[2], diff, 2)
 
     fig = Mke.Figure(size = (1320, 430), fontsize = 15)
     Mke.Label(fig[0, 1:6], "Backend parity: every fast backend matches the direct-sum reference",
@@ -181,17 +193,17 @@ function generate_parity_figure()
 
     ax1 = Mke.Axis(fig[1, 1]; title = "DirectSum  log₁₀|C|", xlabel = "kₓ", ylabel = "k_y",
         aspect = Mke.DataAspect())
-    hm1 = Mke.heatmap!(ax1, ks[1], ks[2], log10.(abs.(c_direct) .+ 1e-30); colormap = :viridis)
+    hm1 = Mke.heatmap!(ax1, ks[1], ky, log10.(abs.(c_direct) .+ 1e-30); colormap = :viridis)
     Mke.Colorbar(fig[1, 2], hm1)
 
     ax2 = Mke.Axis(fig[1, 3]; title = "FFTW  log₁₀|C|", xlabel = "kₓ", ylabel = "k_y",
         aspect = Mke.DataAspect())
-    hm2 = Mke.heatmap!(ax2, ks[1], ks[2], log10.(abs.(c_fft) .+ 1e-30); colormap = :viridis)
+    hm2 = Mke.heatmap!(ax2, ks[1], ky, log10.(abs.(c_fft) .+ 1e-30); colormap = :viridis)
     Mke.Colorbar(fig[1, 4], hm2)
 
     ax3 = Mke.Axis(fig[1, 5]; title = "|difference|  log₁₀  (≈ machine ε)", xlabel = "kₓ",
         ylabel = "k_y", aspect = Mke.DataAspect())
-    hm3 = Mke.heatmap!(ax3, ks[1], ks[2], log10.(diff .+ 1e-30); colormap = :inferno,
+    hm3 = Mke.heatmap!(ax3, ks[1], ky, log10.(diff .+ 1e-30); colormap = :inferno,
         colorrange = (-18, -12))
     Mke.Colorbar(fig[1, 6], hm3)
 
@@ -263,7 +275,7 @@ function generate_anisotropy_figure()
     k_bins, θ_bins, E = FFS.anisotropic_spectrum(ks, c; num_k_bins = 32, num_θ_bins = 36)
 
     fig = Mke.Figure(size = (1180, 460), fontsize = 15)
-    Mke.Label(fig[0, 1:2], "Anisotropy: a directional field concentrates energy at a preferred angle",
+    Mke.Label(fig[0, 1:4], "Anisotropy: a directional field concentrates energy at a preferred angle",
         fontsize = 18, font = :bold)
     ax1 = Mke.Axis(fig[1, 1]; title = "A. Anisotropic field (elongated structures)", xlabel = "x",
         ylabel = "y", aspect = Mke.DataAspect())
@@ -366,12 +378,13 @@ function generate_komega_figure()
     grid = FG.Grids.StructuredGrid(CART, x, t; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
         period = (Lx, Lt))
     coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nt); transform = SB.FFTSpectralBackend())
-    kx, kω = ks
+    kx = ks[1]
+    kω, P = _ascending(ks[2], abs2.(coeffs), 2)
 
     fig = Mke.Figure(size = (640, 480), fontsize = 14)
     ax = Mke.Axis(fig[1, 1]; title = "Wavenumber–frequency spectrum E(k, ω)", xlabel = "k",
         ylabel = "ω")
-    hm = Mke.heatmap!(ax, kx, kω, abs2.(coeffs); colormap = :viridis)
+    hm = Mke.heatmap!(ax, kx, kω, P; colormap = :viridis)
     Mke.lines!(ax, kx, kx; color = :white, linestyle = :dash, label = "ω = k")
     Mke.Colorbar(fig[1, 2], hm)
     Mke.axislegend(ax)
@@ -473,7 +486,8 @@ function generate_execution_figure()
 
     ax2 = Mke.Axis(fig[1, 2]; title = "2D spectral energy  log₁₀|C(kₓ, k_y)|²",
         xlabel = "kₓ", ylabel = "k_y", aspect = Mke.DataAspect())
-    hm = Mke.heatmap!(ax2, ks[1], ks[2], log10.(abs2.(cref) .+ 1e-30); colormap = :viridis)
+    ky, Pref = _ascending(ks[2], log10.(abs2.(cref) .+ 1e-30), 2)
+    hm = Mke.heatmap!(ax2, ks[1], ky, Pref; colormap = :viridis)
     Mke.Colorbar(fig[1, 3], hm)
 
     diffstr = join(("$(n): $(round(d, sigdigits = 2))" for ((n, _), d) in zip(execs, maxdiff)), ",   ")

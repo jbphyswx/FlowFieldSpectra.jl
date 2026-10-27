@@ -568,55 +568,72 @@ end
     _transect_accumulate!(exec, E_reduced, ks, coeffs, dims) -> E_reduced
 
 Add `½|C|²` of every entry of `coeffs` to the entry of `E_reduced` its kept indices name, with the fold
-weights and partners of a halved axis. The last dim of `coeffs` is split on `exec` ([`_split_sum!`](@ref)).
-The GPUArraysCore extension runs a device `coeffs` on its device.
+weights and partners of a halved axis. The columns of `coeffs` along axis 1, one per index of dims `2…N`,
+are split on `exec` ([`_split_sum!`](@ref)). The GPUArraysCore extension runs a device `coeffs` on its
+device.
 """
 function _transect_accumulate!(exec::ComputationalBackends.AbstractExecutionBackend, E_reduced::AbstractArray{T},
         ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N}, dims::Tuple) where {T, N}
     length(coeffs) == 0 && return E_reduced
     D = length(ks_phys)
-    if N > D || !(N in dims || (FTB.is_halved(ks_phys[1]) && 1 in dims && N >= 2))
-        # The split dim is a batch dim, or a kept spectral dim no halved-axis mirror negates, so the tasks
-        # write disjoint entries of `E_reduced`.
-        _split_sum!(exec, (), size(coeffs, N)) do _, r
+    ncols = length(coeffs) ÷ size(coeffs, 1)
+    if all(==(1), dims) && !(FTB.is_halved(ks_phys[1]) && 1 in dims && D >= 2)
+        # Dims `2…N` are kept and no halved-axis mirror negates them, so the tasks write disjoint entries of
+        # `E_reduced`.
+        _split_sum!(exec, (), ncols) do _, r
             _transect_block!(E_reduced, ks_phys, coeffs, dims, r)
         end
     else
-        _split_sum!(exec, (E_reduced,), size(coeffs, N)) do (Ep,), r
+        _split_sum!(exec, (E_reduced,), ncols) do (Ep,), r
             _transect_block!(Ep, ks_phys, coeffs, dims, r)
         end
     end
     return E_reduced
 end
 
-# `_transect_accumulate!` over the entries of `coeffs` whose last index lies in `r`.
+# `_transect_accumulate!` over columns `r` of `coeffs`, column `t` the `t`-th index of dims `2…N`.
 function _transect_block!(E_reduced::AbstractArray{T}, ks_phys::Tuple, coeffs::AbstractArray{Complex{T}, N},
         dims::Tuple, r::UnitRange{Int}) where {T, N}
     D = length(ks_phys)
+    k1 = first(ks_phys)
+    n1 = size(coeffs, 1)
+    cols = CartesianIndices(ntuple(i -> size(coeffs, i + 1), Val(N - 1)))
     kept = ntuple(d -> !(d <= D && d in dims), Val(N))
     # Each dim's stride in E_reduced (kept spectral dims + all batch dims), zero for a summed dim.
     ostride = _kept_strides(kept, size(coeffs), 1)
-    halved_out = FTB.is_halved(ks_phys[1]) && (1 in dims)
+    halved_out = FTB.is_halved(k1) && (1 in dims)
     # The kept spectral dims past axis 1, which the mirror of a halved-axis mode negates.
-    mirrored = ntuple(d -> halved_out && 2 <= d <= D && kept[d], Val(N))
-    axes_n = ntuple(d -> d <= D ? ks_phys[d] : nothing, Val(N))
-    # A kept halved axis reports `|k₁|`, and the field's `−k₁` energy is stored nowhere else, so
-    # each interior stored mode carries its `fold_weight` of 2 (1 at dc and, for even `n₁`, at Nyquist).
-    halved_kept = FTB.is_halved(ks_phys[1]) && !(1 in dims)
-    @inbounds for I in CartesianIndices(ntuple(d -> d == N ? r : (1:size(coeffs, d)), Val(N)))
-        lin = 1 + sum(map((i, s) -> (i - 1) * s, Tuple(I), ostride))
-        if halved_out
-            # Integrating out the halved axis: a stored row stands for itself and, where its fold weight is
-            # 2, for its `k₁ < 0` mirror, the conjugate of the stored mode, whose kept `k_·` is negated.
-            e = T(0.5) * abs2(coeffs[I])
-            E_reduced[lin] += e
-            if FTB.fold_weight(ks_phys[1], I[1]) == 2
-                E_reduced[1 + sum(map((i, s, m, k) -> (_mirror_index(m, k, i) - 1) * s, Tuple(I), ostride,
-                    mirrored, axes_n))] += e
+    mirrored = Base.tail(ntuple(d -> halved_out && 2 <= d <= D && kept[d], Val(N)))
+    axes_n = Base.tail(ntuple(d -> d <= D ? ks_phys[d] : nothing, Val(N)))
+    h = T(0.5)
+    @inbounds for t in r
+        J = cols[t]
+        base = 1 + sum(map((i, s) -> (i - 1) * s, Tuple(J), Base.tail(ostride)))
+        if first(kept)
+            # A kept halved axis reports `|k₁|`, and the field's `−k₁` energy is stored nowhere else, so each
+            # row carries its `fold_weight`: 2, and 1 at dc and, for even `n₁`, at Nyquist.
+            s1 = first(ostride)
+            for i1 in 1:n1
+                E_reduced[base + (i1 - 1) * s1] += T(FTB.fold_weight(k1, i1)) * h * abs2(coeffs[i1, J])
             end
+        elseif halved_out
+            # Integrating out the halved axis: a stored row stands for itself and, where its fold weight is 2,
+            # for its `k₁ < 0` mirror, the conjugate of the stored mode, whose kept `k_·` is negated.
+            s, s2 = zero(T), zero(T)
+            @simd for i1 in 1:n1
+                e = abs2(coeffs[i1, J])
+                s += e
+                s2 += ifelse(FTB.fold_weight(k1, i1) == 2, e, zero(T))
+            end
+            E_reduced[base] += h * s
+            E_reduced[1 + sum(map((i, s, m, k) -> (_mirror_index(m, k, i) - 1) * s, Tuple(J), Base.tail(ostride),
+                mirrored, axes_n))] += h * s2
         else
-            w = halved_kept ? T(FTB.fold_weight(ks_phys[1], I[1])) : one(T)
-            E_reduced[lin] += w * T(0.5) * abs2(coeffs[I])
+            s = zero(T)
+            @simd for i1 in 1:n1
+                s += abs2(coeffs[i1, J])
+            end
+            E_reduced[base] += h * s
         end
     end
     return E_reduced

@@ -39,7 +39,7 @@ Validate `field` against `grid` and split its axes: the first `ndims(grid)` dims
         size(field, d) == ss[d] || throw(DimensionMismatch(
             "field leading dim $d = $(size(field, d)) ≠ grid spatial size $(ss[d]) (size = $ss)"))
     end
-    batch = ntuple(d -> size(field, ns + d), N - ns)
+    batch = ntuple(d -> size(field, ns + d), Val(N - ns))
     return TransformProblem(ss, batch)
 end
 

@@ -17,7 +17,7 @@ const PP_CART = FG.Geometry.CartesianGeometry{Float64}()
 
 pp_unif(L, N) = range(0.0, L; length = N + 1)[1:N]
 pp_cart(L, N) = FG.Grids.StructuredGrid(PP_CART, pp_unif(L, N), pp_unif(L, N);
-    periodic = (true, true), period = (L, L))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 pp_str(L, N, a) = [L * (i - 1) / N + a * L / N * sinpi(2 * (i - 1) / N) for i in 1:N]
 
 # The Hann window at each point's fractional position across the extent of `x` and `y`.
@@ -54,7 +54,7 @@ Test.@testset "A window is evaluated at each point's position and keeps the vari
     M = 60
     xc, yc = L .* rand(M), L .* rand(M)
     wc = 0.5 .+ rand(M)
-    gc = FG.Grids.UnstructuredGrid(PP_CART, (xc, yc), wc; periodic = (true, true), period = (L, L))
+    gc = FG.Grids.UnstructuredGrid(PP_CART, (xc, yc), wc; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     hann = FFS.Preprocess(; detrend = FFS.NoDetrend(), window = FFS.Hann())
     for (gg, x, y, m) in ((gs, vec([x for x in xst, y in yst]), vec([y for x in xst, y in yst]),
                            vec(FG.Grids.measure_array(gs))), (gc, xc, yc, wc))
@@ -80,11 +80,11 @@ Test.@testset "Both detrends are least-squares fits under the transform's weight
     # nodes and the Gaussian weights of a Gauss–Legendre grid.
     gu = pp_cart(L, N)
     xst = pp_str(L, N, 0.25)
-    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     M = 60
     xc, yc = L .* rand(M), L .* rand(M)
     wc = 0.5 .+ rand(M)
-    gc = FG.Grids.UnstructuredGrid(PP_CART, (xc, yc), wc; periodic = (true, true), period = (L, L))
+    gc = FG.Grids.UnstructuredGrid(PP_CART, (xc, yc), wc; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     for (g, f) in ((gu, [5.0 + 2.0 * x + 0.5 * sin(3y) for x in xs, y in xs]),
                    (gs, [3.0 + sin(x) + 0.5 * cos(2y) + x^2 / 10 for x in xst, y in xs]),
                    (gc, 3.0 .+ randn(M)))
@@ -123,7 +123,7 @@ Test.@testset "Both detrends are least-squares fits under the transform's weight
     # On a uniform grid symmetric about the origin, `cos(3y)` is orthogonal to `1`, `x` and `y` (`N` is not
     # a multiple of 3, and the grid is even in `y`), so `LinearDetrend` returns it unchanged.
     xcen = [-π + (j - 0.5) * 2π / N for j in 1:N]
-    gcen = FG.Grids.StructuredGrid(PP_CART, xcen, xcen; periodic = (true, true), period = (L, L))
+    gcen = FG.Grids.StructuredGrid(PP_CART, xcen, xcen; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     fcos = [cos(3y) for x in xcen, y in xcen]
     Test.@test maximum(abs, FFS.preprocess_field(gcen, fcos, linear)[2] .- fcos) < 1e-14
 
@@ -177,7 +177,7 @@ Test.@testset "Zero padding lengthens the domain with zeros" begin
     # A stretched grid is padded the same way: its coefficients are the measure-weighted sum
     # `Σ w f e^{-ik·(x - x₀)} / (pad² Σ w)` on wavenumbers `2πn / (pad L)`, evaluated here directly.
     xst = pp_str(L, N, 0.05)
-    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     fs = [sin(3x) + 0.5 * cos(2y) for x in xst, y in xs]
     cs, kss = FFS.calculate_spectrum(gs, fs, (N, N); preprocess = nopad, transform = PP_DS, execution = PP_SER)
     Test.@test isapprox(kss[1][2] - kss[1][1], 2π / (2L); rtol = 1e-12)

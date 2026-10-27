@@ -41,33 +41,33 @@ const SphericalHarmonicGeometry = Union{
 # Physical wavenumbers.
 # -----------------------------------------------------------------------------
 
-# The layout depends on the field's realness, so the form without a `Val` raises.
+# The layout depends on the field's realness, so the form without the field's element type raises.
 @inline physical_wavenumbers(g::FlowGeometries.Grids.AbstractGrid, ms::NTuple{D, Int}) where {D} =
     throw(ArgumentError(
-        "physical_wavenumbers needs the field's realness, which fixes the layout: pass `Val(true)` for " *
-        "a real field (axis 1 halved to `ms[1]÷2+1` nonnegative modes) or `Val(false)` for a complex " *
-        "one (every mode, native order). `calculate_spectrum` returns the matching axes as its second " *
-        "value, so a caller reducing its coefficients uses those."))
+        "physical_wavenumbers needs the field's element type, whose realness fixes the layout: a real one " *
+        "halves axis 1 to `ms[1]÷2+1` nonnegative modes, a complex one keeps every mode in native order. " *
+        "`calculate_spectrum` returns the matching axes as its second value, so a caller reducing its " *
+        "coefficients uses those."))
 
 """
-    physical_wavenumbers(Ls, box, ::Val{real}) -> NTuple
-    physical_wavenumbers(grid, ms, ::Val{real}) -> NTuple
+    physical_wavenumbers(Ls, box, ::Type{T}) -> NTuple
+    physical_wavenumbers(grid, ms, ::Type{T}) -> NTuple
 
-Packed native-order wavenumber axes matching the packed coefficient layout: for a real transform axis 1
-is a nonnegative rfft axis (`FlowTransformBindings.RFFTAxis`, length `box[1]÷2+1`) and axes `2:D` are
-full fft axes (`FlowTransformBindings.FFTAxis`); for a complex transform every axis is a full fft axis.
-`box[d]` is the coefficient box's mode count along `d`, which on `grid` is the [`mode_box`](@ref) of an
-`ms`-mode transform. A Fourier length of zero takes the spacing of unit length.
+Packed native-order wavenumber axes matching the packed coefficient layout of a field of element type `T`:
+for a real `T` axis 1 is a nonnegative rfft axis (`FlowTransformBindings.RFFTAxis`, length `box[1]÷2+1`)
+and axes `2:D` are full fft axes (`FlowTransformBindings.FFTAxis`); for a complex `T` every axis is a full
+fft axis. `box[d]` is the coefficient box's mode count along `d`, which on `grid` is the
+[`mode_box`](@ref) of an `ms`-mode transform. A Fourier length of zero takes the spacing of unit length.
 """
-@inline physical_wavenumbers(Ls::NTuple{D, <:Real}, box::NTuple{D, Int}, r::Val) where {D} =
-    FTB.wavenumber_axes(map(L -> iszero(L) ? one(L) : L, Ls), box, r)
+@inline physical_wavenumbers(Ls::NTuple{D, <:Real}, box::NTuple{D, Int}, ::Type{T}) where {D, T <: Number} =
+    FTB.wavenumber_axes(T, map(L -> iszero(L) ? one(L) : L, Ls), box)
 
 @inline function physical_wavenumbers(
         g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ms::NTuple{D, Int}, r::Val) where {D}
+        ms::NTuple{D, Int}, ::Type{T}) where {D, T <: Number}
     FT = eltype(g)
     Ls = ntuple(d -> axis_range(FT, g, d), Val(D))
-    return physical_wavenumbers(Ls, mode_box(g, ms, r), r)
+    return physical_wavenumbers(Ls, mode_box(g, ms, T), T)
 end
 
 # -----------------------------------------------------------------------------
@@ -87,25 +87,33 @@ end
     quadrature_scale(grid, ::Type{FT}, N) -> Union{Nothing, AbstractVector}
 
 Per-node factor `α_j = N·w_j/Σw` taking a node-count-normalized transform to the measure-weighted
-quadrature over `grid`, or `nothing` where the measure is constant and `α_j` is exactly one. `N` is the
-number of spatial samples the field carries; the result is flat, of length `N`, in the field's
+quadrature over `grid`, or `nothing` where the measure's type makes it constant (a rectilinear grid's
+`SeparableMeasure` of `Axes.ConstantVector` factors, every axis uniform) and `α_j` is exactly one. `N` is
+the number of spatial samples the field carries; the result is flat, of length `N`, in the field's
 column-major point order.
 
 Read from `FlowGeometries.Grids.measure`, which keeps a rectilinear grid's `SeparableMeasure` and a ring
 layout's `RingwiseVector` compact, so the result is lazy on such a grid.
 """
-function quadrature_scale(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
-        ::Type{FT}, N::Integer) where {FT}
-    m = FlowGeometries.Grids.measure(g)
-    length(m) == N || throw(DimensionMismatch(
-        "grid measure has $(length(m)) entries for $N samples"))
-    lo, hi = extrema(m)
-    lo == hi && return nothing                    # constant measure ⇒ α ≡ 1
+quadrature_scale(g::FlowGeometries.Grids.AbstractGrid{<:FlowGeometries.Geometry.AbstractCartesianGeometry},
+    ::Type{FT}, N::Integer) where {FT} = _quadrature_scale(FlowGeometries.Grids.measure(g), FT, N)
+
+function _quadrature_scale(m::FlowGeometries.Grids.SeparableMeasure{<:Any, D,
+            <:NTuple{D, FlowGeometries.Axes.ConstantVector}}, ::Type{FT}, N::Integer) where {D, FT}
+    _check_measure_length(m, N)
+    return nothing
+end
+
+function _quadrature_scale(m::AbstractArray, ::Type{FT}, N::Integer) where {FT}
+    _check_measure_length(m, N)
     s = sum(m)
     (isfinite(s) && s > 0) || throw(ArgumentError(
         "grid measure sums to $s, so it cannot set quadrature weights"))
     return vec((FT(N) / FT(s)) .* m)
 end
+
+_check_measure_length(m, N::Integer) = length(m) == N || throw(DimensionMismatch(
+    "grid measure has $(length(m)) entries for $N samples"))
 
 # -----------------------------------------------------------------------------
 # Field shape and point lists, read from the grid.
@@ -119,26 +127,26 @@ Trailing batch sizes of `field` on `grid`: the dims after the leading `ndims(gri
 grid that indexes as an `N`-D array.
 """
 field_batch_shape(g::FlowGeometries.Grids.AbstractGrid, field) =
-    ntuple(i -> size(field, ndims(g) + i), ndims(field) - ndims(g))
+    ntuple(i -> size(field, ndims(g) + i), Val(ndims(field) - ndims(g)))
 
 """
-    axis_geometry(::Type{FT}, grid, D) -> (offsets, ranges)
+    axis_geometry(::Type{FT}, grid, ::Val{D}) -> (offsets::NTuple{D,FT}, ranges::NTuple{D,FT})
 
 Per-axis origin and Fourier length: `offsets[d]` is the smallest coordinate along direction `d`, the `x₀`
 every phase is measured from, and `ranges[d]` the [`axis_range`](@ref) of direction `d`.
 """
-function axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int) where {FT}
-    offsets = ntuple(d -> FT(FlowGeometries.Grids.bounds(g, d)[1]), D)
-    ranges = ntuple(d -> axis_range(FT, g, d), D)
+function axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, ::Val{D}) where {FT, D}
+    offsets = ntuple(d -> FT(FlowGeometries.Grids.bounds(g, d)[1]), Val(D))
+    ranges = ntuple(d -> axis_range(FT, g, d), Val(D))
     return offsets, ranges
 end
 
 # A transform of part of a grid's points takes the whole grid's origins and Fourier lengths as `box`, so
 # the parts' coefficients sit on one wavenumber lattice and sum to the whole's.
-axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int, ::Nothing) where {FT} =
+axis_geometry(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Val, ::Nothing) where {FT} =
     axis_geometry(FT, g, D)
-axis_geometry(::Type{FT}, ::FlowGeometries.Grids.AbstractGrid, D::Int, box::Tuple) where {FT} =
-    (map(FT, box[1]), map(FT, box[2]))
+axis_geometry(::Type{FT}, ::FlowGeometries.Grids.AbstractGrid, ::Val{D},
+    box::Tuple{NTuple{D, Any}, NTuple{D, Any}}) where {FT, D} = (map(FT, box[1]), map(FT, box[2]))
 
 """
     relative_coordinates(grid, offsets) -> NTuple
@@ -159,15 +167,15 @@ measure integrates over those cells, so the Fourier modes are periodic over the 
     FT(FlowGeometries.Grids.domain_length(g, d))
 
 """
-    point_coordinates(::Type{FT}, grid, D) -> (coords::NTuple{D}, spatial::Tuple)
+    point_coordinates(::Type{FT}, grid, ::Val{D}) -> (coords::NTuple{D}, spatial::Tuple)
 
 The `D` per-point coordinate vectors of `grid` in the field's own column-major order, and the spatial
 shape a field on it carries. Read from `FlowGeometries.Grids.materialize`, which allocates `D·n` numbers
 on a tensor grid; a repeated caller holds the result in a plan.
 """
-function point_coordinates(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, D::Int) where {FT}
+function point_coordinates(::Type{FT}, g::FlowGeometries.Grids.AbstractGrid, ::Val{D}) where {FT, D}
     pts = FlowGeometries.Grids.materialize(g)
-    return ntuple(d -> _as_points(FT, pts[d]), D), size(g)
+    return ntuple(d -> _as_points(FT, pts[d]), Val(D)), size(g)
 end
 
 # Flat and of element type `FT`, converting only when one of the two differs (a node cloud's own vectors
@@ -275,16 +283,21 @@ _zeroed_inactive(field, g) = _zeroed_inactive(field, FlowGeometries.Grids.mask(g
 _zeroed_inactive(field, ::FlowGeometries.Grids.AllActive) = field
 
 function _zeroed_inactive(field, mask::AbstractArray{Bool})
-    out = similar(field)
-    copyto!(out, field)
+    out = copy(field)
     N = length(mask)
-    B = length(out) ÷ N
-    z = zero(eltype(out))
-    @inbounds for b in 1:B, i in 1:N
-        mask[i] || (out[i + (b - 1) * N] = z)
-    end
+    O = reshape(out, N, length(out) ÷ N)
+    O .= ifelse.(_colocated(out, vec(mask)), O, zero(eltype(out)))
     return out
 end
+
+"""
+    _colocated(a, v) -> AbstractArray
+
+`v`, an array the grid holds on the host, placed where an array like `a` lives: `v` itself beside a host
+array, a dense copy in device memory beside a device array.
+"""
+_colocated(a::AbstractArray, v::AbstractArray) =
+    similar(a, eltype(v), 0) isa Array ? v : copyto!(similar(a, eltype(v), size(v)), collect(v))
 
 """
     AbstractInactiveCells
@@ -299,7 +312,7 @@ abstract type AbstractInactiveCells end
 
 Inactive cells count as zero: the transform of the field extended by zero over the whole grid. The
 quadrature reads the grid's own weights, the inactive cells' contributing nothing, and the least-squares
-fit (`solve = true`) runs over every node, an inactive one reading zero.
+fit ([`LeastSquares`](@ref)) runs over every node, an inactive one reading zero.
 """
 struct ZeroFill <: AbstractInactiveCells end
 
@@ -308,10 +321,36 @@ struct ZeroFill <: AbstractInactiveCells end
 
 Inactive cells are left out: the quadrature or the fit over the active cells as their own point set. The
 quadrature reads the active cells' weights rescaled to the whole grid's total ([`_inactive_scale`](@ref)),
-as a grid of the active cells alone weighs them, and the least-squares fit (`solve = true`) runs over the
-active nodes.
+as a grid of the active cells alone weighs them, and the least-squares fit ([`LeastSquares`](@ref)) runs
+over the active nodes.
 """
 struct Exclude <: AbstractInactiveCells end
+
+"""
+    AbstractAnalysis
+
+How a transform computes the coefficients from a field's samples, passed as `analysis`:
+[`Quadrature`](@ref) or [`LeastSquares`](@ref).
+"""
+abstract type AbstractAnalysis end
+
+"""
+    Quadrature <: AbstractAnalysis
+
+The coefficients as the quadrature `C_k = Σ_j w_j f_j conj(φ_k(x_j))` of the field `f` against each basis
+function `φ_k` under the grid's weights `w`: one adjoint transform. Every backend computes this, and it is
+the default.
+"""
+struct Quadrature <: AbstractAnalysis end
+
+"""
+    LeastSquares <: AbstractAnalysis
+
+The coefficients minimizing `‖A C − f‖` over the field's samples, `A` the synthesis, by LSMR: on samples
+of a field synthesized from coefficients of the transform's resolution, those coefficients.
+`NUFSHTSpectralBackend` computes this; the plan reports the fit's outcome through `analysis_status`.
+"""
+struct LeastSquares <: AbstractAnalysis end
 
 """
     _inactive_scale(inactive, grid, ::Type{FT}; sampling = nothing, weights = nothing) -> FT
@@ -338,16 +377,18 @@ _unmasked_total(::FlowGeometries.Grids.AbstractGrid, ::Type{FT}, sampling, weigh
 """
     _inactive_weights(inactive, grid, ::Type{FT}; sampling = nothing, weights = nothing) -> weights
 
-The `weights` a spherical quadrature over `grid` reads under `inactive`: `weights` itself where
-[`_inactive_scale`](@ref) is one, and otherwise the grid's weights times it, per latitude on a structured
-sphere and per node elsewhere, as `weights` is read there.
+The `weights` a spherical quadrature over `grid` reads under `inactive`: `weights` itself under
+[`ZeroFill`](@ref) or with every cell active, and under [`Exclude`](@ref) on a masked grid the grid's
+weights times [`_inactive_scale`](@ref), per latitude on a structured sphere and per node elsewhere, as
+`weights` is read there.
 """
-function _inactive_weights(s::AbstractInactiveCells, g, ::Type{FT}; sampling = nothing,
-        weights = nothing) where {FT}
-    c = _inactive_scale(s, g, FT; sampling, weights)
-    isone(c) && return weights
-    return c .* _base_weights(g, FT, sampling, weights)
-end
+_inactive_weights(::ZeroFill, g, ::Type{FT}; sampling = nothing, weights = nothing) where {FT} = weights
+_inactive_weights(s::Exclude, g, ::Type{FT}; sampling = nothing, weights = nothing) where {FT} =
+    _excluded_weights(FlowGeometries.Grids.mask(g), g, FT, sampling, weights)
+
+_excluded_weights(::FlowGeometries.Grids.AllActive, g, ::Type{FT}, sampling, weights) where {FT} = weights
+_excluded_weights(mask::AbstractArray{Bool}, g, ::Type{FT}, sampling, weights) where {FT} =
+    _inactive_scale(mask, g, FT, sampling, weights) .* _base_weights(g, FT, sampling, weights)
 
 _base_weights(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
     ::Type{FT}, sampling, weights) where {FT} =
@@ -356,19 +397,21 @@ _base_weights(g::FlowGeometries.Grids.AbstractGrid, ::Type{FT}, sampling, weight
     collect(FT, _sph_point_weights(g, FT; sampling, weights))
 
 """
-    _transform_nodes(inactive, grid, solve) -> (act, live)
+    _transform_nodes(inactive, grid, analysis) -> (act, live)
 
 The nodes a spherical transform over `grid` holds under `inactive`, `act` their indices (`nothing` for
 every node), and which of them read the field, `live` a flag per held node (`nothing` where every one
 does). A quadrature gives an inactive node no weight, so it holds the active nodes. A least-squares fit
-(`solve`) holds every node under [`ZeroFill`](@ref), an inactive one reading zero, and the active nodes
-under [`Exclude`](@ref).
+holds every node under [`ZeroFill`](@ref), an inactive one reading zero, and the active nodes under
+[`Exclude`](@ref).
 """
-_transform_nodes(s::AbstractInactiveCells, g::FlowGeometries.Grids.AbstractGrid, solve::Bool) =
-    _transform_nodes(s, FlowGeometries.Grids.mask(g), solve)
-_transform_nodes(::AbstractInactiveCells, ::FlowGeometries.Grids.AllActive, ::Bool) = (nothing, nothing)
-_transform_nodes(s::AbstractInactiveCells, mask::AbstractArray{Bool}, solve::Bool) =
-    (solve && s isa ZeroFill) ? (nothing, vec(mask)) : (findall(vec(mask)), nothing)
+_transform_nodes(s::AbstractInactiveCells, g::FlowGeometries.Grids.AbstractGrid, a::AbstractAnalysis) =
+    _held_nodes(FlowGeometries.Grids.mask(g), s, a)
+_held_nodes(::FlowGeometries.Grids.AllActive, ::AbstractInactiveCells, ::AbstractAnalysis) = (nothing, nothing)
+_held_nodes(mask::AbstractArray{Bool}, s::AbstractInactiveCells, a::AbstractAnalysis) =
+    _masked_nodes(vec(mask), s, a)
+_masked_nodes(live::AbstractVector{Bool}, ::ZeroFill, ::LeastSquares) = (nothing, live)
+_masked_nodes(live::AbstractVector{Bool}, ::AbstractInactiveCells, ::AbstractAnalysis) = (findall(live), nothing)
 
 # `v` at the points `act`, or `v` itself where every point is active.
 _at_points(v::AbstractVector, ::Nothing) = v
@@ -379,28 +422,28 @@ _at_points(v::AbstractVector, act::AbstractVector{Int}) = v[act]
 # -----------------------------------------------------------------------------
 
 """
-    mode_box(grid, ms, ::Val{real}) -> NTuple
+    mode_box(grid, ms, ::Type{T}) -> NTuple
 
-The extents of the coefficient box an `ms`-mode Cartesian transform of a real field on `grid` fills: an
-even `ms[d]` on an axis whose samples tell `+ms[d]/2` from `-ms[d]/2` apart widens to `ms[d] + 1`
-(`FlowTransformBindings.box_size`), so that the packed half reaches every conjugate partner. A uniform axis
-of a structured grid transformed at its own length samples the two as one mode and keeps `ms[d]`. A
-complex field's box is `ms`.
+The extents of the coefficient box an `ms`-mode Cartesian transform on `grid` of a field of element type
+`T` fills. For a real `T`, an even `ms[d]` on an axis whose samples tell `+ms[d]/2` from `-ms[d]/2` apart
+widens to `ms[d] + 1` (`FlowTransformBindings.box_size`), so that the packed half reaches every conjugate
+partner; a uniform axis of a structured grid transformed at its own length samples the two as one mode and
+keeps `ms[d]`. A complex `T`'s box is `ms`.
 """
-mode_box(g, ms::NTuple{D, Int}, ::Val{true}) where {D} =
+mode_box(g, ms::NTuple{D, Int}, ::Type{<:Real}) where {D} =
     FTB.box_size(ms, ntuple(d -> !_nyquist_shared(g, d, ms[d]), Val(D)))
-mode_box(g, ms::NTuple{D, Int}, ::Val{false}) where {D} = ms
+mode_box(g, ms::NTuple{D, Int}, ::Type{<:Complex}) where {D} = ms
 
 """
-    series_modes(grid, ms, ::Val{real}) -> NTuple
+    series_modes(grid, ms, ::Type{T}) -> NTuple
 
-The mode counts, in FFT order, of the complex series an `ms`-mode synthesis on `grid` evaluates: for a
-real field `mode_box(grid, ms, Val(true))[1]` on axis 1 and `ms` on the others, whose real part, with the
-coefficients `DirectSum.native_coefficients!` writes, is the series of the packed half over the whole
-coefficient box; `ms` for a complex field.
+The mode counts, in FFT order, of the complex series an `ms`-mode synthesis on `grid` evaluates for a field
+of element type `T`: for a real `T`, `mode_box(grid, ms, T)[1]` on axis 1 and `ms` on the others, whose
+real part, with the coefficients `DirectSum.native_coefficients!` writes, is the series of the packed half
+over the whole coefficient box; `ms` for a complex `T`.
 """
-series_modes(g, ms::NTuple{D, Int}, ::Val{true}) where {D} = (mode_box(g, ms, Val(true))[1], Base.tail(ms)...)
-series_modes(g, ms::NTuple{D, Int}, ::Val{false}) where {D} = ms
+series_modes(g, ms::NTuple{D, Int}, ::Type{T}) where {D, T <: Real} = (mode_box(g, ms, T)[1], Base.tail(ms)...)
+series_modes(g, ms::NTuple{D, Int}, ::Type{<:Complex}) where {D} = ms
 
 _nyquist_shared(g::FlowGeometries.Grids.AbstractStructuredGrid, d::Int, m::Int) =
     FlowGeometries.Grids.isuniform(g, d) && m == size(g, d)
@@ -411,11 +454,15 @@ _nyquist_shared(::FlowGeometries.Grids.AbstractGrid, ::Int, ::Int) = false
 
 Warn, once per logger, when degree `lmax` exceeds what `nlat` latitude samples of `sampling` resolve; the
 coefficients are still returned. The relation is the sampling's own `SphericalSampling.bandlimit`:
-`nlat÷2 − 1` for Driscoll–Healy, `nlat − 1` for Gauss–Legendre and Clenshaw–Curtis.
+`nlat÷2 − 1` for Driscoll–Healy, `nlat − 1` for Gauss–Legendre and Fejér's first rule. A sampling with no
+such relation (`SphericalSampling.has_bandlimit` false: a lat–lon grid, an equal-area pixelization) has
+nothing to check against.
 """
-function _warn_bandlimit(s, nlat::Integer, lmax::Integer)
-    lim = _bandlimit_or_nothing(s, nlat)
-    (lim === nothing || lmax <= lim) && return nothing
+function _warn_bandlimit(s::FlowGeometries.SphericalSampling.AbstractSphericalSampling, nlat::Integer,
+        lmax::Integer)
+    FlowGeometries.SphericalSampling.has_bandlimit(s) || return nothing
+    lim = FlowGeometries.SphericalSampling.bandlimit(s, nlat)
+    lmax <= lim && return nothing
     @warn("requested spherical degree exceeds what this grid's sampling resolves; coefficients above " *
           "its band limit are not supported by its quadrature",
         sampling = nameof(typeof(s)), nlat, lmax, bandlimit = lim,
@@ -439,17 +486,19 @@ function _warn_longitude_bandlimit(nlon::Integer, lmax::Integer)
     return nothing
 end
 
-# A sampling states a band-limit relation only where it has one: an equal-area pixelization defines no
-# `bandlimit` method, a lat–lon grid's is user-chosen and raises, and Driscoll–Healy's requires an even
-# latitude count. Absent a relation there is nothing to check against.
-function _bandlimit_or_nothing(s, nlat::Integer)
-    hasmethod(FlowGeometries.SphericalSampling.bandlimit, Tuple{typeof(s), Int}) || return nothing
-    try
-        return FlowGeometries.SphericalSampling.bandlimit(s, nlat)
-    catch e
-        e isa ArgumentError && return nothing
-        rethrow()
-    end
+"""
+    _longitude_axis(grid, ::Type{FT}) -> (λ₀, s)
+
+The origin `λ₀` and step sign `s` of a structured sphere's longitude axis, which a longitude FFT reads only
+as a `FlowGeometries.Axes.PeriodicAxis`: `nlon` samples `2π/nlon` apart around the circle. With
+`λ_j = λ₀ + s·2πj/nlon`, `Σ_j f_j e^{-imλ_j}` is `e^{-imλ₀}` times the FFT's bin `s·m`.
+"""
+function _longitude_axis(g, ::Type{FT}) where {FT}
+    ax = FlowGeometries.Grids.coordinates(g, 1)
+    ax isa FlowGeometries.Axes.PeriodicAxis || throw(ArgumentError(
+        "a longitude FFT reads a longitude axis of `nlon` samples `2π/nlon` apart around the circle, a " *
+        "`FlowGeometries.Axes.PeriodicAxis`; this grid's is a $(nameof(typeof(ax)))"))
+    return FT(first(ax)), step(ax) > 0 ? 1 : -1
 end
 
 """

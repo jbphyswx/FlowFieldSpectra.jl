@@ -24,7 +24,7 @@ function run_execution_backends_example()
     N = 96
     xs = range(0.0, L; length = N + 1)[1:N]
     grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     ms = (N, N)
 
     # A broadband field with a k^-5/3 cascade — built and kept as a plain (N, N) tensor.
@@ -54,7 +54,8 @@ function run_execution_backends_example()
     # ── real GPU / Distributed / MPI (uncomment on the appropriate machine) ──
     # using CUDA; dev = CB.GPUBackend(CUDA.CUDABackend())
     #   FFS.calculate_spectrum(grid, f, ms; transform=SB.FFTSpectralBackend(),  execution=dev)   # CUFFT
-    #   scat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(length(xv)); periodic=(true,true), period=(L,L))
+    #   scat = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xv, yv), ones(length(xv));
+    #       topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     #   using FINUFFT; using FlowTransformBindings: FlowTransformBindings as FTB
     #   FFS.calculate_spectrum(scat, fscat, ms; transform=FTB.FINUFFTBackend(), execution=dev)  # cuFINUFFT
     # using Distributed; addprocs(4); @everywhere using FlowFieldSpectra, FINUFFT

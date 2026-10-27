@@ -29,7 +29,7 @@ v = real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N]))
 
 # A uniform periodic Cartesian grid (FlowGeometries) defined by its axes; fields are (N, N) tensors.
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    periodic = (true, true), period = (L, L))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 ```
 

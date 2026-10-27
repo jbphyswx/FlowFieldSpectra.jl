@@ -25,16 +25,16 @@ xv = rand(N) .* L
 yv = rand(N) .* L
 f = rand(N, 2)
 cart = FG.Geometry.CartesianGeometry{Float64}()
-sc = FG.Grids.UnstructuredGrid(cart, (xv, yv), ones(N); periodic = (true, true), period = (L, L))
+sc = FG.Grids.UnstructuredGrid(cart, (xv, yv), ones(N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 xs = range(0.0, L; length = 17)[1:16]
 ys = range(0.0, L; length = 17)[1:16]
-ug = FG.Grids.StructuredGrid(cart, xs, ys; periodic = (true, true), period = (L, L))
+ug = FG.Grids.StructuredGrid(cart, xs, ys; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 u = [cos(2x) + 0.5 * sin(3y) for x in xs, y in ys]
 ub = cat(u, 2 .* u, 3 .* u, 4 .* u; dims = 3)
 
 # The round-robin shares carry different mean measures, and a masked sphere holds NaN at its masked
 # nodes.
-scw = FG.Grids.UnstructuredGrid(cart, (xv, yv), [isodd(j) ? 1.0 : 3.0 for j in 1:N]; periodic = (true, true),
+scw = FG.Grids.UnstructuredGrid(cart, (xv, yv), [isodd(j) ? 1.0 : 3.0 for j in 1:N]; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
                                 period = (L, L))
 θ = rand(N) .* π; φ = rand(N) .* 2π
 smask = trues(N); smask[1:3:N] .= false

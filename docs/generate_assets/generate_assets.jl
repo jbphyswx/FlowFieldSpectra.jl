@@ -24,10 +24,10 @@ mkpath(ASSETS_DIR)
 const CART = FG.Geometry.CartesianGeometry{Float64}()
 # Uniform periodic Cartesian grid over the given axes (FlowGeometries StructuredGrid).
 ucg(axes...; L) = FG.Grids.StructuredGrid(CART, axes...;
-    periodic = ntuple(_ -> true, length(axes)), period = ntuple(_ -> L, length(axes)))
+    topology = map(_ -> FG.Grids.Periodic(), axes), period = map(_ -> L, axes))
 # Scattered periodic Cartesian grid (unused per-node measure = ones).
 scg(coords::Tuple; L) = FG.Grids.UnstructuredGrid(CART, coords, ones(length(coords[1]));
-    periodic = ntuple(_ -> true, length(coords)), period = ntuple(_ -> L, length(coords)))
+    topology = map(_ -> FG.Grids.Periodic(), coords), period = map(_ -> L, coords))
 _uaxis(L, N) = range(0.0, L; length = N + 1)[1:N]
 
 # ─── Synthetic broadband fields ────────────────────────────────────────────
@@ -128,17 +128,17 @@ function generate_spherical_figure()
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
 
-    # Clenshaw–Curtis grid (FlowGeometries) — the grid FastSphericalHarmonics transforms on.
-    sht_grid = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), Nθ)
+    # Fejér first-rule grid (FlowGeometries) — the grid FastSphericalHarmonics transforms on.
+    sht_grid = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), Nθ)
     λ = collect(FG.Grids.coordinates(sht_grid, 1))                # longitude (nlon)
     θ_colat = (π / 2) .- collect(FG.Grids.coordinates(sht_grid, 2))  # colatitude (nlat)
 
-    C_true = zeros(ComplexF64, Nθ, Nφ)
+    C_true = zeros(Nθ, Nφ)
     C_true[FFS.sph_mode_index(2, 1)] = 1.0
     C_true[FFS.sph_mode_index(5, -3)] = 0.8
     C_true[FFS.sph_mode_index(8, 4)] = 0.5
-    f_val = real(FFS.synthesize(sht_grid, C_true, (Nθ, Nφ);
-        transform = SB.DirectSumSpectralBackend()))               # (nlon, nlat)
+    f_val = FFS.synthesize(sht_grid, C_true, (Nθ, Nφ);
+        transform = SB.DirectSumSpectralBackend())                # (nlon, nlat)
 
     c_sht, _ = FFS.calculate_spectrum(sht_grid, f_val, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())
     deg, E_l = FFS.spherical_energy_spectrum(c_sht)
@@ -147,7 +147,7 @@ function generate_spherical_figure()
     Mke.Label(fig[0, 1:2], "Spherical Harmonic Transform & Degree Energy Spectrum",
         fontsize = 18, font = :bold)
 
-    ax1 = Mke.Axis(fig[1, 1], title = "A. Scalar Field f(θ, φ) on CC Grid",
+    ax1 = Mke.Axis(fig[1, 1], title = "A. Scalar Field f(θ, φ) on the Fejér first-rule grid",
         xlabel = "Longitude φ (rad)", ylabel = "Colatitude θ (rad)")
     hm = Mke.heatmap!(ax1, λ, θ_colat, f_val; colormap = :balance)
     Mke.Colorbar(fig[1, 2], hm)
@@ -363,7 +363,8 @@ function generate_komega_figure()
     t = _uaxis(Lt, Nt)
     k0, ω0 = 6.0, 6.0
     f = [cos(k0 * xi + ω0 * ti) + 0.4 * cos(2 * xi + 1.0 * ti + 0.5) for xi in x, ti in t]  # (Nx, Nt)
-    grid = FG.Grids.StructuredGrid(CART, x, t; periodic = (true, true), period = (Lx, Lt))
+    grid = FG.Grids.StructuredGrid(CART, x, t; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
+        period = (Lx, Lt))
     coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nt); transform = SB.FFTSpectralBackend())
     kx, kω = ks
 
@@ -399,7 +400,7 @@ function generate_estimation_figure()
     sig = @. 0.25 * cos(k0 * x) + bg               # tone buried in a k⁻² continuum
     K = 6
     V = FFS.dpss(Nx, 4.0, K)
-    grid = FG.Grids.StructuredGrid(CART, x; periodic = (true,), period = (L,))
+    grid = FG.Grids.StructuredGrid(CART, x; topology = FG.Grids.Periodic(), period = (L,))
     C = zeros(ComplexF64, Nx ÷ 2 + 1, K)          # a real field's packed half
     ks = nothing
     for k in 1:K

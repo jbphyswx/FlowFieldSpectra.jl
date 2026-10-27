@@ -49,7 +49,8 @@ sig = @. 0.25 * cos(k0 * x) + bg            # tone at k₀ on a k⁻² (red-nois
 
 K = 6
 V = FFS.dpss(Nx, 4.0, K)                    # N×K tapers, unit mean square (NW = 4)
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x; periodic = (true,), period = (L,))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x; topology = FG.Grids.Periodic(),
+    period = (L,))
 C = zeros(ComplexF64, Nx ÷ 2 + 1, K)        # a real field's packed half
 for k in 1:K
     c, ks1 = FFS.calculate_spectrum(grid, V[:, k] .* sig, (Nx,); transform = SB.FFTSpectralBackend())

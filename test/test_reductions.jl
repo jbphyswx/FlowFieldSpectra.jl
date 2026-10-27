@@ -54,7 +54,7 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
     n1, n2 = 12, 10
     xax = ucg_axis(Float64, L, n1)
     yax = sort(rand(n2)) .* L
-    gn = FG.Grids.StructuredGrid(_cg(Float64), xax, yax; periodic = (true, true), period = (L, L))
+    gn = FG.Grids.StructuredGrid(_cg(Float64), xax, yax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     ms = (n1, 8)
     fn = randn(n1, n2)
     for (t, kw, tol) in ((SB.DirectSumSpectralBackend(), (;), 1e-12), (FTB.FINUFFTBackend(), (; eps = 1e-13), 1e-10))
@@ -135,4 +135,43 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
             Test.@test isequal(Eip, Eall)
         end
     end
+end
+
+Test.@testset "Reductions on ThreadedBackend equal the serial ones" begin
+    # Rows split over the tasks, each task binning into its own accumulators: the sums differ from the
+    # serial ones only in the order the tasks' sums are added.
+    ser = (; execution = CB.SerialBackend())
+    thr = (; execution = CB.ThreadedBackend())
+    Random.seed!(41)
+    for (ks, c) in (((FTB.RFFTAxis(64, 1.0), FTB.FFTAxis(48, 0.7)), randn(ComplexF64, 33, 48, 3)),
+                    ((FTB.FFTAxis(24, 1.0), FTB.FFTAxis(20, 1.3), FTB.FFTAxis(16, 0.9)), randn(ComplexF64, 24, 20, 16, 2)))
+        D = length(ks)
+        for cut in (true, false)
+            kb, E = FFS.isotropic_spectrum(ks, c; cutoff = cut, ser...)
+            kbt, Et = FFS.isotropic_spectrum(ks, c; cutoff = cut, thr...)
+            Test.@test kbt == kb
+            Test.@test Et ≈ E rtol = 1e-13
+            Eip, kip = similar(E), similar(kb)
+            FFS.isotropic_spectrum!(Eip, kip, ks, c; cutoff = cut, thr...)
+            Test.@test Eip ≈ E rtol = 1e-13
+            Test.@test last(FFS.welch_power_spectrum(ks, c; cutoff = cut, thr...)) ≈
+                       last(FFS.welch_power_spectrum(ks, c; cutoff = cut, ser...)) rtol = 1e-13
+        end
+        Test.@test last(FFS.cross_spectrum(ks, c, reverse(c; dims = D + 1); thr...)) ≈
+                   last(FFS.cross_spectrum(ks, c, reverse(c; dims = D + 1); ser...)) rtol = 1e-13
+        ch = FFS.coherence_spectrum(ks, c, reverse(c; dims = D + 1); thr...)
+        cs = FFS.coherence_spectrum(ks, c, reverse(c; dims = D + 1); ser...)
+        Test.@test all(map((a, b) -> isapprox(a, b; rtol = 1e-12), ch, cs))
+        for dims in ((1,), (D,), ntuple(identity, D))
+            Test.@test last(FFS.transect_spectrum(ks, c, dims; thr...)) ≈
+                       last(FFS.transect_spectrum(ks, c, dims; ser...)) rtol = 1e-13
+        end
+        if D == 2
+            Test.@test last(FFS.anisotropic_spectrum(ks, c; num_θ_bins = 8, thr...)) ≈
+                       last(FFS.anisotropic_spectrum(ks, c; num_θ_bins = 8, ser...)) rtol = 1e-13
+        end
+    end
+    lmax = 40
+    C = randn(lmax + 1, 2lmax + 1, 3)
+    Test.@test last(FFS.spherical_energy_spectrum(C; thr...)) ≈ last(FFS.spherical_energy_spectrum(C; ser...)) rtol = 1e-13
 end

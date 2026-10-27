@@ -33,18 +33,27 @@ FlowFieldSpectra._hybrid_synthesis_plan
 ### NUFFT plans
 
 The NUFFT plans run FlowTransformBindings' library plans in `FFTModes` order and publish the packed
-layout from them: a point set's type 1, a nonuniform tensor grid's separable passes, and the type-2
-inverse.
+layout from them: a point set's type 1 and type 2, and a nonuniform tensor grid's separable passes in both
+directions. A line pass of the separable plans and the hybrid composite asks NonuniformFFTs for `m_d`
+modes and reads, or writes, the mode `+m_d/2` of a widened axis in each line's oversampled spectrum; it asks
+FINUFFT for the box's `m_d + 1` modes.
 
 ```@docs
 FlowFieldSpectra.NUFFTPointPlan
 FlowFieldSpectra.NUFFTSeparablePlan
+FlowFieldSpectra.NUFFTSeparableSynthesisPlan
 FlowFieldSpectra.NUFFTAxisPass
+FlowFieldSpectra._axis_pass
+FlowFieldSpectra._LinePlus
+FlowFieldSpectra._half_row_weights
 FlowFieldSpectra.NUFFTSynthesisPlan
 FlowFieldSpectra._packed_src
 FlowFieldSpectra._oversampled_table
 FlowFieldSpectra._gather_packed!
 FlowFieldSpectra._scatter_each!
+FlowFieldSpectra._inject_each!
+FlowFieldSpectra._mode_src
+FlowFieldSpectra._synthesis_reader
 ```
 
 ### The direct sum's setup / run split
@@ -59,10 +68,13 @@ FlowFieldSpectra.DirectSum.phase_geometry
 FlowFieldSpectra.DirectSum.cart_setup
 FlowFieldSpectra.DirectSum.cart_run!
 FlowFieldSpectra.DirectSum.synth_setup
+FlowFieldSpectra.DirectSum.native_table
 FlowFieldSpectra.DirectSum.native_coefficients!
 FlowFieldSpectra.DirectSum.AxisPass
 FlowFieldSpectra.DirectSum.sph_setup
 FlowFieldSpectra.DirectSum.sph_run!
+FlowFieldSpectra.DirectSum._order_starts
+FlowFieldSpectra.DirectSum._sph_order_accumulate!
 FlowFieldSpectra.DirectSum.sph_synth_setup
 FlowFieldSpectra.DirectSum.sph_synth_run!
 ```
@@ -86,6 +98,8 @@ FlowFieldSpectra.Grids.axis_range
 FlowFieldSpectra.Grids.relative_coordinates
 FlowFieldSpectra.Grids._sph_points
 FlowFieldSpectra.Grids._colatitude
+FlowFieldSpectra.Grids._longitude_axis
+FlowFieldSpectra.Grids._colocated
 ```
 
 ### Spherical layout routing
@@ -104,6 +118,7 @@ FlowFieldSpectra.Grids._sph_node_weights
 FlowFieldSpectra.Grids.quadrature_scale
 FlowFieldSpectra.quadrature_weighted
 FlowFieldSpectra.Grids._warn_bandlimit
+FlowFieldSpectra.Grids._warn_longitude_bandlimit
 FlowFieldSpectra.Grids._zeroed_inactive
 FlowFieldSpectra.Grids._inactive_scale
 FlowFieldSpectra.Grids._inactive_weights
@@ -125,9 +140,11 @@ FlowFieldSpectra.Grids.series_modes
 
 The packed layout and the widened axes are FlowTransformBindings' (`box_size`, `outside_modes`). The NUFFT
 and hybrid plans publish the half over the coefficient box from a library's `FFTModes` output through one
-index table ([`FlowFieldSpectra._packed_src`](@ref)) of direct and conjugate reads, and a real-data
-NonuniformFFTs plan reads its modes at `+ms_d/2` from its oversampled spectra
-([`FlowFieldSpectra._oversampled_table`](@ref)), on the host and on a device alike.
+index table ([`FlowFieldSpectra._packed_src`](@ref)) of direct and conjugate reads. A NonuniformFFTs plan
+asked for `ms_d` modes reads the modes at `+ms_d/2` a widened axis adds from its oversampled spectra, and
+its synthesis writes them there: a real-data point plan through
+[`FlowFieldSpectra._oversampled_table`](@ref), a line pass through [`FlowFieldSpectra._LinePlus`](@ref),
+on the host and on a device alike.
 
 ## Transform problem & layout
 
@@ -138,6 +155,14 @@ FlowFieldSpectra.Problem.n_batch
 FlowFieldSpectra.Problem.batch_length
 FlowFieldSpectra.Problem.coeff_output_size
 FlowFieldSpectra.Problem.stack_fields
+FlowFieldSpectra.Problem.check_same_shape
+```
+
+## Process backends
+
+```@docs
+FlowFieldSpectra._point_partition
+FlowFieldSpectra._partition_weight
 ```
 
 ## Preprocessing helpers
@@ -159,6 +184,14 @@ FlowFieldSpectra.Preprocessing.detrend_spatial!
 
 ```@docs
 FlowFieldSpectra.Reductions._shell_values!
+FlowFieldSpectra.Reductions._requested_bins
+FlowFieldSpectra.Reductions._split_sum!
+FlowFieldSpectra.Reductions._foreach_radial
+FlowFieldSpectra.Reductions._radial_accumulate!
+FlowFieldSpectra.Reductions._sector_accumulate!
+FlowFieldSpectra.Reductions._transect_accumulate!
+FlowFieldSpectra.Averaging._welch_accumulate!
+FlowFieldSpectra.Averaging._coherence_accumulate!
 ```
 
 ## Spherical-harmonic kernels
@@ -167,7 +200,7 @@ FlowFieldSpectra.Reductions._shell_values!
 FlowFieldSpectra.SphericalKernels.LegendreTables
 FlowFieldSpectra.SphericalKernels.legendre_tables
 FlowFieldSpectra.SphericalKernels.fill_legendre!
-FlowFieldSpectra.SphericalKernels.legendre_start
+FlowFieldSpectra.SphericalKernels.legendre_start_step
 FlowFieldSpectra.SphericalKernels.legendre_order!
 FlowFieldSpectra.SphericalKernels.legendre_index
 FlowFieldSpectra.SphericalKernels.legendre_count

@@ -25,7 +25,7 @@ field(x, y) = cos(3x) + 0.6 * sin(5y) + 0.4 * cos(2x + 4y)
 
 # Reference spectrum on the full uniform grid (a plain (N, N) field tensor).
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    periodic = (true, true), period = (L, L))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 F = [field(x, y) for x in xs, y in xs]
 c_fft, k_fft = FFS.calculate_spectrum(grid, F, (N, N); transform = SB.FFTSpectralBackend())
 k_ref, E_ref = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 24)
@@ -42,7 +42,7 @@ fo = field.(xo, yo)                       # scattered field: a length-M vector
 
 # NUFFT on the irregular ocean-only cloud (an unstructured Cartesian grid).
 ocean_grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xo, yo),
-    ones(length(xo)); periodic = (true, true), period = (L, L))
+    ones(length(xo)); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-9)
 k_b, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 24)
 ```

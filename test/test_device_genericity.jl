@@ -5,7 +5,8 @@
 # the same path fails loudly here. The first testset asserts the guard is armed, so the rest cannot pass
 # vacuously.
 #
-# These are the DirectSum device kernels. JLArrays implements no `AbstractFFTs` methods, so the GPU FFT,
+# These are the DirectSum device kernels and the device forms of the reductions, the preprocessing, the
+# averaged estimators and the operators. JLArrays implements no `AbstractFFTs` methods, so the GPU FFT,
 # NUFFT and NUFSHT device paths, which delegate their transform to a library that needs a device FFT,
 # keep their `KA.CPU()` coverage in the other topic files.
 
@@ -67,14 +68,14 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     # Uniform tensor grid, real field.
     N = 8
     xs = dg_uni(L, N)
-    gu = FG.Grids.StructuredGrid(dg_cart(), xs, xs; periodic = (true, true), period = (L, L))
+    gu = FG.Grids.StructuredGrid(dg_cart(), xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     fu = [cos(2 * x + y) for x in xs, y in xs]
     cs, _, cd, _ = dg_pair(gu, fu, (N, N))
     Test.@test dg_rel(cd, cs) < 1e-12
 
     # Stretched tensor grid with even axes, which a real field's coefficient box widens.
     ax = dg_str(L, N)
-    gs = FG.Grids.StructuredGrid(dg_cart(), ax, ax; periodic = (true, true), period = (L, L))
+    gs = FG.Grids.StructuredGrid(dg_cart(), ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     fs = randn(N, N)
     cs2, ks2, cd2, kd2 = dg_pair(gs, fs, (N, N))
     Test.@test size(cd2) == size(cs2) == (N ÷ 2 + 1, N + 1)
@@ -85,7 +86,7 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     # transform computes, and the box's modes outside them and their mirror stay zero.
     n3 = 6
     ax3 = dg_str(L, n3)
-    g3 = FG.Grids.StructuredGrid(dg_cart(), ax3, ax3, ax3; periodic = (true, true, true), period = (L, L, L))
+    g3 = FG.Grids.StructuredGrid(dg_cart(), ax3, ax3, ax3; topology = (FG.Grids.Periodic(), FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L, L))
     f3 = randn(n3, n3, n3)
     cs3, _, cd3, _ = dg_pair(g3, f3, (4, 6, 4))
     Test.@test size(cd3) == size(cs3) == (3, 7, 5)
@@ -96,7 +97,7 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     xv = L .* rand(M)
     yv = L .* rand(M)
     gc = FG.Grids.UnstructuredGrid(dg_cart(), (xv, yv), fill(L^2 / M, M);
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     fc = randn(M)
     csc, _, cdc, _ = dg_pair(gc, fc, (N, N))
     Test.@test dg_rel(cdc, csc) < 1e-12
@@ -107,7 +108,7 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     X = [L * (i - 1) / n + 0.1 * L / n * sinpi(2 * (j - 1) / n) for i in 1:n, j in 1:n]
     Y = [L * (j - 1) / n + 0.1 * L / n * cospi(2 * (i - 1) / n) for i in 1:n, j in 1:n]
     meas = [1.0 + 0.3 * sinpi(2 * (i + j) / n) for i in 1:n, j in 1:n]
-    gcv = FG.Grids.CurvilinearGrid(dg_cart(), X, Y, trues(n, n); measure = meas, periodic = (true, true),
+    gcv = FG.Grids.CurvilinearGrid(dg_cart(), X, Y, trues(n, n); measure = meas, topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
         period = (L, L))
     fcv = randn(n, n)
     csv, _, cdv, _ = dg_pair(gcv, fcv, (n, n))
@@ -128,7 +129,7 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     for D in (1, 3)
         Nd = D == 3 ? 5 : 10
         gd = FG.Grids.StructuredGrid(dg_cart(), ntuple(_ -> dg_uni(L, Nd), D)...;
-            periodic = ntuple(_ -> true, D), period = ntuple(_ -> L, D))
+            topology = ntuple(_ -> FG.Grids.Periodic(), D), period = ntuple(_ -> L, D))
         fd = randn(ntuple(_ -> Nd, D)...)
         csd, _, cdd, _ = dg_pair(gd, fd, ntuple(_ -> Nd, D))
         Test.@test dg_rel(cdd, csd) < 1e-12
@@ -174,13 +175,13 @@ function dg_grids(L, N)
     X = [L * (i - 1) / n + 0.1 * L / n * sinpi(2 * (j - 1) / n) for i in 1:n, j in 1:n]
     Y = [L * (j - 1) / n + 0.1 * L / n * cospi(2 * (i - 1) / n) for i in 1:n, j in 1:n]
     return (
-        (FG.Grids.StructuredGrid(dg_cart(), dg_uni(L, N), dg_uni(L, N); periodic = (true, true),
+        (FG.Grids.StructuredGrid(dg_cart(), dg_uni(L, N), dg_uni(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
             period = (L, L)), (N, N)),
-        (FG.Grids.StructuredGrid(dg_cart(), ax, ax; periodic = (true, true), period = (L, L)), (N, N)),
+        (FG.Grids.StructuredGrid(dg_cart(), ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (N, N)),
         (FG.Grids.UnstructuredGrid(dg_cart(), (L .* rand(M), L .* rand(M)), fill(L^2 / M, M);
-            periodic = (true, true), period = (L, L)), (N, N)),
+            topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (N, N)),
         (FG.Grids.CurvilinearGrid(dg_cart(), X, Y, trues(n, n);
-            measure = [1.0 + 0.3 * sinpi(2 * (i + j) / n) for i in 1:n, j in 1:n], periodic = (true, true),
+            measure = [1.0 + 0.3 * sinpi(2 * (i + j) / n) for i in 1:n, j in 1:n], topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
             period = (L, L)), (n, n)),
     )
 end
@@ -212,7 +213,7 @@ Test.@testset "Cartesian direct-sum synthesis on JLArrays" begin
     for (g, ms) in dg_grids(2π, 8), (T, batch) in ((Float64, ()), (Float64, (2,)), (ComplexF64, ()))
         c, _ = FFS.calculate_spectrum(g, randn(T, size(g)..., batch...), ms; transform = DG_DS,
             execution = DG_SER)
-        ref = FFS.synthesize(g, c, ms; transform = DG_DS, execution = DG_SER, real_output = T <: Real)
+        ref = FFS.synthesize(T, g, c, ms; transform = DG_DS, execution = DG_SER)
         p = FFS.plan_synthesis(g, T, ms; transform = DG_DS, execution = DG_JL, batch = batch)
         out = FFS.allocate_field(p)
         FFS.synthesize!(out, p, c)
@@ -243,7 +244,7 @@ Test.@testset "Spherical direct-sum plans and synthesis on JLArrays" begin
             cs, _ = FFS.calculate_spectrum(g, f, ms; transform = DG_DS, execution = DG_SER)
             FFS.calculate_spectrum!(c, p, dg_dev(f))
             Test.@test dg_rel(c, cs) < 1e-12
-            ref = FFS.synthesize(g, cs, ms; transform = DG_DS, execution = DG_SER, real_output = T <: Real)
+            ref = FFS.synthesize(T, g, cs, ms; transform = DG_DS, execution = DG_SER)
             FFS.synthesize!(out, q, cs)
             Test.@test dg_rel(out, ref) < 1e-12
             outd = dg_dev(zero(out))
@@ -260,9 +261,9 @@ end
 Test.@testset "Spectral reductions of JLArray coefficients equal the host reductions" begin
     Random.seed!(57)
     for (n, halved) in ((32, true), (33, true), (32, false))
-        g = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, n), dg_uni(2π, n); periodic = (true, true),
+        g = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, n), dg_uni(2π, n); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
             period = (2π, 2π))
-        ks = FFS.Grids.physical_wavenumbers(g, (n, n), Val(halved))
+        ks = FFS.Grids.physical_wavenumbers(g, (n, n), halved ? Float64 : ComplexF64)
         c = randn(ComplexF64, length(ks[1]), length(ks[2]), 2)
         h = randn(ComplexF64, size(c))
         cd, hd = dg_dev(c), dg_dev(h)
@@ -290,11 +291,69 @@ Test.@testset "Spectral reductions of JLArray coefficients equal the host reduct
     _, Eld = FFS.spherical_energy_spectrum(dg_dev(C))
     Test.@test dg_rel(Eld, El) < 1e-12
     # A device field's one-shot spectrum stays on the device, where the reductions above read it.
-    gc = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, 12), dg_uni(2π, 10); periodic = (true, true),
+    gc = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, 12), dg_uni(2π, 10); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
         period = (2π, 2π))
     f = randn(12, 10, 2)
     cs, ks = FFS.calculate_spectrum(gc, f, (12, 10); transform = DG_DS, execution = DG_SER)
     cd, _ = FFS.calculate_spectrum(gc, dg_dev(f), (12, 10); transform = DG_DS, execution = DG_JL)
     Test.@test cd isa JLArrays.JLArray && dg_rel(Array(cd), cs) < 1e-12
     Test.@test dg_rel(last(FFS.isotropic_spectrum(ks, cd)), last(FFS.isotropic_spectrum(ks, cs))) < 1e-12
+end
+
+dg_box(L, n, D) = FG.Grids.StructuredGrid(dg_cart(), ntuple(_ -> dg_uni(L, n), D)...;
+    topology = ntuple(_ -> FG.Grids.Periodic(), D), period = ntuple(_ -> L, D))
+
+# A device field preprocessed and transformed, the zeroing under a mask, the Welch and coherence
+# estimators and the divergence and vorticity operators, each against the same call on the host copy.
+Test.@testset "Preprocessing, averaging and operators on JLArrays equal the host" begin
+    Random.seed!(58)
+    L = 2π
+    N = 8
+    # Detrended and tapered on the device, then the direct sum over a stretched grid, whose quadrature
+    # weights the field.
+    ax = dg_str(L, N)
+    gs = FG.Grids.StructuredGrid(dg_cart(), ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
+        period = (L, L))
+    f = randn(N, N, 2)
+    for spec in (FFS.Preprocess(; detrend = FFS.Demean(), window = FFS.Hann()),
+                 FFS.Preprocess(; detrend = FFS.LinearDetrend(), window = FFS.Tukey(0.4)))
+        cs, _ = FFS.calculate_spectrum(gs, f, (N, N); transform = DG_DS, execution = DG_SER, preprocess = spec)
+        cd, _ = FFS.calculate_spectrum(gs, dg_dev(f), (N, N); transform = DG_DS, execution = DG_JL,
+            preprocess = spec)
+        Test.@test cd isa JLArrays.JLArray && dg_rel(Array(cd), cs) < 1e-12
+    end
+
+    # The masked cells zeroed, the `NaN` they hold included.
+    mask = trues(N, N)
+    mask[2, 3] = false
+    mask[5, 1] = false
+    fm = copy(f)
+    fm[2, 3, :] .= NaN
+    zs = FFS.Grids._zeroed_inactive(fm, mask)
+    zd = FFS.Grids._zeroed_inactive(dg_dev(fm), mask)
+    Test.@test !any(isnan, zs) && zd isa JLArrays.JLArray && Array(zd) == zs
+
+    # A packed real-field layout and a full complex one, three realizations.
+    for (n, E) in ((16, Float64), (15, ComplexF64))
+        ks = FFS.Grids.physical_wavenumbers(dg_box(L, n, 2), (n, n), E)
+        c = randn(ComplexF64, map(length, ks)..., 3)
+        h = randn(ComplexF64, size(c))
+        kb, Ew = FFS.welch_power_spectrum(ks, c)
+        kbd, Ewd = FFS.welch_power_spectrum(ks, dg_dev(c))
+        Test.@test kbd == kb && dg_rel(Ewd, Ew) < 1e-12
+        kb, γ, ϕ = FFS.coherence_spectrum(ks, c, h)
+        kbd, γd, ϕd = FFS.coherence_spectrum(ks, dg_dev(c), dg_dev(h))
+        Test.@test kbd == kb && dg_rel(γd, γ) < 1e-12 && dg_rel(cis.(ϕd), cis.(ϕ)) < 1e-12
+        cv = randn(ComplexF64, map(length, ks)..., 2, 3)
+        for op in (FFS.spectral_divergence, FFS.spectral_vorticity)
+            od = op(ks, dg_dev(cv))
+            Test.@test od isa JLArrays.JLArray && dg_rel(Array(od), op(ks, cv)) < 1e-12
+        end
+    end
+    ks3 = FFS.Grids.physical_wavenumbers(dg_box(L, 6, 3), (6, 6, 6), Float64)
+    cv3 = randn(ComplexF64, map(length, ks3)..., 3, 2)
+    for op in (FFS.spectral_divergence, FFS.spectral_vorticity)
+        od = op(ks3, dg_dev(cv3))
+        Test.@test od isa JLArrays.JLArray && dg_rel(Array(od), op(ks3, cv3)) < 1e-12
+    end
 end

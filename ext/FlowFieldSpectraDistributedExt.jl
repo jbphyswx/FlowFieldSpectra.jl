@@ -27,7 +27,7 @@ _batch_chunks(B::Integer, nw::Integer) = [(((w - 1) * B) ÷ nw + 1):((w * B) ÷ 
 # ---- point-partition: Σ_w α_w · coeff_w ----
 function _distributed_pointsum(inner, transform, g::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
     # The spatial dims collapse to one point axis; the batch dims ride through.
-    Nglob = prod(ntuple(d -> size(field, d), ndims(g)))
+    Nglob = prod(size(g))
     fieldP = reshape(field, Nglob, FFS.Grids.field_batch_shape(g, field)...)
     nw = max(1, Distributed.nworkers())
     chunks = _index_chunks(Nglob, nw)
@@ -47,20 +47,20 @@ function _distributed_pointsum(inner, transform, g::FlowGeometries.Grids.Abstrac
     @inbounds for (k, cw) in enumerate(partials)
         coeffs .+= α[k] .* cw
     end
-    return coeffs, FFS._partition_ks(g, ms, eltype(field) <: Real)
+    return coeffs, FFS._partition_ks(g, ms, float(eltype(field)))
 end
 
 # ---- batch-partition: disjoint batch slices, gathered along the (flattened) batch axis ----
 function _distributed_batch(inner, transform, g::FlowGeometries.Grids.AbstractGrid, field::AbstractArray, ms::Tuple; kwargs...)
     ns = ndims(g)
-    sp = ntuple(d -> size(field, d), ns)
-    batch = ntuple(i -> size(field, ns + i), ndims(field) - ns)
+    sp = size(g)
+    batch = FFS.Grids.field_batch_shape(g, field)
     B = prod(batch; init = 1)
     fieldB = reshape(field, sp..., B)
     nw = max(1, Distributed.nworkers())
     chunks = filter(!isempty, _batch_chunks(B, nw))
-    R = eltype(field) <: Real
-    spatial_out = FFS._coeff_spatial(g, ms, R)
+    E = float(eltype(field))
+    spatial_out = FFS._coeff_spatial(g, ms, E)
     parts = Distributed.pmap(chunks) do bc
         fslice = collect(selectdim(fieldB, ns + 1, bc))
         cw, _ = _serial_ft(() -> FFS.calculate_spectrum(transform, inner, g, fslice, ms; kwargs...))
@@ -70,7 +70,7 @@ function _distributed_batch(inner, transform, g::FlowGeometries.Grids.AbstractGr
     for (cw, bc) in parts
         @inbounds selectdim(coeffsB, ndims(coeffsB), bc) .= reshape(cw, spatial_out..., length(bc))
     end
-    return reshape(coeffsB, spatial_out..., batch...), FFS._partition_ks(g, ms, R)
+    return reshape(coeffsB, spatial_out..., batch...), FFS._partition_ks(g, ms, E)
 end
 
 function FFS._calculate_spectrum_distributed(transform, exec::ComputationalBackends.AbstractDistributedBackend,
@@ -151,7 +151,6 @@ function FFS._plan_spectrum_distributed(t::SpectralBackends.AbstractSpectralBack
         ::Type{T}, ms::Tuple; batch::Tuple = (), kwargs...) where {T}
     inner = ComputationalBackends.local_backend(exec)
     FT = real(float(T))
-    R = T <: Real
     bt = NTuple{length(batch), Int}(batch)
     B = prod(bt; init = 1)
     Nglob = prod(size(g))
@@ -164,8 +163,8 @@ function FFS._plan_spectrum_distributed(t::SpectralBackends.AbstractSpectralBack
     plans = _remote_plans(build, pids, shares)
     w = get(kwargs, :weights, nothing)
     α = points ? [FT(FFS._partition_weight(g, s, w)) for s in shares] : nothing
-    so = FFS._coeff_spatial(g, ms, R)
-    ks = FFS._partition_ks(g, ms, R)
+    so = FFS._coeff_spatial(g, ms, T)
+    ks = FFS._partition_ks(g, ms, T)
     sp = size(g)
     return DistributedSpectralPlan{FFS._coeff_eltype(g, T, FT), length(so), length(bt), typeof(ks),
             typeof(pids), typeof(plans), typeof(shares), typeof(α), typeof(sp)}(
@@ -234,7 +233,6 @@ struct DistributedSynthesisPlan{OT, NB, PW <: AbstractVector{Int}, FS <: Abstrac
     shares::SH
     points::Bool
     spatial::SP
-    nspec::Int                    # spectral dims of the coefficients
     batch::NTuple{NB, Int}
     Nglob::Int
     B::Int
@@ -269,7 +267,7 @@ function FFS._plan_synthesis_distributed(t::SpectralBackends.AbstractSpectralBac
     OT = T <: Real ? FT : Complex{FT}
     sp = size(g)
     return DistributedSynthesisPlan{OT, length(bt), typeof(pids), typeof(plans), typeof(shares), typeof(sp)}(
-        pids, plans, shares, points, sp, length(FFS._coeff_spatial(g, ms, T <: Real)), bt, Nglob, B)
+        pids, plans, shares, points, sp, bt, Nglob, B)
 end
 
 # On a worker: its synthesis plan evaluated on its coefficients.
@@ -285,11 +283,13 @@ end
 
 Evaluate the series `coeffs` at the grid's points into `out`, each worker evaluating its share.
 """
-function FFS.Plans.synthesize!(out::AbstractArray, p::DistributedSynthesisPlan, coeffs::AbstractArray)
+function FFS.Plans.synthesize!(out::AbstractArray, p::DistributedSynthesisPlan{OT, NB},
+        coeffs::AbstractArray) where {OT, NB}
     size(out) == FFS.Plans.field_size(p) || throw(DimensionMismatch(
         "out is $(size(out)); this plan writes $(FFS.Plans.field_size(p))"))
-    nsp = p.nspec
-    spec = ntuple(i -> size(coeffs, i), nsp)
+    # The coefficients' spectral dims precede the plan's `NB` batch dims.
+    spec = ntuple(i -> size(coeffs, i), Val(ndims(coeffs) - NB))
+    nsp = length(spec)
     parts = Vector{Any}(undef, length(p.pids))
     @sync for k in eachindex(p.pids)
         c = p.points ? coeffs : collect(selectdim(reshape(coeffs, spec..., p.B), nsp + 1, p.shares[k]))

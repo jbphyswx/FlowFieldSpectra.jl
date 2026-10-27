@@ -13,6 +13,7 @@ using LinearAlgebra: LinearAlgebra
 
 const SUITE = BenchmarkGroup()
 const CARTGEOM = FG.Geometry.CartesianGeometry{Float64}()
+const PER2 = (FG.Grids.Periodic(), FG.Grids.Periodic())
 _uaxis(L, N) = range(0.0, L; length = N + 1)[1:N]
 
 # =============================================================================
@@ -23,7 +24,7 @@ for N in [64, 128, 256]
     SUITE["cartesian_uniform"]["N=$N"] = BenchmarkGroup()
     L = 10.0
     xs = _uaxis(L, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (L, L))
     u = [cos(2π * 2 * x / L + 2π * y / L) + 0.5 * sin(2π * (-3) * x / L + 2π * 2 * y / L) for x in xs, y in xs]
     v = [sin(2π * 2 * x / L + 2π * y / L) for x in xs, y in xs]
     uv = cat(u, v; dims = 3)
@@ -46,7 +47,7 @@ for N in [1000, 10000, 100000]
     yv = rand(N) .* L
     kx, ky = 2π * 1 / L, 2π * (-1) / L
     f = @. cos(kx * xv + ky * yv)
-    g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), ones(N); periodic = (true, true), period = (L, L))
+    g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), ones(N); topology = PER2, period = (L, L))
     SUITE["cartesian_scattered"]["N=$N"]["finufft"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = FTB.FINUFFTBackend(), eps = 1e-9)
     N <= 10000 && (SUITE["cartesian_scattered"]["N=$N"]["direct_sum"] =
@@ -54,18 +55,18 @@ for N in [1000, 10000, 100000]
 end
 
 # =============================================================================
-# Spherical structured grid: DirectSum vs FastSphericalHarmonics (Clenshaw–Curtis grid).
+# Spherical structured grid: DirectSum vs FastSphericalHarmonics (Fejér first-rule grid).
 # =============================================================================
 SUITE["spherical_structured"] = BenchmarkGroup()
 for lmax in [16, 32, 64]
     SUITE["spherical_structured"]["lmax=$lmax"] = BenchmarkGroup()
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-    g = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), Nθ)
-    C = zeros(ComplexF64, Nθ, Nφ)
+    g = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), Nθ)
+    C = zeros(Nθ, Nφ)
     C[FFS.sph_mode_index(2, 1)] = 1.0
     C[FFS.sph_mode_index(3, -2)] = 0.5
-    f = real(FFS.synthesize(g, C, (Nθ, Nφ)))
+    f = FFS.synthesize(g, C, (Nθ, Nφ))
     SUITE["spherical_structured"]["lmax=$lmax"]["fast_sht"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.FSHTSpectralBackend())
     lmax <= 32 && (SUITE["spherical_structured"]["lmax=$lmax"]["direct_sum"] =
@@ -87,15 +88,15 @@ for lmax in [8, 16, 32]
     θ = acos.(clamp.(zf, -1.0, 1.0))
     φ = mod.(ga .* (0:(N_pts-1)), 2π)
     C_true = zeros(Nθ, Nφ)
-    C_true[FSH.sph_mode(2, 0)] = 1.0
-    plan = NUFSHT.make_plan(Float64, θ, φ, lmax)
-    f = zeros(N_pts)
-    NUFSHT.nusht_type2!(f, C_true, plan)
+    C_true[FFS.sph_mode_index(2, 0)] = 1.0
     g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (φ, π / 2 .- θ), ones(N_pts))
-    SUITE["spherical_scattered"]["lmax=$lmax"]["nufsht_adjoint"] =
-        @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.NUFSHTSpectralBackend(), solve = false, tol = 1e-8)
+    f = FFS.synthesize(g, C_true, (Nθ, Nφ); transform = SB.DirectSumSpectralBackend())
+    SUITE["spherical_scattered"]["lmax=$lmax"]["nufsht_quadrature"] =
+        @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.NUFSHTSpectralBackend(),
+            analysis = FFS.Quadrature(), tol = 1e-8)
     lmax <= 16 && (SUITE["spherical_scattered"]["lmax=$lmax"]["nufsht_fit"] =
-        @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.NUFSHTSpectralBackend(), solve = true, rtol = 1e-6, maxiter = 500))
+        @benchmarkable FFS.calculate_spectrum($g, $f, ($Nθ, $Nφ); transform = SB.NUFSHTSpectralBackend(),
+            analysis = FFS.LeastSquares(), rtol = 1e-6, maxiter = 500))
 end
 
 # =============================================================================
@@ -107,7 +108,7 @@ let
     N = 128
     ms = (N, N)
     xs = _uaxis(L, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (L, L))
     u = [cos(2π * 2 * x / L + 2π * y / L) for x in xs, y in xs]
     v = [sin(2π * 2 * x / L + 2π * y / L) for x in xs, y in xs]
     coeffs, ks = FFS.calculate_spectrum(g, cat(u, v; dims = 3), ms; transform = SB.FFTSpectralBackend())
@@ -117,10 +118,10 @@ let
     lmax = 16
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-    gs = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.ClenshawCurtisSampling(), Nθ)
-    Ct = zeros(ComplexF64, Nθ, Nφ)
+    gs = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), Nθ)
+    Ct = zeros(Nθ, Nφ)
     Ct[FFS.sph_mode_index(2, 1)] = 1.0
-    fsph = real(FFS.synthesize(gs, Ct, (Nθ, Nφ)))
+    fsph = FFS.synthesize(gs, Ct, (Nθ, Nφ))
     c_sph, _ = FFS.calculate_spectrum(gs, fsph, (Nθ, Nφ); transform = SB.FSHTSpectralBackend())
     SUITE["reductions"]["spherical_energy_spectrum"] = @benchmarkable FFS.spherical_energy_spectrum($c_sph; lmax = $lmax)
 end
@@ -140,12 +141,12 @@ SUITE["plans"] = BenchmarkGroup()
 for N in [128, 256, 512]
     SUITE["plans"]["fft_N=$N"] = BenchmarkGroup()
     xs = _uaxis(2π, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; periodic = (true, true), period = (2π, 2π))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (2π, 2π))
     Random.seed!(1)
     f = randn(N, N)
     ms = (N, N)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.FFTSpectralBackend())
-    buf = zeros(ComplexF64, FTB.packed_size(ms, Val(true))...)
+    buf = zeros(ComplexF64, FTB.packed_size(Real, ms)...)
     SUITE["plans"]["fft_N=$N"]["one_shot"] =
         @benchmarkable FFS.calculate_spectrum($g, $f, $ms; transform = SB.FFTSpectralBackend())
     SUITE["plans"]["fft_N=$N"]["plan_exec"] = @benchmarkable FFS.calculate_spectrum!($buf, $p, $f)
@@ -157,7 +158,7 @@ for N in [64, 128, 256]
     L = 2π
     uni = _uaxis(L, N)
     str = [L * (i - 1) / N + 0.04 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
-    g = FG.Grids.StructuredGrid(CARTGEOM, uni, str; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, uni, str; topology = PER2, period = (L, L))
     Random.seed!(2)
     f = randn(N, N)
     ms = (N, N)
@@ -177,7 +178,7 @@ for M in [10_000, 100_000]
     xv = rand(M) .* L
     yv = rand(M) .* L
     g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(L^2 / M, M);
-        periodic = (true, true), period = (L, L))
+        topology = PER2, period = (L, L))
     f = randn(M)
     p = FFS.plan_spectrum(g, Float64, ms; transform = FTB.NonuniformFFTsBackend(), eps = 1e-9)
     buf = FFS.allocate_coefficients(p)
@@ -192,7 +193,7 @@ for N in [32, 64, 128]
     SUITE["plans"]["directsum_N=$N"] = BenchmarkGroup()
     L = 2π
     str = [L * (i - 1) / N + 0.03 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
-    g = FG.Grids.StructuredGrid(CARTGEOM, str, str; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, str, str; topology = PER2, period = (L, L))
     Random.seed!(6)
     f = randn(N, N)
     ms = (N, N)
@@ -211,7 +212,7 @@ for M in [2_000, 8_000]
     xv = rand(M) .* L
     yv = rand(M) .* L
     g = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(L^2 / M, M);
-        periodic = (true, true), period = (L, L))
+        topology = PER2, period = (L, L))
     f = randn(M)
     p = FFS.plan_spectrum(g, Float64, ms; transform = SB.DirectSumSpectralBackend())
     buf = FFS.allocate_coefficients(p)
@@ -288,7 +289,7 @@ SUITE["defaults"] = BenchmarkGroup()
 let nt = Threads.nthreads()
     N, L = 1024, 10.0
     xs = _uaxis(L, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; periodic = (true, true), period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (L, L))
     Random.seed!(3)
     u, v = randn(N, N), randn(N, N)
     pr = FFTW.plan_rfft(u; num_threads = nt)
@@ -298,7 +299,7 @@ let nt = Threads.nthreads()
 
     M, m, Lc = 100_000, 128, 1000e3
     xv, yv = Lc .* rand(M), Lc .* rand(M)
-    gc = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(Lc^2 / M, M); periodic = (true, true), period = (Lc, Lc))
+    gc = FG.Grids.UnstructuredGrid(CARTGEOM, (xv, yv), fill(Lc^2 / M, M); topology = PER2, period = (Lc, Lc))
     uc, vc = randn(M), randn(M)
     p = FTB.plan_nufft(FTB.NonuniformFFTsBackend(), Float64, (xv, yv), (m, m); period = Lc, ntrans = 2, nthreads = nt)
     F, c = FTB.allocate_modes(p), FTB.allocate_values(p)

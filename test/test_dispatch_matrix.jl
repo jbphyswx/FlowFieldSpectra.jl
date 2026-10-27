@@ -23,8 +23,8 @@ Test.@testset "A direction's Fourier length is the length its cells cover" begin
     N = 8
     xs = collect(dm_unif(L, N))
     cloud = FG.Grids.UnstructuredGrid(DM_CART, (repeat(xs, N), repeat(xs; inner = N)), fill(1.0, N^2);
-        periodic = (true, false), period = (L, 5.0))
-    ks = FFS.Grids.physical_wavenumbers(cloud, (N, N), Val(true))
+        topology = (FG.Grids.Periodic(), FG.Grids.Bounded()), period = (L, 5.0))
+    ks = FFS.Grids.physical_wavenumbers(cloud, (N, N), Float64)
     Test.@test isapprox(ks[1][2] - ks[1][1], 2π / L; rtol = 1e-12)
     Test.@test isapprox(ks[2][2] - ks[2][1], 2π / L; rtol = 1e-12)
 
@@ -63,7 +63,7 @@ Test.@testset "The catch-all names the grid and the transform" begin
     nlon, nlat = 2 * lmax + 1, lmax + 1
     g = FG.Grids.StructuredGrid(DM_SPHEROID,
         [2π * (i - 1) / nlon for i in 1:nlon], [π * (j - 0.5) / nlat - π / 2 for j in 1:nlat];
-        periodic = (true, false), period = (2π, 0.0))
+        topology = (FG.Grids.Periodic(), FG.Grids.Bounded()), period = (2π, 0.0))
     err = try
         FFS.calculate_spectrum(g, randn(nlon, nlat), sms; transform = SB.FSHTSpectralBackend(),
             execution = CB.SerialBackend())

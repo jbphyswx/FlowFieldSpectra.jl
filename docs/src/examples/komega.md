@@ -27,7 +27,7 @@ f = [cos(k0 * xi + ω0 * ti) + 0.4 * cos(2 * xi + 1.0 * ti + 0.5) for xi in x, t
 
 # dim 1 = space (→ k), dim 2 = time (→ ω)
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x, t;
-    periodic = (true, true), period = (Lx, Lt))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (Lx, Lt))
 coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nt); transform = SB.FFTSpectralBackend())
 kx, kω = ks
 Ekω = abs2.(coeffs)
@@ -35,7 +35,8 @@ Ekω = abs2.(coeffs)
 
 ![Wavenumber–frequency spectrum E(k, ω) with the dominant peak on the ω = k dispersion line](../assets/komega.png)
 
-The dominant peak sits on the `ω = k` dispersion line at `(k₀, ω₀) = (6, 6)` (and its conjugate at
-`(−6, −6)`); the weaker background mode lies off the line at a slower phase speed. Building the same
+The dominant peak sits on the `ω = k` dispersion line at `(k₀, ω₀) = (6, 6)`; its conjugate at
+`(−6, −6)` is the mirror the packed half `k ≥ 0` stands for. The weaker background mode lies off the line
+at a slower phase speed. Building the same
 field on a fixed nonuniform horizontal grid with the plan reused across time is shown in the
 [4D fixed-grid example](horizontal_4d.md).

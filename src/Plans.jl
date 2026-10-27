@@ -1,7 +1,7 @@
 module Plans
 
 export AbstractSpectralPlan, plan_spectrum,
-    coefficient_size, coefficient_type, wavenumbers, allocate_coefficients,
+    coefficient_size, coefficient_type, wavenumbers, allocate_coefficients, analysis_status,
     AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
 
 """
@@ -67,6 +67,23 @@ A zeroed coefficient array of this plan's own size and element type, ready for
 """
 allocate_coefficients(plan::AbstractSpectralPlan) =
     zeros(coefficient_type(plan), coefficient_size(plan)...)
+
+"""
+    analysis_status(plan) -> (; converged, iterations, residual)
+
+The outcome of the plan's last `calculate_spectrum!`. A plan computing a least-squares fit
+(`analysis = LeastSquares()`) passes on the fitting library's report over the whole batch (NUFSHT's
+`nusht_analyze!` returns it per call): `converged` for every field, the most LSMR iterations, and the
+largest relative residual `‖A†r‖/‖A†f‖`. A fit that stops short still writes its coefficients and is
+reported here. A quadrature is `(true, 0, 0)`.
+"""
+analysis_status(plan::AbstractSpectralPlan) = _quadrature_status(real(coefficient_type(plan)))
+
+# The report `analysis_status` returns; a plan running its fit in several calls combines theirs.
+const AnalysisStatus{T} = @NamedTuple{converged::Bool, iterations::Int, residual::T}
+_quadrature_status(::Type{T}) where {T} = AnalysisStatus{T}((true, 0, zero(T)))
+_combine_status(a::AnalysisStatus{T}, b::AnalysisStatus{T}) where {T} =
+    AnalysisStatus{T}((a.converged & b.converged, max(a.iterations, b.iterations), max(a.residual, b.residual)))
 
 # A transform writes its modes by linear index, so `coeffs` must have the shape it writes.
 function _check_coefficients(coeffs::AbstractArray, plan::AbstractSpectralPlan)

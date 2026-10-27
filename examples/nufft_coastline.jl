@@ -23,7 +23,7 @@ function run_nufft_coastline_example()
     xs = range(0.0, L; length = N + 1)[1:N]
     ys = range(0.0, L; length = N + 1)[1:N]
     grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     field(x, y) = cos(3x) + 0.6 * sin(5y) + 0.4 * cos(2x + 4y)
     f_grid = [field(x, y) for x in xs, y in ys]         # (N, N) tensor
 
@@ -44,7 +44,7 @@ function run_nufft_coastline_example()
     println("Kept $(count(ocean)) / $(length(xj)) points after the coastline cutout.")
 
     ocean_grid = FG.Grids.UnstructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), (xo, yo), ones(length(xo));
-        periodic = (true, true), period = (L, L))
+        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     c_nu, k_nu = FFS.calculate_spectrum(ocean_grid, fo, (N, N); transform = FTB.FINUFFTBackend(), eps = 1e-9)
     k_nu2, E_nu = FFS.isotropic_spectrum(k_nu, c_nu; num_bins = 24)
 

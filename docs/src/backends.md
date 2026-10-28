@@ -206,7 +206,7 @@ coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nz); transform = SB.FFTSpectra
 ### `FSHTSpectralBackend`
 - **Use Case**: On the host, FastTransforms' own grid: Fejér first-rule latitudes (`Fejer1Sampling`) and a
   periodic longitude axis of `2nlat − 1` points, either direction, any origin. On a `GPUBackend`, any
-  structured sphere whose longitude axis is periodic (`FlowGeometries.Axes.PeriodicAxis`), with the
+  structured sphere whose longitude axis is periodic (`FlowGeometries.Axes.PeriodicUniformAxis`), with the
   latitude quadrature of its `sampling`.
 - **Mathematical Method**: Fast Spherical Harmonic Transform via `FastSphericalHarmonics.jl` on the host;
   on a device, a longitude FFT through `AbstractFFTs` and a Legendre kernel.

@@ -165,7 +165,7 @@ end
 function sp_ft_grid(lmax, λ₀, s)
     base = FG.Connectivity.structured_grid(Float64, FG.SphericalSampling.Fejer1Sampling(), lmax + 1)
     nlon = 2 * lmax + 1
-    λ = FG.Axes.PeriodicAxis(λ₀, s * 2π, nlon)
+    λ = FG.Axes.PeriodicUniformAxis(λ₀, s * 2π, nlon)
     return FG.Grids.StructuredGrid(FG.Grids.grid_geometry(base), λ, FG.Grids.coordinates(base, 2);
         sampling = FG.Grids.sampling(base))
 end
@@ -380,7 +380,7 @@ Test.@testset "The device SHT synthesis evaluates the series at the nodes" begin
     # direction as the bin order, against the direct sum's exact longitude sums.
     for (λ₀, s) in ((0.37, 1), (1.1, -1)), cplx in (false, true)
         base = FG.Connectivity.structured_grid(Float64, GL, lmax + 1)
-        g = FG.Grids.StructuredGrid(FG.Grids.grid_geometry(base), FG.Axes.PeriodicAxis(λ₀, s * 2π, 2 * lmax + 1),
+        g = FG.Grids.StructuredGrid(FG.Grids.grid_geometry(base), FG.Axes.PeriodicUniformAxis(λ₀, s * 2π, 2 * lmax + 1),
             FG.Grids.coordinates(base, 2); sampling = FG.Grids.sampling(base))
         C = sp_coeffs(lmax, 2; cplx = cplx)
         fd = FFS.synthesize(sp_field_type(cplx), g, C, ms; transform = SP_DS, execution = SP_SER)

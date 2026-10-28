@@ -490,14 +490,14 @@ end
     _longitude_axis(grid, ::Type{FT}) -> (λ₀, s)
 
 The origin `λ₀` and step sign `s` of a structured sphere's longitude axis, which a longitude FFT reads only
-as a `FlowGeometries.Axes.PeriodicAxis`: `nlon` samples `2π/nlon` apart around the circle. With
+as a `FlowGeometries.Axes.PeriodicUniformAxis`: `nlon` samples `2π/nlon` apart around the circle. With
 `λ_j = λ₀ + s·2πj/nlon`, `Σ_j f_j e^{-imλ_j}` is `e^{-imλ₀}` times the FFT's bin `s·m`.
 """
 function _longitude_axis(g, ::Type{FT}) where {FT}
     ax = FlowGeometries.Grids.coordinates(g, 1)
-    ax isa FlowGeometries.Axes.PeriodicAxis || throw(ArgumentError(
+    ax isa FlowGeometries.Axes.PeriodicUniformAxis || throw(ArgumentError(
         "a longitude FFT reads a longitude axis of `nlon` samples `2π/nlon` apart around the circle, a " *
-        "`FlowGeometries.Axes.PeriodicAxis`; this grid's is a $(nameof(typeof(ax)))"))
+        "`FlowGeometries.Axes.PeriodicUniformAxis`; this grid's is a $(nameof(typeof(ax)))"))
     return FT(first(ax)), step(ax) > 0 ? 1 : -1
 end
 

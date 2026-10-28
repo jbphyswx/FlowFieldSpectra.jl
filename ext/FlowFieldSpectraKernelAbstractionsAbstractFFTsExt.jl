@@ -28,7 +28,7 @@ FFS._available(::FFS._DeviceFFT) = true
     GPUSHTPlan{FT,CT}
 
 Reusable device spherical-harmonic transform on a structured `(nlon, nlat)` sphere whose longitude axis
-is a `FlowGeometries.Axes.PeriodicAxis` (`Grids._longitude_axis`): the device field and longitude-bin
+is a `FlowGeometries.Axes.PeriodicUniformAxis` (`Grids._longitude_axis`): the device field and longitude-bin
 buffers with the longitude FFT planned on them, the Legendre values at every latitude row
 (`SphericalKernels.device_legendre_table`) and the quadrature weights, the activity mask, the coefficient
 buffer, and the longitude origin `λ0` and step sign `sλ`, built once for a fixed `lmax` and batch shape.
@@ -162,7 +162,7 @@ end
     GPUSHTSynthesisPlan{FT,R}
 
 Reusable device spherical-harmonic synthesis on a structured `(nlon, nlat)` sphere whose longitude axis
-is a `FlowGeometries.Axes.PeriodicAxis` (`Grids._longitude_axis`): the device coefficients, the longitude
+is a `FlowGeometries.Axes.PeriodicUniformAxis` (`Grids._longitude_axis`): the device coefficients, the longitude
 bins each latitude row reduces to with the backward longitude FFT planned on them, the device field, the
 Legendre values at every latitude row (`SphericalKernels.device_legendre_table`), and the longitude origin
 `λ0` and step sign `sλ`. `R` marks a real field. Execute with `synthesize!(out, plan, coeffs)`.

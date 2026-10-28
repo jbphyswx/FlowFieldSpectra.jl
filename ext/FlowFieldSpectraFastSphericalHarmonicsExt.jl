@@ -38,7 +38,7 @@ end
 # its guarantee is the exact round trip with `sph_evaluate`.
 #
 # A grid is FastTransforms' when its sampling is Fejér's first rule (`Fejer1Sampling`) at `Nθ` latitudes
-# and its longitude axis a `FlowGeometries.Axes.PeriodicAxis` of `Nφ` points; any other grid raises. Each
+# and its longitude axis a `FlowGeometries.Axes.PeriodicUniformAxis` of `Nφ` points; any other grid raises. Each
 # batch slab maps onto that grid through permutations: the latitudes sorted to ascending colatitude, and
 # the longitudes `λ₀ + s·φ_j` taken in the order of `φ_j`. The coefficients in `φ` rotate to the grid's
 # longitudes by `mλ₀` per order. FastTransforms runs on the host, so these methods take SerialBackend,
@@ -207,7 +207,7 @@ end
 # its size.
 _on_ft_grid(g, Nθ::Int, Nφ::Int) =
     FlowGeometries.Grids.sampling(g) isa FlowGeometries.SphericalSampling.AbstractFejer1Sampling &&
-    FlowGeometries.Grids.coordinates(g, 1) isa FlowGeometries.Axes.PeriodicAxis && size(g) == (Nφ, Nθ)
+    FlowGeometries.Grids.coordinates(g, 1) isa FlowGeometries.Axes.PeriodicUniformAxis && size(g) == (Nφ, Nθ)
 
 # The grid's latitude order to FastTransforms' ascending colatitudes, its longitude `λ₀ + s(i−1)Δ` at
 # FastTransforms' column `j` (`φ = (j−1)Δ`), and `(sin mλ₀, cos mλ₀)` per order. The forward and the

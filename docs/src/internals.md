@@ -28,6 +28,7 @@ FlowFieldSpectra._hybrid_plan
 FlowFieldSpectra._hybrid_derive
 FlowFieldSpectra.HybridSynthesisPlan
 FlowFieldSpectra._hybrid_synthesis_plan
+FlowFieldSpectra.Plans.SplitFFTPlan
 ```
 
 ### NUFFT plans

@@ -261,4 +261,26 @@ function FFS.Plans.synthesize!(out::AbstractArray, p::MPISynthesisPlan{OT, NB},
     return out
 end
 
+FFS.Plans._split_fft_execution(split::FlowGeometries.Decomposition.AbstractRankSplit) =
+    ComputationalBackends.MPIBackend(FlowGeometries.Decomposition.block(split).execution;
+        comm = FlowGeometries.Decomposition.cartesian_comm(split))
+
+function FFS.Plans._foreach_split_field(f::F,
+                                       field::FlowGeometries.Decomposition.AbstractRankField) where {F}
+    split = FlowGeometries.Decomposition.split_of(field)
+    f(FlowGeometries.Decomposition.block(split), FlowGeometries.Decomposition.local_array(field))
+    return nothing
+end
+
+function FFS.Plans._split_fft_stage(::ComputationalBackends.AbstractMPIBackend,
+                                   input, output, axis; measure)
+    source = FlowGeometries.Decomposition.local_array(input)
+    target = FlowGeometries.Decomposition.local_array(output)
+    backend = FlowGeometries.Decomposition.block(FlowGeometries.Decomposition.split_of(input)).execution
+    return FFS.Plans._local_fft_stage(source, target, axis, backend, measure)
+end
+
+FFS.Plans._run_split_fft_stage!(::ComputationalBackends.AbstractMPIBackend, stage, direction) =
+    FFS.Plans._run_local_fft_stage!(stage, direction)
+
 end # module FlowFieldSpectraMPIExt

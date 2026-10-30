@@ -105,5 +105,22 @@ Test.@testset "Entry points make no runtime dispatch" begin
         o = similar(c, size(c, 1), size(c, 2), 1)
         JET.@test_opt target_modules = JET_MODULES FFS.spectral_divergence!(o, ks, c)
         JET.@test_opt target_modules = JET_MODULES FFS.spectral_vorticity!(o, ks, c)
+
+        # A plan holding its preprocessing, built and executed on a field with an invalid point, by mask and by value:
+        # a node set's detrend and window, and a uniform grid's padding.
+        fsg = randn(64)
+        fsg[5] = NaN
+        lin = FFS.Preprocess(; detrend = FFS.LinearDetrend(), window = FFS.Tukey(0.5))
+        padded = FFS.Preprocess(; detrend = FFS.LinearDetrend(), window = FFS.Hann(), pad = 2.0)
+        for (g, t, f, spec) in ((sg, fin, fsg, lin), (sg, SB.DirectSumSpectralBackend(), fsg, lin),
+                                (ug, SB.FFTSpectralBackend(), randn(N, N), padded))
+            JET.@test_opt target_modules = JET_MODULES FFS.plan_spectrum(g, Float64, ms; transform = t, execution = ser,
+                preprocess = spec)
+            p = FFS.plan_spectrum(g, Float64, ms; transform = t, execution = ser, preprocess = spec)
+            cp = FFS.allocate_coefficients(p)
+            JET.@test_opt target_modules = JET_MODULES FFS.calculate_spectrum!(cp, p, f)
+            JET.@test_opt target_modules = JET_MODULES FFS.calculate_spectrum!(cp, p, f, isfinite.(f))
+            FFS.close!(p)
+        end
     end
 end

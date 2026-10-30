@@ -167,10 +167,13 @@ Exclude
 ## Preprocessing & normalization conventions
 
 `preprocess::Preprocess` on [`calculate_spectrum`](@ref) detrends, tapers and zero-pads the field before
-transforming; [`preprocess_field`](@ref) applies the same spec explicitly, for the plan path and for
-multitaper (one plan, `K` tapered copies as a batch).
+transforming. On [`plan_spectrum`](@ref) it gives a [`PreprocessedPlan`](@ref FlowFieldSpectra.PreprocessedPlan), which preprocesses each batch slice
+under that slice's valid points (a `valid` mask, or the finite values) on every `calculate_spectrum!`.
+[`preprocess_field`](@ref) applies the same spec explicitly, for multitaper (one plan, `K` tapered copies as a
+batch).
 
 ```@docs
+FlowFieldSpectra.PreprocessedPlan
 preprocess_field
 Preprocess
 AbstractWindow

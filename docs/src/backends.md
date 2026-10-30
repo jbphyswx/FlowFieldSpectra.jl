@@ -239,8 +239,28 @@ transform axis. Defaults to `AutoBackend()`.
 
 Point-partitionable transforms (`DirectSumSpectralBackend`, the NUFFT backends, and
 `NUFSHTSpectralBackend` in projection mode) distribute over the point/sample axis and sum the complex
-coefficients; `FFTSpectralBackend`/`FSHTSpectralBackend` (which need the full grid on one process)
-distribute over the batch/field axis instead.
+coefficients. Array inputs to `FFTSpectralBackend` and `FSHTSpectralBackend` distribute over the
+batch/field axis.
+
+An FFT on a `FlowGeometries.Decomposition.AbstractSplitGrid` transforms one uniform periodic Cartesian
+field across its processes. Each local FFT runs along an axis held whole, with distributed transposes
+between layouts. Real fields return the packed half spectrum; complex fields return the full spectrum,
+both normalized by the total cell count. Trailing batch axes stay with each spatial block.
+
+```julia
+analysis = FFS.plan_spectrum(split, Float64; batch = (), measure = false)
+coefficients = FFS.allocate_coefficients(analysis)
+ks = FFS.calculate_spectrum!(coefficients, analysis, field)
+
+synthesis = FFS.plan_synthesis(analysis)
+reconstructed = FFS.allocate_field(synthesis)
+FFS.synthesize!(reconstructed, synthesis, coefficients)
+```
+
+Here `field` is a FlowGeometries split field on `split`, built with a `DistributedBackend` or an
+`MPIBackend`. MPI transposes require `using PencilArrays`. The forward and inverse share their block
+buffers and local FFT plans and execute sequentially. Consecutive stages on the same layout reuse one
+coefficient buffer. Caller-allocated coefficients remain intact through synthesis.
 
 The execution axis is **result-invariant**: it changes only where/how a transform runs, never the
 answer. One FFT transform under `SerialBackend`, `ThreadedBackend`, and `GPUBackend(KA.CPU())`

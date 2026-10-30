@@ -329,4 +329,146 @@ function _backward_input!(p::FFTSynthesisPlan, coeffs, pre)
     return p.scratch
 end
 
+struct SplitFFTStage{I,O,F,B}
+    input::I
+    output::O
+    forward::F
+    backward::B
+end
+
+Base.show(io::IO, p::SplitFFTStage) = print(io, "SplitFFTStage(", size(p.input), " → ", size(p.output), ")")
+
+function FFS.Plans._local_fft_stage(input::AbstractArray, output::AbstractArray,
+                                  axis::Integer, execution, measure)
+    options = FFS._fft_options(execution, measure, true)
+    forward, backward = if eltype(input) <: Real
+        AbstractFFTs.plan_rfft(input, axis:axis; options...),
+        AbstractFFTs.plan_brfft(output, size(input, axis), axis:axis; options...)
+    elseif input === output
+        AbstractFFTs.plan_fft!(input, axis:axis; options...),
+        AbstractFFTs.plan_bfft!(output, axis:axis; options...)
+    else
+        AbstractFFTs.plan_fft(input, axis:axis; options...),
+        AbstractFFTs.plan_bfft(output, axis:axis; options...)
+    end
+    return SplitFFTStage(input, output, forward, backward)
+end
+
+function FFS.Plans._run_local_fft_stage!(stage::SplitFFTStage, ::Val{:forward})
+    LA.mul!(stage.output, stage.forward, stage.input)
+    return nothing
+end
+
+function FFS.Plans._run_local_fft_stage!(stage::SplitFFTStage, ::Val{:backward})
+    LA.mul!(stage.input, stage.backward, stage.output)
+    return nothing
+end
+
+function _fft_axis_layout(dims::NTuple{M,Int}, blocks, axis, ::Val{N}) where {M,N}
+    slot = findfirst(==(axis), dims)
+    slot === nothing && return dims
+    blocks[slot] == 1 && return dims
+    free = findfirst(d -> !(d in dims), 1:N)::Int
+    return ntuple(k -> k == slot ? free : dims[k], Val(M))
+end
+
+function FFS.Plans._plan_split_fft(transform::SpectralBackends.AbstractAutoSpectralBackend,
+                                 execution, split, ::Type{T}, ms; kwargs...) where {T}
+    grid = FlowGeometries.Decomposition.global_grid(split)
+    return FFS.Plans._plan_split_fft(FFS._resolve_transform(transform, grid, ms, execution),
+        execution, split, T, ms; kwargs...)
+end
+
+function FFS.Plans._plan_split_fft(::SpectralBackends.AbstractFFTSpectralBackend, execution,
+        split::FlowGeometries.Decomposition.AbstractSplitGrid{N}, ::Type{T}, ms::NTuple{N,Int};
+        batch::Tuple = (), iflag::Int = 1, measure::Bool = true) where {N,T}
+    grid = FlowGeometries.Decomposition.global_grid(split)
+    FlowGeometries.Grids.grid_geometry(grid) isa FlowGeometries.Geometry.AbstractCartesianGeometry &&
+        FlowGeometries.Grids.isuniform(grid) && all(FlowGeometries.Grids.periodic_flags(grid)) &&
+        FlowGeometries.Grids.mask(grid) isa FlowGeometries.Grids.AllActive || throw(ArgumentError(
+            "a block FFT requires an unmasked, uniform periodic Cartesian grid"))
+    ms == size(grid) || throw(ArgumentError("a block FFT requires ms == size(grid) = $(size(grid))"))
+    abs(iflag) == 1 || throw(ArgumentError("iflag must be +1 or -1"))
+    return _split_fft_plan(execution, split, float(T), ms, FlowGeometries.Decomposition.split_dims(split),
+        batch, iflag, measure)
+end
+
+function _split_fft_plan(execution, domain::FlowGeometries.Decomposition.AbstractSplitGrid{N},
+                         ::Type{T}, ms, dims::NTuple{M,Int}, batch, iflag, measure) where {N,T,M}
+    M < N || throw(ArgumentError("a block FFT needs at least one unsplit grid direction"))
+    grid = FlowGeometries.Decomposition.global_grid(domain)
+    ranges = FlowGeometries.Decomposition.map_blocks(b -> b.ranges, domain)
+    blocks = map(d -> length(unique(map(r -> r[d], ranges))), dims)
+    layouts = accumulate((layout, axis) -> _fft_axis_layout(layout, blocks, axis, Val(N)),
+        ntuple(identity, Val(N)); init = dims)
+    initial_dims = first(layouts)
+    physical_split = FlowGeometries.Decomposition.split_grid(grid, execution;
+        dims = initial_dims, blocks, halo = 0)
+    field = FFS.Plans._zero_split_field(physical_split, T, batch)
+
+    sizes = FTB.packed_size(T, ms)
+    axes = map(n -> range(zero(real(T)); step = one(real(T)), length = n), sizes)
+    lattice = FlowGeometries.Grids.StructuredGrid(FlowGeometries.Geometry.CartesianGeometry{real(T)}(),
+        axes...; topology = ntuple(_ -> FlowGeometries.Grids.Periodic(), Val(N)))
+    first_split = FlowGeometries.Decomposition.split_grid(lattice, execution;
+        dims = initial_dims, blocks, halo = 0)
+    first_modes = FFS.Plans._zero_split_field(first_split, Complex{real(T)}, batch)
+    modes = accumulate(layouts; init = first_modes) do previous, dims
+        FlowGeometries.Decomposition.split_dims(FlowGeometries.Decomposition.split_of(previous)) == dims &&
+            return previous
+        layout = FlowGeometries.Decomposition.split_grid(first_split; dims)
+        return FFS.Plans._zero_split_field(layout, Complex{real(T)}, batch)
+    end
+    stages = ntuple(Val(N)) do axis
+        input = axis == 1 ? field : modes[axis]
+        FFS.Plans._split_fft_stage(execution, input, modes[axis], axis; measure)
+    end
+    ks = FFS.Grids.physical_wavenumbers(grid, ms, T)
+    return FFS.Plans.SplitFFTPlan{T,typeof(domain),typeof(field),typeof(modes),typeof(stages),
+        typeof(execution),typeof(batch),typeof(ks)}(domain, field, modes, stages, execution, batch, ks, iflag)
+end
+
+function FFS.calculate_spectrum!(coeffs::FlowGeometries.Decomposition.AbstractSplitField,
+                               plan::FFS.Plans.SplitFFTPlan{T},
+                               field::FlowGeometries.Decomposition.AbstractSplitField) where {T}
+    field === plan.field || FlowGeometries.Decomposition.redistribute!(plan.field, field)
+    if T <: Complex && plan.iflag < 0
+        _conjugate_split!(plan.field)
+    end
+    FFS.Plans._run_split_fft_stage!(plan.execution, first(plan.stages), Val(:forward))
+    FFS.Plans._forward_split_fft!(plan.execution, Base.tail(plan.modes), Base.tail(plan.stages), first(plan.modes))
+    norm = one(real(T)) / prod(size(FlowGeometries.Decomposition.global_grid(plan.domain)))
+    negative = plan.iflag < 0
+    FFS.Plans._foreach_split_field(last(plan.modes)) do _, array
+        if negative
+            array .= conj.(array) .* norm
+        else
+            array .*= norm
+        end
+        return nothing
+    end
+    coeffs === last(plan.modes) || FlowGeometries.Decomposition.redistribute!(coeffs, last(plan.modes))
+    return FFS.wavenumbers(plan)
+end
+
+function _conjugate_split!(field)
+    FFS.Plans._foreach_split_field(field) do _, array
+        array .= conj.(array)
+        return nothing
+    end
+    return nothing
+end
+
+function FFS.Plans.synthesize!(out::FlowGeometries.Decomposition.AbstractSplitField,
+                               inverse::FFS.Plans.SplitFFTSynthesisPlan,
+                               coeffs::FlowGeometries.Decomposition.AbstractSplitField)
+    plan = inverse.forward
+    coeffs === last(plan.modes) || FlowGeometries.Decomposition.redistribute!(last(plan.modes), coeffs)
+    plan.iflag < 0 && _conjugate_split!(last(plan.modes))
+    FFS.Plans._backward_split_fft!(plan.execution, plan.modes, plan.stages)
+    FFS.field_type(inverse) <: Complex && plan.iflag < 0 && _conjugate_split!(plan.field)
+    out === plan.field || FlowGeometries.Decomposition.redistribute!(out, plan.field)
+    return out
+end
+
 end # module FlowFieldSpectraAbstractFFTsExt

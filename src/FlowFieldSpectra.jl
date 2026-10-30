@@ -412,7 +412,8 @@ default) or [`Exclude`](@ref).
 [`preprocess_field`](@ref)); omitting it transforms the field as given, copying nothing. A taper is
 scaled to unit mean square, so Parseval holds on the returned coefficients with no correction applied
 afterwards. `pad > 1` lengthens the grid's axes and scales `ms` by the same factor, so the wavenumber
-spacing narrows.
+spacing narrows. On a host execution backend the call runs through a [`PreprocessedPlan`](@ref), so a slice's
+non-finite values are invalid points, weighed out of its fit, its window's normalization and its quadrature.
 
 # Returns
 `(coeffs, ks_phys)` — the coefficients and the physical wavenumber coordinates per spectral axis.
@@ -431,6 +432,8 @@ function calculate_spectrum(grid::FlowGeometries.Grids.AbstractGrid, field::Abst
         execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
         preprocess::Union{Nothing, Preprocess} = nothing, kwargs...)
     e = _resolve_execution(execution)
+    _one_shot_plan(e, preprocess) &&
+        return _preprocessed_once(grid, field, ms, transform, e, preprocess, kwargs)
     # Zero padding returns a lengthened grid, and the mode counts scale with it.
     gp, fp, scale = preprocess_field(grid, field, preprocess; _quadrature_keywords(values(kwargs))...)
     msp = scale == 1 ? ms : map(m -> max(1, round(Int, scale * m)), ms)
@@ -570,7 +573,7 @@ calculate_spectrum(::SpectralBackends.AbstractFSHTSpectralBackend, exec::Union{C
 # ext — no FastTransforms, runs on any KA device. Structured grid only.
 calculate_spectrum(::SpectralBackends.AbstractFSHTSpectralBackend, exec::ComputationalBackends.AbstractGPUBackend, g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry}, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_gpu_sht(exec, g, field, ms; kwargs...)
-calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::ComputationalBackends.AbstractExecutionBackend, g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, field::AbstractArray, ms::Tuple; kwargs...) =
+calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::ComputationalBackends.AbstractLocalBackend, g::FlowGeometries.Grids.AbstractGrid{<:Grids.SphericalHarmonicGeometry}, field::AbstractArray, ms::Tuple; kwargs...) =
     _calculate_spectrum_nufsht(exec, g, field, ms; kwargs...)
 
 # =============================================================================
@@ -1165,20 +1168,29 @@ function _calculate_spectrum!(coeffs::AbstractArray, t::SpectralBackends.Abstrac
 end
 
 """
-    plan_spectrum(grid, ::Type{T}, ms; transform=AutoSpectralBackend(), execution=AutoBackend(), batch=(), kwargs...)
+    plan_spectrum(grid, ::Type{T}, ms; transform=AutoSpectralBackend(), execution=AutoBackend(), batch=(),
+                  preprocess=nothing, kwargs...)
 
 Reusable [`AbstractSpectralPlan`](@ref) for the fixed geometry of `grid` at resolution `ms`,
 transforming a field with trailing batch shape `batch` of element type `T` in one batched,
 allocation-free execution. Reuse via `calculate_spectrum!(coeffs, plan, field)`.
+
+A `preprocess::Preprocess` is held by the plan ([`PreprocessedPlan`](@ref)): each call detrends, tapers and pads every
+batch slice under that slice's valid points, `calculate_spectrum!(coeffs, plan, field, valid)` or the finite values
+of `field`, on a host execution backend.
 """
 function Plans.plan_spectrum(grid::FlowGeometries.Grids.AbstractGrid, ::Type{T}, ms::Tuple;
         transform::SpectralBackends.AbstractSpectralBackend = SpectralBackends.AutoSpectralBackend(),
         execution::ComputationalBackends.AbstractExecutionBackend = ComputationalBackends.AutoBackend(),
-        batch::Tuple = (), kwargs...) where {T}
+        batch::Tuple = (), preprocess::Union{Nothing, Preprocess} = nothing, kwargs...) where {T}
     e = _resolve_execution(execution)
+    _plan_identity(preprocess) || return _preprocessed_plan(grid, T, ms, transform, e, batch, preprocess, kwargs)
     t = _resolve_transform(transform, grid, ms, e)
     return Plans.plan_spectrum(t, e, grid, T, ms; batch = batch, _analysis_kwargs(t, kwargs)...)
 end
+
+_plan_identity(::Nothing) = true
+_plan_identity(spec::Preprocess) = Preprocessing.is_identity(spec)
 
 """
     plan_synthesis(grid, ::Type{T}, ms; transform=AutoSpectralBackend(), execution=AutoBackend(),
@@ -1611,6 +1623,8 @@ compare_spectra(args...; kwargs...) = throw(ArgumentError("compare_spectra requi
 `using CairoMakie`.
 """
 compare_spectral_analysis(args...; kwargs...) = throw(ArgumentError("compare_spectral_analysis requires CairoMakie. Run `using CairoMakie`."))
+
+include("PreprocessedPlan.jl")
 
 # =============================================================================
 # Precompilation workload (DirectSum + reductions on the array/batch API).

@@ -310,4 +310,40 @@ function FFS.Plans.synthesize!(out::AbstractArray, p::DistributedSynthesisPlan{O
     return out
 end
 
+function FFS.Plans._split_fft_execution(split::FlowGeometries.Decomposition.AbstractWorkerSplit)
+    backends = FlowGeometries.Decomposition.map_blocks(b -> b.execution, split)
+    return ComputationalBackends.DistributedBackend(first(backends))
+end
+
+_hold_fft_state(state) = (Distributed.myid(), Distributed.remotecall(identity, Distributed.myid(), state))
+
+function FFS.Plans._split_fft_stage(::ComputationalBackends.AbstractDistributedBackend,
+                                   input, output, axis; measure)
+    states = if input === output
+        FlowGeometries.Decomposition.map_blocks(FlowGeometries.Decomposition.split_of(input), input) do b, array
+            _hold_fft_state(FFS.Plans._local_fft_stage(array, array, axis, b.execution, measure))
+        end
+    else
+        parts = FlowGeometries.Decomposition.map_blocks(FlowGeometries.Decomposition.split_of(output), output) do _, array
+            _hold_fft_state(array)
+        end
+        outputs = Dict{Int,Distributed.Future}(parts)
+        FlowGeometries.Decomposition.map_blocks(FlowGeometries.Decomposition.split_of(input), input) do b, array
+            target = fetch(outputs[Distributed.myid()])
+            _hold_fft_state(FFS.Plans._local_fft_stage(array, target, axis, b.execution, measure))
+        end
+    end
+    return map(state -> state::Tuple{Int,Distributed.Future}, states)
+end
+
+_run_owned_fft_stage!(state::Distributed.Future, direction) =
+    FFS.Plans._run_local_fft_stage!(fetch(state), direction)
+
+function FFS.Plans._run_split_fft_stage!(::ComputationalBackends.AbstractDistributedBackend, states, direction)
+    @sync for (worker, state) in states
+        @async Distributed.remotecall_wait(_run_owned_fft_stage!, worker, state, direction)
+    end
+    return nothing
+end
+
 end # module FlowFieldSpectraDistributedExt

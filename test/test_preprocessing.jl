@@ -9,6 +9,7 @@ using SpectralBackends: SpectralBackends as SB
 using ComputationalBackends: ComputationalBackends as CB
 using FFTW: FFTW
 using NonuniformFFTs: NonuniformFFTs
+using KernelAbstractions: KernelAbstractions as KA
 using Random: Random
 
 const PP_SER = CB.SerialBackend()
@@ -208,4 +209,86 @@ Test.@testset "Preprocessing composes with the batch axis and the backends" begi
     cf, _ = FFS.calculate_spectrum(g, fb, (N, N); preprocess = spec,
         transform = SB.FFTSpectralBackend(), execution = PP_SER)
     Test.@test maximum(abs, cf .- c) < 1e-12
+end
+
+pp_run(p, args...) = (c = FFS.allocate_coefficients(p); FFS.calculate_spectrum!(c, p, args...); c)
+pp_alloc(c, p, f) = @allocated FFS.calculate_spectrum!(c, p, f)
+
+Test.@testset "A plan holds the preprocessing and weighs out each slice's invalid points" begin
+    Random.seed!(9093)
+    L = 2π
+    M = 80
+    per = (; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    xc, yc = L .* rand(M), L .* rand(M)
+    wc = 0.5 .+ rand(M)
+    gc = FG.Grids.UnstructuredGrid(PP_CART, (xc, yc), wc; per...)
+    f = sin.(xc) .+ 0.3 .* xc .- 0.2 .* yc .+ 0.1 .* randn(M)
+    ms = (8, 8)
+    # Invalid points away from the first point and from either coordinate's extremes, which set the window.
+    bad = setdiff([5, 17, 18, 40, 63], [1, argmin(xc), argmax(xc), argmin(yc), argmax(yc)])
+    keep = setdiff(1:M, bad)
+    gsub = FG.Grids.UnstructuredGrid(PP_CART, (xc[keep], yc[keep]), wc[keep]; per...)
+    valid = trues(M)
+    valid[bad] .= false
+    fn = copy(f)
+    fn[bad] .= NaN
+    for spec in (FFS.Preprocess(; detrend = FFS.Demean()), FFS.Preprocess(; detrend = FFS.LinearDetrend()),
+                 FFS.Preprocess(; detrend = FFS.LinearDetrend(), window = FFS.Tukey(0.5)),
+                 FFS.Preprocess(; detrend = FFS.NoDetrend(), window = FFS.Hann()))
+        p = FFS.plan_spectrum(gc, Float64, ms; transform = PP_DS, execution = PP_SER, preprocess = spec)
+        Test.@test p isa FFS.PreprocessedPlan
+        # Every point valid: the field preprocessed, then the plain transform.
+        gp, fp, _ = FFS.preprocess_field(gc, f, spec)
+        ref, _ = FFS.calculate_spectrum(gp, fp, ms; transform = PP_DS, execution = PP_SER)
+        Test.@test maximum(abs, pp_run(p, f) .- ref) < 1e-13 * maximum(abs, ref)
+        # Non-finite points: the transform over the valid points alone.
+        gs, fs, _ = FFS.preprocess_field(gsub, f[keep], spec)
+        sub, _ = FFS.calculate_spectrum(gs, fs, ms; transform = PP_DS, execution = PP_SER)
+        cn = pp_run(p, fn)
+        Test.@test maximum(abs, cn .- sub) < 1e-12 * maximum(abs, sub)
+        # A `valid` mask gives the same whatever the masked points hold, and the field is never written.
+        fv = copy(f)
+        fv[bad] .= 1e6
+        fv0 = copy(fv)
+        Test.@test pp_run(p, fv, valid) == cn
+        Test.@test fv == fv0
+        Test.@test FFS.calculate_spectrum(gc, fn, ms; transform = PP_DS, execution = PP_SER, preprocess = spec)[1] == cn
+        Test.@test_throws ArgumentError pp_run(p, fill(NaN, M))
+        FFS.close!(p)
+    end
+
+    # Each slice of a batch under its own valid points equals its own run, and a repeated call allocates what the
+    # plain plan's does.
+    spec = FFS.Preprocess(; detrend = FFS.LinearDetrend(), window = FFS.Tukey(0.5))
+    U = hcat(fn, f, ifelse.((1:M) .% 7 .== 0, NaN, f .^ 2))
+    pb = FFS.plan_spectrum(gc, Float64, ms; transform = PP_DS, execution = PP_SER, batch = (3,), preprocess = spec)
+    p1 = FFS.plan_spectrum(gc, Float64, ms; transform = PP_DS, execution = PP_SER, preprocess = spec)
+    cb = pp_run(pb, U)
+    for s in 1:3
+        cs = pp_run(p1, U[:, s])
+        Test.@test maximum(abs, selectdim(cb, ndims(cb), s) .- cs) < 1e-14 * maximum(abs, cs)
+    end
+    plain = FFS.plan_spectrum(gc, Float64, ms; transform = PP_DS, execution = PP_SER, batch = (3,))
+    cpl = pp_run(plain, hcat(f, f, f))
+    pp_alloc(cb, pb, U)
+    pp_alloc(cpl, plain, hcat(f, f, f))
+    Test.@test pp_alloc(cb, pb, U) == pp_alloc(cpl, plain, hcat(f, f, f))
+    foreach(FFS.close!, (pb, p1, plain))
+
+    # A uniform grid's padding embeds each slice in the padded block the inner FFT plan transforms.
+    N = 16
+    g = pp_cart(L, N)
+    xs = pp_unif(L, N)
+    fu = [sin(3x) + 0.2y for x in xs, y in xs]
+    sp = FFS.Preprocess(; detrend = FFS.LinearDetrend(), window = FFS.Hann(), pad = 2.0)
+    gp, fp, sc = FFS.preprocess_field(g, fu, sp)
+    ref, _ = FFS.calculate_spectrum(gp, fp, (2N, 2N); transform = SB.FFTSpectralBackend(), execution = PP_SER)
+    pu = FFS.plan_spectrum(g, Float64, (N, N); transform = SB.FFTSpectralBackend(), execution = PP_SER, preprocess = sp)
+    Test.@test sc == 2.0
+    Test.@test maximum(abs, pp_run(pu, fu) .- ref) < 1e-13 * maximum(abs, ref)
+    FFS.close!(pu)
+
+    # Preprocessing on a plan runs on the host.
+    Test.@test_throws ArgumentError FFS.plan_spectrum(gc, Float64, ms; transform = PP_DS,
+        execution = CB.GPUBackend(KA.CPU()), preprocess = spec)
 end

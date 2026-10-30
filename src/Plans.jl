@@ -170,4 +170,6 @@ frees. A plan over a Julia-only transform holds none, and this does nothing.
 """
 close!(::Union{AbstractSpectralPlan, AbstractSynthesisPlan}) = nothing
 
+include("SplitFFT.jl")
+
 end # module Plans

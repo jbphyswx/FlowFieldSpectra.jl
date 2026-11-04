@@ -40,7 +40,7 @@ const DG_JL = CB.GPUBackend(NoScalarBackend())
 const DG_SER = CB.SerialBackend()
 const DG_DS = SB.DirectSumSpectralBackend()
 dg_rel(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
-dg_uni(L, N) = range(0.0, L; length = N + 1)[1:N]
+dg_uni(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 dg_str(L, N) = [L * (i - 1) / N + 0.05 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
 dg_cart() = FG.Geometry.CartesianGeometry{Float64}()
 dg_sph() = FG.Geometry.SphericalGeometry(1.0)
@@ -68,7 +68,7 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     # Uniform tensor grid, real field.
     N = 8
     xs = dg_uni(L, N)
-    gu = FG.Grids.StructuredGrid(dg_cart(), xs, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gu = FG.Grids.StructuredGrid(dg_cart(), xs, xs)
     fu = [cos(2 * x + y) for x in xs, y in xs]
     cs, _, cd, _ = dg_pair(gu, fu, (N, N))
     Test.@test dg_rel(cd, cs) < 1e-12
@@ -128,8 +128,7 @@ Test.@testset "Cartesian direct sum on JLArrays" begin
     # D = 1 and D = 3 exercise the flat-index decode at both ends.
     for D in (1, 3)
         Nd = D == 3 ? 5 : 10
-        gd = FG.Grids.StructuredGrid(dg_cart(), ntuple(_ -> dg_uni(L, Nd), D)...;
-            topology = ntuple(_ -> FG.Grids.Periodic(), D), period = ntuple(_ -> L, D))
+        gd = FG.Grids.StructuredGrid(dg_cart(), ntuple(_ -> dg_uni(L, Nd), D)...)
         fd = randn(ntuple(_ -> Nd, D)...)
         csd, _, cdd, _ = dg_pair(gd, fd, ntuple(_ -> Nd, D))
         Test.@test dg_rel(cdd, csd) < 1e-12
@@ -175,8 +174,7 @@ function dg_grids(L, N)
     X = [L * (i - 1) / n + 0.1 * L / n * sinpi(2 * (j - 1) / n) for i in 1:n, j in 1:n]
     Y = [L * (j - 1) / n + 0.1 * L / n * cospi(2 * (i - 1) / n) for i in 1:n, j in 1:n]
     return (
-        (FG.Grids.StructuredGrid(dg_cart(), dg_uni(L, N), dg_uni(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
-            period = (L, L)), (N, N)),
+        (FG.Grids.StructuredGrid(dg_cart(), dg_uni(L, N), dg_uni(L, N)), (N, N)),
         (FG.Grids.StructuredGrid(dg_cart(), ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (N, N)),
         (FG.Grids.UnstructuredGrid(dg_cart(), (L .* rand(M), L .* rand(M)), fill(L^2 / M, M);
             topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L)), (N, N)),
@@ -261,8 +259,7 @@ end
 Test.@testset "Spectral reductions of JLArray coefficients equal the host reductions" begin
     Random.seed!(57)
     for (n, halved) in ((32, true), (33, true), (32, false))
-        g = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, n), dg_uni(2π, n); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
-            period = (2π, 2π))
+        g = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, n), dg_uni(2π, n))
         ks = FFS.Grids.physical_wavenumbers(g, (n, n), halved ? Float64 : ComplexF64)
         c = randn(ComplexF64, length(ks[1]), length(ks[2]), 2)
         h = randn(ComplexF64, size(c))
@@ -291,8 +288,7 @@ Test.@testset "Spectral reductions of JLArray coefficients equal the host reduct
     _, Eld = FFS.spherical_energy_spectrum(dg_dev(C))
     Test.@test dg_rel(Eld, El) < 1e-12
     # A device field's one-shot spectrum stays on the device, where the reductions above read it.
-    gc = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, 12), dg_uni(2π, 10); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
-        period = (2π, 2π))
+    gc = FG.Grids.StructuredGrid(dg_cart(), dg_uni(2π, 12), dg_uni(2π, 10))
     f = randn(12, 10, 2)
     cs, ks = FFS.calculate_spectrum(gc, f, (12, 10); transform = DG_DS, execution = DG_SER)
     cd, _ = FFS.calculate_spectrum(gc, dg_dev(f), (12, 10); transform = DG_DS, execution = DG_JL)
@@ -300,8 +296,7 @@ Test.@testset "Spectral reductions of JLArray coefficients equal the host reduct
     Test.@test dg_rel(last(FFS.isotropic_spectrum(ks, cd)), last(FFS.isotropic_spectrum(ks, cs))) < 1e-12
 end
 
-dg_box(L, n, D) = FG.Grids.StructuredGrid(dg_cart(), ntuple(_ -> dg_uni(L, n), D)...;
-    topology = ntuple(_ -> FG.Grids.Periodic(), D), period = ntuple(_ -> L, D))
+dg_box(L, n, D) = FG.Grids.StructuredGrid(dg_cart(), ntuple(_ -> dg_uni(L, n), D)...)
 
 # A device field preprocessed and transformed, the zeroing under a mask, the Welch and coherence
 # estimators and the divergence and vorticity operators, each against the same call on the host copy.

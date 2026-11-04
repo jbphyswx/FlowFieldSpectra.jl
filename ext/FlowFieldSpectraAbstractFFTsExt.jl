@@ -386,7 +386,8 @@ function FFS.Plans._plan_split_fft(::SpectralBackends.AbstractFFTSpectralBackend
     FlowGeometries.Grids.grid_geometry(grid) isa FlowGeometries.Geometry.AbstractCartesianGeometry &&
         FlowGeometries.Grids.isuniform(grid) && all(FlowGeometries.Grids.periodic_flags(grid)) &&
         FlowGeometries.Grids.mask(grid) isa FlowGeometries.Grids.AllActive || throw(ArgumentError(
-            "a block FFT requires an unmasked, uniform periodic Cartesian grid"))
+            "a block FFT requires an unmasked Cartesian grid with a `FlowGeometries.Axes.PeriodicUniformAxis` " *
+            "in every direction"))
     ms == size(grid) || throw(ArgumentError("a block FFT requires ms == size(grid) = $(size(grid))"))
     abs(iflag) == 1 || throw(ArgumentError("iflag must be +1 or -1"))
     return _split_fft_plan(execution, split, float(T), ms, FlowGeometries.Decomposition.split_dims(split),

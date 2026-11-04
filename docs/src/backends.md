@@ -148,8 +148,9 @@ raises.
 - **Use Case**: Traditional uniform Cartesian grids (e.g. models on regular grids), and grids that are
   uniform in some directions and stretched in others (e.g. uniform in `x`/`y`, stretched in `z`).
 - **Mathematical Method**: Fast Fourier Transform (FFT) through the `AbstractFFTs` interface, FFTW or any
-  other implementation. Uniformity is read **per axis** from the axis type
-  (`FlowGeometries.Axes.spacing_trait`: a range axis is uniform). A grid uniform in every direction takes
+  other implementation. Uniformity is read **per direction** from the grid's types
+  (`FlowGeometries.Grids.spacing_trait`): a bounded direction on a range and a periodic direction on a
+  `FlowGeometries.Axes.PeriodicUniformAxis` are uniform. A grid uniform in every direction takes
   the pure FFT. A grid uniform in only some directions takes a **hybrid**
   transform: one FFT across all the uniform axes, then a 1-D type-1 NUFFT along each stretched axis, with
   every other spatial and batch dimension carried as that pass's batch. Axis 1 must be uniform; where it
@@ -169,9 +170,9 @@ raises.
 ```julia
 # uniform in x, stretched in z: FFT along x, 1-D NUFFT along z
 grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(),
-    range(0, 2π; length = Nx + 1)[1:Nx],      # an AbstractRange ⇒ uniform
+    FG.Axes.PeriodicUniformAxis(0.0, 2π, Nx), # Nx equal cells around the period ⇒ uniform
     stretched_z;                              # a Vector ⇒ stretched
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (2π, 2π))
+    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (nothing, 2π))
 coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nz); transform = SB.FFTSpectralBackend())
 ```
 
@@ -218,7 +219,7 @@ coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nz); transform = SB.FFTSpectra
 - **Mathematical Method**: Non-Uniform Fast Spherical Harmonic Transform via `NUFSHT.jl`.
 - **Complexity**: ``O(M \log M + N \log(1/\epsilon))`` (where ``M`` is number of modes, ``N`` is number of points).
 - **Dependencies**: Requires `using NUFSHT`.
-- **Note on Coefficient Recovery**: Because scattered points are unstructured, the quadrature projection (`analysis = Quadrature()`, the default) is not the exact inverse. `analysis = LeastSquares()` fits the coefficients to the scattered data by LSMR least squares, bounded by `maxiter` and `rtol`; `analysis_status(plan)` reports `(; converged, iterations, residual)` for the last call, and a fit that stops short still writes its coefficients. On a masked grid, `inactive = ZeroFill()` (the default) fits the field extended by zero over every node, and `inactive = Exclude()` fits the active nodes as their own point set; neither reads a masked value.
+- **Note on Coefficient Recovery**: Because scattered points are unstructured, the quadrature projection (`analysis = Quadrature()`, the default) is not the exact inverse. `analysis = LeastSquares()` fits the coefficients to the scattered data by LSMR least squares, bounded by `maxiter` and `rtol`; `analysis_status(plan)` reports the last call's `FlowTransformBindings.SolverResult` (`converged`, `iterations`, `residual`), and a fit that stops short still writes its coefficients. On a masked grid, `inactive = ZeroFill()` (the default) fits the field extended by zero over every node, and `inactive = Exclude()` fits the active nodes as their own point set; neither reads a masked value.
 - **NUFFT engine**: `nufft=` picks the NUFFT library NUFSHT runs, `FlowTransformBindings.NonuniformFFTsBackend()` or `FlowTransformBindings.FINUFFTBackend()`; both take real strengths for a real field. The default `AutoSpectralBackend()` takes NonuniformFFTs when it is loaded and FINUFFT when only it is. A reusable plan (`plan_spectrum` + `calculate_spectrum!`) presets the points, the NUFSHT plan and the LSMR workspace once for a fixed point set.
 
 ---

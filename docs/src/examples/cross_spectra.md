@@ -12,13 +12,12 @@ using FlowGeometries: FlowGeometries as FG
 
 L = 2π
 N = 64
-xs = range(0.0, L; length = N + 1)[1:N]
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 u = [cos(2x) + 0.5 * sin(6y) for x in xs, y in xs]     # shared mode at k≈2, own structure at k≈6
 w = [cos(2x) - 0.4 * cos(9x) for x in xs, y in xs]     # shared mode at k≈2, own structure at k≈9
 
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 cu, ks = FFS.calculate_spectrum(grid, u, (N, N); transform = SB.FFTSpectralBackend())
 cw, _ = FFS.calculate_spectrum(grid, w, (N, N); transform = SB.FFTSpectralBackend())
 

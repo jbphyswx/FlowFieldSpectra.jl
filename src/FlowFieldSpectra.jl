@@ -153,16 +153,24 @@ function _padded(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries
     FT = eltype(g)
     ns = size(g)
     np = map(n -> max(n, round(Int, pad * n)), ns)
-    axs = map((ax, n) -> range(FT(first(ax)); step = FT(step(ax)), length = n), FlowGeometries.Grids.coordinates(g),
-        np)
     per = ntuple(d -> FT(FlowGeometries.Grids.period(g, d)) * FT(np[d]) / FT(ns[d]), Val(ndims(g)))
+    axs = map((ax, n, P) -> _padded_axis(FT, ax, n, P), FlowGeometries.Grids.coordinates(g), np, per)
     gp = FlowGeometries.Grids.StructuredGrid(FlowGeometries.Grids.grid_geometry(g), axs...;
-        topology = FlowGeometries.Grids.topology(g), period = per)
+        topology = FlowGeometries.Grids.topology(g), period = map(_given_period, axs, per))
     batch = Grids.field_batch_shape(g, field)
     out = fill!(similar(field, eltype(field), np..., batch...), zero(eltype(field)))
     copyto!(view(out, map(n -> 1:n, ns)..., map(_ -> Colon(), batch)...), reshape(field, ns..., batch...))
     return (gp, out, pad)
 end
+
+# Axis `ax` lengthened to `n` samples at its own step; a `PeriodicUniformAxis` closes the padded period `P`.
+_padded_axis(::Type{FT}, ax::AbstractRange, n::Int, P) where {FT} = range(FT(first(ax)); step = FT(step(ax)), length = n)
+_padded_axis(::Type{FT}, ax::FlowGeometries.Axes.PeriodicUniformAxis, n::Int, P) where {FT} =
+    FlowGeometries.Axes.PeriodicUniformAxis{FT}(first(ax), FlowGeometries.Axes.wrap_sign(ax) * P, n)
+
+# The period a grid is given for an axis: a `PeriodicUniformAxis` carries its own.
+_given_period(::FlowGeometries.Axes.PeriodicUniformAxis, _) = nothing
+_given_period(::AbstractVector, P) = P
 
 # Every other Cartesian grid is transformed as a sum over its points, to which a zero adds nothing: its
 # points become a node grid wrapping at `pad` times each domain length, and the field is scaled by
@@ -595,9 +603,10 @@ calculate_spectrum(::SpectralBackends.AbstractNUFSHTSpectralBackend, exec::Compu
 # conjugation of the whole product.
 # =============================================================================
 
-# Each direction's spacing trait, read from its axis type.
+# Each direction's spacing trait, a periodic direction's wrap included (`Grids.spacing_trait`): an FFT
+# samples one period at its axis's step, which only a `PeriodicUniformAxis` states.
 _spacing_traits(g::FlowGeometries.Grids.AbstractStructuredGrid) =
-    map(FlowGeometries.Axes.spacing_trait, FlowGeometries.Grids.coordinates(g))
+    map(v -> FlowGeometries.Grids.spacing_trait(g, v), ntuple(Val, Val(ndims(g))))
 
 # The entries of `xs` at the directions whose trait is an `S`, in order. Selected by dispatch on the traits,
 # so the result's length is fixed by the grid's type.
@@ -1633,10 +1642,8 @@ PrecompileTools.@setup_workload begin
     T = Float64
     PrecompileTools.@compile_workload begin
         # Cartesian 2D DirectSum on a uniform grid with a small batch.
-        ax = range(zero(T), T(10); length = 9)[1:8]
-        cart = FlowGeometries.Grids.StructuredGrid(FlowGeometries.Geometry.CartesianGeometry{T}(), ax, ax;
-            topology = (FlowGeometries.Grids.Periodic(), FlowGeometries.Grids.Periodic()),
-            period = (T(10), T(10)))
+        ax = FlowGeometries.Axes.PeriodicUniformAxis(zero(T), T(10), 8)
+        cart = FlowGeometries.Grids.StructuredGrid(FlowGeometries.Geometry.CartesianGeometry{T}(), ax, ax)
         u = rand(T, 8, 8, 2)
         c, k = calculate_spectrum(cart, u, (4, 4); transform = SpectralBackends.DirectSumSpectralBackend(), execution = ComputationalBackends.SerialBackend())
         isotropic_spectrum(k, c; num_bins = 2)

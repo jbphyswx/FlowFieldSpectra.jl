@@ -19,13 +19,12 @@ Random.seed!(42)
 L = 2π
 N = 64
 dx = L / N
-xs = range(0.0, L; length = N + 1)[1:N]
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 field(x, y) = cos(3x) + 0.6 * sin(5y) + 0.4 * cos(2x + 4y)
 
 # Reference spectrum on the full uniform grid (a plain (N, N) field tensor).
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 F = [field(x, y) for x in xs, y in xs]
 c_fft, k_fft = FFS.calculate_spectrum(grid, F, (N, N); transform = SB.FFTSpectralBackend())
 k_ref, E_ref = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 24)

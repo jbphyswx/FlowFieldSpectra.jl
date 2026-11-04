@@ -22,9 +22,8 @@ function run_execution_backends_example()
 
     L = 2π
     N = 96
-    xs = range(0.0, L; length = N + 1)[1:N]
-    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
     ms = (N, N)
 
     # A broadband field with a k^-5/3 cascade — built and kept as a plain (N, N) tensor.

@@ -17,7 +17,7 @@ using ComputationalBackends: ComputationalBackends as CB
 
 const SP_SER = CB.SerialBackend()
 sp_cart() = FG.Geometry.CartesianGeometry{Float64}()
-sp_uni(L, N) = range(0.0, L; length = N + 1)[1:N]
+sp_uni(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 sp_str(L, N) = collect(sp_uni(L, N)) .+ (0.03 * L / N) .* sinpi.(2 .* (0:(N - 1)) ./ N)
 
 # The plan against the allocating `synthesize`, executed twice, leaving the caller's coefficients intact.
@@ -40,8 +40,7 @@ Test.@testset "Cartesian synthesis plans" begin
     Random.seed!(81)
     L = 2π
     N = 8
-    gu = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N);
-        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gu = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N))
     gs = FG.Grids.StructuredGrid(sp_cart(), sp_str(L, N), sp_str(L, N);
         topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
 
@@ -76,8 +75,7 @@ Test.@testset "FFT synthesis against the direct-sum synthesis" begin
     L = 2π
     for ns in ((10,), (8, 6), (6, 4, 5)), T in (Float64, ComplexF64), iflag in (1, -1)
         D = length(ns)
-        g = FG.Grids.StructuredGrid(sp_cart(), map(n -> sp_uni(L, n), ns)...;
-            topology = ntuple(_ -> FG.Grids.Periodic(), D), period = ntuple(_ -> L, D))
+        g = FG.Grids.StructuredGrid(sp_cart(), map(n -> sp_uni(L, n), ns)...)
         c, _ = FFS.calculate_spectrum(g, randn(T, ns..., 2), ns; transform = SB.DirectSumSpectralBackend(),
             execution = SP_SER, iflag)
         ref = FFS.synthesize(T, g, c, ns; transform = SB.DirectSumSpectralBackend(), execution = SP_SER, iflag)
@@ -111,8 +109,7 @@ Test.@testset "Device synthesis plans" begin
     dev = CB.GPUBackend(KA.CPU())
     L = 2π
     N = 8
-    gu = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N);
-        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gu = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N))
     for (f, batch, T) in ((randn(N, N), (), Float64), (randn(N, N, 2), (2,), Float64),
                           (randn(ComplexF64, N, N), (), ComplexF64))
         sp_agrees(gu, f, (N, N), T; batch = batch,
@@ -154,8 +151,7 @@ Test.@testset "A synthesis plan is fixed to its shape" begin
     Random.seed!(83)
     L = 2π
     N = 8
-    g = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N);
-        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    g = FG.Grids.StructuredGrid(sp_cart(), sp_uni(L, N), sp_uni(L, N))
     p = FFS.plan_synthesis(g, Float64, (N, N); transform = SB.FFTSpectralBackend())
     out = FFS.allocate_field(p)
     c, _ = FFS.calculate_spectrum(g, randn(N, N), (N, N); transform = SB.FFTSpectralBackend())

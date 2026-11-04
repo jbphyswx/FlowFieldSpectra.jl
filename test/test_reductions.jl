@@ -54,7 +54,7 @@ Test.@testset "Radial reductions: cutoff, estimators and default bins" begin
     n1, n2 = 12, 10
     xax = ucg_axis(Float64, L, n1)
     yax = sort(rand(n2)) .* L
-    gn = FG.Grids.StructuredGrid(_cg(Float64), xax, yax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gn = FG.Grids.StructuredGrid(_cg(Float64), xax, yax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (nothing, L))
     ms = (n1, 8)
     fn = randn(n1, n2)
     for (t, kw, tol) in ((SB.DirectSumSpectralBackend(), (;), 1e-12), (FTB.FINUFFTBackend(), (; eps = 1e-13), 1e-10))

@@ -20,10 +20,9 @@ function run_nufft_coastline_example()
 
     L = 2π
     N = 64
-    xs = range(0.0, L; length = N + 1)[1:N]
-    ys = range(0.0, L; length = N + 1)[1:N]
-    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
-        topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+    ys = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+    grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys)
     field(x, y) = cos(3x) + 0.6 * sin(5y) + 0.4 * cos(2x + 4y)
     f_grid = [field(x, y) for x in xs, y in ys]         # (N, N) tensor
 

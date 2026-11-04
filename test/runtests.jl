@@ -37,12 +37,10 @@ parseval(ks::Tuple, c::AbstractArray) =
 _periodic(n) = ntuple(_ -> FG.Grids.Periodic(), length(n))
 
 # Uniform Cartesian grid from per-axis point counts + periodic domain lengths.
-function ucg(::Type{T}, domain::Tuple, n::Tuple) where {T}
-    axes = map((L, m) -> range(zero(T), T(L); length = m + 1)[1:m], domain, n)
-    return FG.Grids.StructuredGrid(_cg(T), axes...; topology = _periodic(n), period = T.(domain))
-end
+ucg(::Type{T}, domain::Tuple, n::Tuple) where {T} =
+    FG.Grids.StructuredGrid(_cg(T), map((L, m) -> ucg_axis(T, L, m), domain, n)...)
 ucg(domain::Tuple, n::Tuple) = ucg(Float64, domain, n)
-ucg_axis(::Type{T}, domain, n) where {T} = range(zero(T), T(domain); length = n + 1)[1:n]  # matching axis values
+ucg_axis(::Type{T}, domain, n) where {T} = FG.Axes.PeriodicUniformAxis{T}(zero(T), T(domain), n)  # matching axis values
 
 # Nonuniform-gridded Cartesian (stretched axes + periodic domain).
 nucg(::Type{T}, axes::Tuple, domain::Tuple) where {T} =

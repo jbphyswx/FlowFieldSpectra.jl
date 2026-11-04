@@ -15,7 +15,7 @@ using FlowGeometries: FlowGeometries as FG
 
 L = 2π
 N = 128
-xs = range(0.0, L; length = N + 1)[1:N]
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 # Synthetic incompressible turbulence: build a broadband streamfunction ψ, then derive the
 # velocity by spectral differentiation u = ∂ψ/∂y, v = -∂ψ/∂x (so ∇·u = 0 by construction).
@@ -30,8 +30,7 @@ end
 u = real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N]))    # (N, N) field tensors
 v = real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N]))
 
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 
 # Spectral operators: divergence ≈ 0 (incompressible); vorticity → enstrophy spectrum.

@@ -5,8 +5,8 @@
 # grid's weights. A grid whose per-node measures vary is the case that separates a weighted transform from
 # an unweighted one.
 #
-# `analysis = LeastSquares()` is the least-squares fit `A c ≈ f`, recovering the coefficients a field was
-# synthesized from.
+# `analysis = LeastSquares()` is the fit `min Σⱼ wⱼ |(A c − f)ⱼ|²` under the grid's weights, recovering the
+# coefficients a field was synthesized from.
 
 using Test: Test
 using FlowFieldSpectra: FlowFieldSpectra as FFS
@@ -127,10 +127,41 @@ Test.@testset "NUFSHT solve consumes the raw field" begin
     # The quadrature reports no fit, and a backend computing the quadrature alone refuses the fit.
     g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φlat), fill(4π / N, N))
     pq = FFS.plan_spectrum(g, Float64, (Nθ, Nφ); transform = SP_NU)
-    Test.@test FFS.analysis_status(pq) == (; converged = true, iterations = 0, residual = 0.0)
+    Test.@test !applicable(FFS.analysis_status, pq)
     FFS.close!(pq)
     Test.@test_throws ArgumentError FFS.calculate_spectrum(g, fv, (Nθ, Nφ); transform = SP_DS,
         analysis = FFS.LeastSquares())
+end
+
+Test.@testset "NUFSHT's fit weighs each node by the grid's weight" begin
+    # A field above degree `lmax` on nodes of unequal weight: the fit is `(AᵀWA)⁻¹AᵀWf` of the dense basis
+    # the direct sum synthesizes, apart from the unweighted `A \ f`.
+    lmax = 3
+    ms = (lmax + 1, 2 * lmax + 1)
+    N = 400
+    λ, φlat, z = sp_nodes(N)
+    w = [1.0 + 0.8 * sin(λ[i])^2 + 0.5 * z[i] for i in 1:N]
+    g = FG.Grids.UnstructuredGrid(FG.Geometry.SphericalGeometry(1.0), (λ, φlat), w)
+    f = [exp(z[i]) * cos(5 * λ[i]) + z[i]^6 for i in 1:N]
+    slots = [FFS.sph_mode_index(l, m) for l in 0:lmax for m in -l:l]
+    A = zeros(N, length(slots))
+    for (j, s) in enumerate(slots)
+        e = zeros(ms)
+        e[s] = 1
+        A[:, j] = FFS.synthesize(g, e, ms; transform = SP_DS, execution = SP_SER)
+    end
+    cw = (A' * (w .* A)) \ (A' * (w .* f))
+    cu = A \ f
+    Test.@test maximum(abs, cw .- cu) > 1e-3 * maximum(abs, cw)
+    for exec in (SP_SER, CB.GPUBackend(KA.CPU()))
+        p = FFS.plan_spectrum(g, Float64, ms; transform = SP_NU, execution = exec, analysis = FFS.LeastSquares(),
+            rtol = 1.0e-12, maxiter = 2000)
+        cs = FFS.allocate_coefficients(p)
+        FFS.calculate_spectrum!(cs, p, f)
+        Test.@test maximum(abs, cs[slots] .- cw) < 1e-9 * maximum(abs, cw)
+        Test.@test FFS.analysis_status(p).converged
+        FFS.close!(p)
+    end
 end
 
 Test.@testset "NUFSHT on a structured spherical grid" begin

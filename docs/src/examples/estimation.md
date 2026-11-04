@@ -41,7 +41,7 @@ using FlowGeometries: FlowGeometries as FG
 
 Nx = 256
 L = 2π
-x = range(0.0, L; length = Nx + 1)[1:Nx]
+x = FG.Axes.PeriodicUniformAxis(0.0, L, Nx)
 freq = [0:(Nx ÷ 2 - 1); -(Nx ÷ 2):-1]
 bg = real(FFTW.ifft(FFTW.fft(randn(Nx)) .* [k == 0 ? 0.0 : abs(k)^(-1.0) for k in freq]))
 k0 = 20
@@ -49,8 +49,7 @@ sig = @. 0.25 * cos(k0 * x) + bg            # tone at k₀ on a k⁻² (red-nois
 
 K = 6
 V = FFS.dpss(Nx, 4.0, K)                    # N×K tapers, unit mean square (NW = 4)
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x; topology = FG.Grids.Periodic(),
-    period = (L,))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x)
 C = zeros(ComplexF64, Nx ÷ 2 + 1, K)        # a real field's packed half
 for k in 1:K
     c, ks1 = FFS.calculate_spectrum(grid, V[:, k] .* sig, (Nx,); transform = SB.FFTSpectralBackend())

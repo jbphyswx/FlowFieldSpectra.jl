@@ -49,8 +49,8 @@ Test.@testset "A uniform grid transformed below its own length widens its even a
     Random.seed!(64)
     L = 2π
     N = 12
-    ax = range(0.0, L; length = N + 1)[1:N]
-    g = FG.Grids.StructuredGrid(dp_cart(), ax, ax; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    ax = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+    g = FG.Grids.StructuredGrid(dp_cart(), ax, ax)
     f = randn(N, N)
     for (ms, box) in (((8, 8), (9, 9)), ((7, 8), (7, 9)), ((8, 6), (9, 7)))
         c, ks = FFS.calculate_spectrum(g, f, ms; transform = DP_DS, execution = DP_SER)

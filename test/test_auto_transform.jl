@@ -20,8 +20,8 @@ const AT_SER = CB.SerialBackend()
 at_rel(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
 at_auto(g, ms, exec = AT_SER) = FFS._resolve_transform(SB.AutoSpectralBackend(), g, ms, exec)
 
-# A uniform axis is an `AbstractRange` by type; a collected copy of one is stretched.
-at_unif(L, N) = range(0.0, L; length = N + 1)[1:N]
+# A periodic axis is uniform around its wrap by type, as a `PeriodicUniformAxis`; a `Vector` is stretched.
+at_unif(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 at_stretch(L, N) = [L * (i - 1) / N + 0.03 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
 
 Test.@testset "Auto picks the fast Cartesian transform and agrees with the direct sum" begin
@@ -29,9 +29,9 @@ Test.@testset "Auto picks the fast Cartesian transform and agrees with the direc
     L = 2π
     N = 8
     cart = FG.Geometry.CartesianGeometry{Float64}()
-    gu = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
-    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
-    gs = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gu = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N))
+    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (nothing, L))
+    gs = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, nothing))
     ga = FG.Grids.StructuredGrid(cart, at_stretch(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
     cloud = FG.Grids.UnstructuredGrid(cart, (L .* rand(50), L .* rand(50)), fill(L^2 / 50, 50);
         topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
@@ -85,8 +85,8 @@ Test.@testset "Auto on the in-place and plan entries" begin
     L = 2π
     N = 8
     cart = FG.Geometry.CartesianGeometry{Float64}()
-    g = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
-    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    g = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_unif(L, N))
+    gh = FG.Grids.StructuredGrid(cart, at_unif(L, N), at_stretch(L, N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (nothing, L))
     M = 60
     cloud = FG.Grids.UnstructuredGrid(cart, (L .* rand(M), L .* rand(M)), fill(L^2 / M, M);
         topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))

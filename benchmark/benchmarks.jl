@@ -14,7 +14,7 @@ using LinearAlgebra: LinearAlgebra
 const SUITE = BenchmarkGroup()
 const CARTGEOM = FG.Geometry.CartesianGeometry{Float64}()
 const PER2 = (FG.Grids.Periodic(), FG.Grids.Periodic())
-_uaxis(L, N) = range(0.0, L; length = N + 1)[1:N]
+_uaxis(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 # =============================================================================
 # Cartesian uniform grid (tensor field): DirectSum vs FFTW.
@@ -24,7 +24,7 @@ for N in [64, 128, 256]
     SUITE["cartesian_uniform"]["N=$N"] = BenchmarkGroup()
     L = 10.0
     xs = _uaxis(L, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs)
     u = [cos(2π * 2 * x / L + 2π * y / L) + 0.5 * sin(2π * (-3) * x / L + 2π * 2 * y / L) for x in xs, y in xs]
     v = [sin(2π * 2 * x / L + 2π * y / L) for x in xs, y in xs]
     uv = cat(u, v; dims = 3)
@@ -108,7 +108,7 @@ let
     N = 128
     ms = (N, N)
     xs = _uaxis(L, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs)
     u = [cos(2π * 2 * x / L + 2π * y / L) for x in xs, y in xs]
     v = [sin(2π * 2 * x / L + 2π * y / L) for x in xs, y in xs]
     coeffs, ks = FFS.calculate_spectrum(g, cat(u, v; dims = 3), ms; transform = SB.FFTSpectralBackend())
@@ -141,7 +141,7 @@ SUITE["plans"] = BenchmarkGroup()
 for N in [128, 256, 512]
     SUITE["plans"]["fft_N=$N"] = BenchmarkGroup()
     xs = _uaxis(2π, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (2π, 2π))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs)
     Random.seed!(1)
     f = randn(N, N)
     ms = (N, N)
@@ -158,7 +158,7 @@ for N in [64, 128, 256]
     L = 2π
     uni = _uaxis(L, N)
     str = [L * (i - 1) / N + 0.04 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
-    g = FG.Grids.StructuredGrid(CARTGEOM, uni, str; topology = PER2, period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, uni, str; topology = PER2, period = (nothing, L))
     Random.seed!(2)
     f = randn(N, N)
     ms = (N, N)
@@ -289,7 +289,7 @@ SUITE["defaults"] = BenchmarkGroup()
 let nt = Threads.nthreads()
     N, L = 1024, 10.0
     xs = _uaxis(L, N)
-    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs; topology = PER2, period = (L, L))
+    g = FG.Grids.StructuredGrid(CARTGEOM, xs, xs)
     Random.seed!(3)
     u, v = randn(N, N), randn(N, N)
     pr = FFTW.plan_rfft(u; num_threads = nt)

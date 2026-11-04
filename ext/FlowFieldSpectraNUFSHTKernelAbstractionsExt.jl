@@ -24,22 +24,22 @@ FFS._available(::FFS._DeviceNUFSHT) = true
 Device-resident reusable NUFSHT plan (GPU execution): the device NUFSHT plan over the nodes its
 `inactive` holds, carrying `C` transforms per execution, the device field and coefficient buffers, the
 host staging for a host field or coefficient array, those nodes' indices and which of them read the
-field, their device quadrature weights or the device LSMR workspace of a fit, and NUFSHT's report of the
-last fit. Built once for a fixed point set + batch shape; reuse via `calculate_spectrum!`.
+field, their device quadrature weights or a fit's operator weighted by them and its LSMR workspace, and
+NUFSHT's report of the last fit. Built once for a fixed point set + batch shape; reuse via `calculate_spectrum!`.
 """
-struct NUFSHTSphericalGPUPlan{T, CT, NB, A, P, FD, FH, CD, HB, WS, QW, AC, AD, LV, LD, KS} <: FFS.AbstractSpectralPlan
+struct NUFSHTSphericalGPUPlan{T, CT, NB, A, P, FD, FH, CD, HB, WS, QW, AC, AD, LV, LD, KS, ST} <: FFS.AbstractSpectralPlan
     plan::P            # device-resident NUFSHT plan over the held nodes, ntrans = C
     fd::FD             # device (n, C) field buffer at the held nodes
     fh::FH             # host (n, C) staging for a host field's held nodes or a complex field's component
     Cd::CD             # device (Nθ, Nφ, C) real coeff buffer
     Cr_host::HB        # host (Nθ, Nφ, C) copy of `Cd` for a host coefficient array
     ws::WS             # device FTB.LSMRWorkspace of a fit; `nothing` for a quadrature
-    wd::QW             # device (n,) the held nodes' quadrature weights; `nothing` for a fit
+    wd::QW             # device (n,) the held nodes' quadrature weights, or a fit's `FTB.RangeWeighted(plan, w)`
     act::AC            # host indices of the held nodes, `nothing` for every node
     actd::AD           # the same indices on the device
     live::LV           # host flag per held node, whether it reads the field; `nothing` where every one does
     lived::LD          # the same flags on the device
-    status::Base.RefValue{FFS.Plans.AnalysisStatus{T}}  # NUFSHT's report of the last call
+    status::ST         # NUFSHT's report of the last fit, a `Base.RefValue`; `nothing` for a quadrature
     N::Int             # the grid's node count, the field's stride between batch slices
     lmax::Int
     Nθ::Int
@@ -57,16 +57,25 @@ end
 Base.show(io::IO, p::NUFSHTSphericalGPUPlan{T}) where {T} =
     print(io, "NUFSHTSphericalGPUPlan{", T, "}(lmax=", p.lmax, ", B=", p.B, ", ", nameof(typeof(p.analysis)), ")")
 
-# What an analysis holds: a fit's LSMR workspace, a quadrature's weights at the held nodes in the plan's
-# memory.
-_fit_workspace(::FFS.Quadrature, plan) = nothing
-_fit_workspace(::FFS.LeastSquares, plan) = FTB.LSMRWorkspace(plan)
-_held_weights(::FFS.Quadrature, backend, w) = copyto!(KA.allocate(backend, eltype(w), length(w)), w)
-_held_weights(::FFS.LeastSquares, backend, w) = nothing
+# What an analysis holds, in the plan's memory: a quadrature's weights at the held nodes; a fit's operator
+# weighted by them, which LSMR solves as `min Σⱼ wⱼ |(A c − f)ⱼ|²`, and its LSMR workspace.
+_held_weights(::FFS.Quadrature, backend, w, _plan) = copyto!(KA.allocate(backend, eltype(w), length(w)), w)
+_held_weights(::FFS.LeastSquares, backend, w, plan) =
+    FTB.RangeWeighted(plan, copyto!(KA.allocate(backend, eltype(w), length(w)), w))
+_fit_workspace(::FFS.Quadrature, _wd) = nothing
+_fit_workspace(::FFS.LeastSquares, op) = FTB.LSMRWorkspace(op)
 
-# The report `nusht_analyze!` returns, in the plan's real type.
-_status(r, ::Type{T}) where {T} =
-    FFS.Plans.AnalysisStatus{T}((Bool(r.converged), Int(r.iterations), T(r.residual)))
+# One staged chunk of slices into `p.Cd`.
+_analyze_chunk!(::FFS.Quadrature, p) = NUFSHT.nusht_analyze!(p.Cd, p.fd, p.plan; weights = p.wd)
+_analyze_chunk!(::FFS.LeastSquares, p) =
+    NUFSHT.nusht_solve!(p.Cd, p.fd, p.wd; ws = p.ws, maxiter = p.maxiter, rtol = p.rtol)
+
+# A fit's report of one chunk, in the plan's real type; the quadrature has none. A plan's record before its first fit.
+_chunk_status(::FFS.Quadrature, _r, ::Type) = nothing
+_chunk_status(::FFS.LeastSquares, r, ::Type{T}) where {T} =
+    FTB.SolverResult{T}(Bool(r.converged), Int(r.iterations), T(r.residual))
+_status_ref(::FFS.Quadrature, ::Type) = nothing
+_status_ref(::FFS.LeastSquares, ::Type{T}) where {T} = Ref(FTB.SolverResult{T}(false, 0, zero(T)))
 
 function _nusht_gpu_plan(::Type{CT}, ::Type{FT}, exec, g, ms::Tuple, batch::NTuple{NB, Int};
         tol::Real, analysis::FFS.AbstractAnalysis, maxiter::Int, rtol::Real, nufft, batch_chunk::Int,
@@ -75,8 +84,9 @@ function _nusht_gpu_plan(::Type{CT}, ::Type{FT}, exec, g, ms::Tuple, batch::NTup
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-    θ, φ, w = FFS.DirectSum._sph_point_data(g, FT; sampling,
-        weights = FFS.Grids._inactive_weights(inactive, g, FT; sampling, weights))
+    θp, φp = FFS.Grids._sph_points(g)
+    θ, φ = FT.(θp), FT.(φp)
+    w = FFS.Grids._analysis_weights(analysis, inactive, g, FT; sampling, weights)
     N = length(θ)
     act, live = FFS.Grids._transform_nodes(inactive, g, analysis)
     n = act === nothing ? N : length(act)
@@ -89,16 +99,17 @@ function _nusht_gpu_plan(::Type{CT}, ::Type{FT}, exec, g, ms::Tuple, batch::NTup
         fh = zeros(FT, n, C)
         Cd = KA.zeros(backend, FT, Nθ, Nφ, C)
         Cr_host = zeros(FT, Nθ, Nφ, C)
-        ws = _fit_workspace(analysis, plan)
-        wd = _held_weights(analysis, backend, FFS.Grids._at_points(collect(FT, w), act))
+        wd = _held_weights(analysis, backend, FFS.Grids._at_points(collect(FT, w), act), plan)
+        ws = _fit_workspace(analysis, wd)
         actd = act === nothing ? nothing : copyto!(KA.allocate(backend, Int, n), act)
         lived = live === nothing ? nothing : copyto!(KA.allocate(backend, Bool, n), collect(Bool, live))
         ks = (0:lmax, -lmax:lmax)
+        st = _status_ref(analysis, FT)
         return NUFSHTSphericalGPUPlan{FT, CT, NB, typeof(analysis), typeof(plan), typeof(fd), typeof(fh),
                 typeof(Cd), typeof(Cr_host), typeof(ws), typeof(wd), typeof(act), typeof(actd), typeof(live),
-                typeof(lived), typeof(ks)}(
-            plan, fd, fh, Cd, Cr_host, ws, wd, act, actd, live, lived, Ref(FFS.Plans._quadrature_status(FT)),
-            N, lmax, Nθ, Nφ, batch, B, C, analysis, maxiter, FT(rtol), ks)
+                typeof(lived), typeof(ks), typeof(st)}(
+            plan, fd, fh, Cd, Cr_host, ws, wd, act, actd, live, lived, st, N, lmax, Nθ, Nφ, batch, B, C, analysis,
+            maxiter, FT(rtol), ks)
     catch
         NUFSHT.close!(plan)
         rethrow()
@@ -108,8 +119,11 @@ end
 FFS.Plans.coefficient_size(p::NUFSHTSphericalGPUPlan) = (p.Nθ, p.Nφ, p.batch...)
 FFS.Plans.coefficient_type(::NUFSHTSphericalGPUPlan{T, CT}) where {T, CT} = CT
 FFS.Plans.wavenumbers(p::NUFSHTSphericalGPUPlan) = p.ks
-FFS.Plans.analysis_status(p::NUFSHTSphericalGPUPlan) = p.status[]
 FFS.Plans.close!(p::NUFSHTSphericalGPUPlan) = (NUFSHT.close!(p.plan); nothing)
+
+const _FittingPlan = NUFSHTSphericalGPUPlan{T, CT, NB, <:FFS.LeastSquares} where {T, CT, NB}
+FFS.Plans.analysis_status(p::_FittingPlan) = p.status[]
+FFS.Plans.analysis_status(pp::FFS.PreprocessedPlan{<:_FittingPlan}) = FFS.Plans.analysis_status(pp.inner)
 
 """
     plan_spectrum(NUFSHTSpectralBackend(), GPUBackend(dev), grid, T, ms; batch=(), tol, analysis=Quadrature(),
@@ -139,7 +153,7 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, plan::NUFSHTSp
     s = _nusht_gpu_pass!(coeffs, plan, field, real, one(T))
     eltype(field) <: Real ||
         (s = FFS.Plans._combine_status(s, _nusht_gpu_pass!(coeffs, plan, field, imag, im)))
-    plan.status[] = s
+    FFS.Plans._record!(plan.status, s)
     return plan.ks
 end
 
@@ -194,19 +208,21 @@ end
 # `coeffs` at weight `scale`; returns NUFSHT's report over the chunks. NUFSHT's transform is real and
 # linear, so a real field runs this once with `real` (the identity on it) at weight 1, and a complex field
 # runs it again with `imag` at weight `im`. NUFSHT's slots above degree `lmax` are zero, as FFS's are.
-function _nusht_gpu_pass!(coeffs, plan::NUFSHTSphericalGPUPlan{T}, field, part, scale) where {T}
-    C = plan.C
+function _nusht_gpu_pass!(coeffs, plan::NUFSHTSphericalGPUPlan, field, part, scale)
     Cc = reshape(coeffs, plan.Nθ, plan.Nφ, plan.B)
-    s = FFS.Plans._quadrature_status(T)
-    for lo in 1:C:plan.B
-        nvalid = min(C, plan.B - lo + 1)
-        _stage_chunk!(plan, field, part, lo, nvalid)
-        r = NUFSHT.nusht_analyze!(plan.Cd, plan.fd, plan.plan; weights = plan.wd, ws = plan.ws,
-            maxiter = plan.maxiter, rtol = plan.rtol)
-        s = FFS.Plans._combine_status(s, _status(r, T))
-        view(Cc, :, :, lo:(lo + nvalid - 1)) .+= scale .* view(_coeffs_like(Cc, plan), :, :, 1:nvalid)
+    s = _nusht_gpu_chunk!(Cc, plan, field, part, scale, 1)
+    for lo in (1 + plan.C):plan.C:plan.B
+        s = FFS.Plans._combine_status(s, _nusht_gpu_chunk!(Cc, plan, field, part, scale, lo))
     end
     return s
+end
+
+function _nusht_gpu_chunk!(Cc, plan::NUFSHTSphericalGPUPlan{T}, field, part, scale, lo::Int) where {T}
+    nvalid = min(plan.C, plan.B - lo + 1)
+    _stage_chunk!(plan, field, part, lo, nvalid)
+    r = _analyze_chunk!(plan.analysis, plan)
+    view(Cc, :, :, lo:(lo + nvalid - 1)) .+= scale .* view(_coeffs_like(Cc, plan), :, :, 1:nvalid)
+    return _chunk_status(plan.analysis, r, T)
 end
 
 # The plan's coefficients in the memory of `A`: `Cd` itself beside a device array, its host copy beside a

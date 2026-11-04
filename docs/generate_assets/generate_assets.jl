@@ -22,13 +22,12 @@ const ASSETS_DIR = joinpath(@__DIR__, "..", "src", "assets")
 mkpath(ASSETS_DIR)
 
 const CART = FG.Geometry.CartesianGeometry{Float64}()
-# Uniform periodic Cartesian grid over the given axes (FlowGeometries StructuredGrid).
-ucg(axes...; L) = FG.Grids.StructuredGrid(CART, axes...;
-    topology = map(_ -> FG.Grids.Periodic(), axes), period = map(_ -> L, axes))
+# Uniform periodic Cartesian grid over the given `PeriodicUniformAxis` axes (FlowGeometries StructuredGrid).
+ucg(axes...) = FG.Grids.StructuredGrid(CART, axes...)
 # Scattered periodic Cartesian grid (unused per-node measure = ones).
 scg(coords::Tuple; L) = FG.Grids.UnstructuredGrid(CART, coords, ones(length(coords[1]));
     topology = map(_ -> FG.Grids.Periodic(), coords), period = map(_ -> L, coords))
-_uaxis(L, N) = range(0.0, L; length = N + 1)[1:N]
+_uaxis(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 # A full wavenumber axis in ascending order and `A` permuted to match along dim `d`: the transforms keep
 # FFT order, negative wavenumbers last, and a heatmap needs ascending coordinates.
@@ -91,7 +90,7 @@ function generate_cartesian_figure()
     # Broadband, incompressible "turbulence" with a k^{-5/3} energy cascade.
     u, v, _ = synthetic_incompressible(N, L; seed = 7)
 
-    cart_grid = ucg(xs, xs; L = L)
+    cart_grid = ucg(xs, xs)
     c_fft, k_fft = FFS.calculate_spectrum(cart_grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
     # Kinetic-energy isotropic spectrum: fold the component axis (dim 3) into the energy.
     k_bins, E_k = FFS.isotropic_spectrum(k_fft, c_fft; num_bins = 40, dims = 3)
@@ -179,7 +178,7 @@ function generate_parity_figure()
     xs = _uaxis(L, N)
 
     f = synthetic_field(N; slope = 5 / 3, seed = 2)
-    parity_grid = ucg(xs, xs; L = L)
+    parity_grid = ucg(xs, xs)
     c_direct, ks = FFS.calculate_spectrum(parity_grid, f, (N, N); transform = SB.DirectSumSpectralBackend())
     c_fft, _ = FFS.calculate_spectrum(parity_grid, f, (N, N); transform = SB.FFTSpectralBackend())
     diff = abs.(c_direct .- c_fft)
@@ -227,7 +226,7 @@ function generate_nufft_coastline_figure()
     interp = let f = fld
         (x, y) -> f[clamp(round(Int, x / dx) + 1, 1, N), clamp(round(Int, y / dx) + 1, 1, N)]
     end
-    grid = ucg(xs, xs; L = L)
+    grid = ucg(xs, xs)
     c_ref, k_ref = FFS.calculate_spectrum(grid, fld, (N, N); transform = SB.FFTSpectralBackend())
     kr, E_ref = FFS.isotropic_spectrum(k_ref, c_ref; num_bins = 28)
 
@@ -270,7 +269,7 @@ function generate_anisotropy_figure()
     N = 128
     xs = _uaxis(L, N)
     g = synthetic_field(N; slope = 0.6, aniso = 3.5, seed = 5)
-    grid = ucg(xs, xs; L = L)
+    grid = ucg(xs, xs)
     c, ks = FFS.calculate_spectrum(grid, g, (N, N); transform = SB.FFTSpectralBackend())
     k_bins, θ_bins, E = FFS.anisotropic_spectrum(ks, c; num_k_bins = 32, num_θ_bins = 36)
 
@@ -300,7 +299,7 @@ function generate_cross_coherence_figure()
     xs = _uaxis(L, N)
     xv = vec([x for x in xs, y in xs])
     yv = vec([y for x in xs, y in xs])
-    grid = ucg(xs, xs; L = L)
+    grid = ucg(xs, xs)
 
     nreal = 40
     ϕ = 0.7
@@ -343,7 +342,7 @@ function generate_derived_figure()
     N = 128
     u, v, _ = synthetic_incompressible(N, L; seed = 3)     # k^{-5/3} energy cascade
     xs = _uaxis(L, N)
-    grid = ucg(xs, xs; L = L)
+    grid = ucg(xs, xs)
     c, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
     vort = FFS.spectral_vorticity(ks, c)                   # scalar vorticity coeffs (2D)
     k_bins, E_k = FFS.isotropic_spectrum(ks, c; num_bins = 40, dims = 3)
@@ -375,8 +374,7 @@ function generate_komega_figure()
     t = _uaxis(Lt, Nt)
     k0, ω0 = 6.0, 6.0
     f = [cos(k0 * xi + ω0 * ti) + 0.4 * cos(2 * xi + 1.0 * ti + 0.5) for xi in x, ti in t]  # (Nx, Nt)
-    grid = FG.Grids.StructuredGrid(CART, x, t; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
-        period = (Lx, Lt))
+    grid = ucg(x, t)
     coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nt); transform = SB.FFTSpectralBackend())
     kx = ks[1]
     kω, P = _ascending(ks[2], abs2.(coeffs), 2)
@@ -413,7 +411,7 @@ function generate_estimation_figure()
     sig = @. 0.25 * cos(k0 * x) + bg               # tone buried in a k⁻² continuum
     K = 6
     V = FFS.dpss(Nx, 4.0, K)
-    grid = FG.Grids.StructuredGrid(CART, x; topology = FG.Grids.Periodic(), period = (L,))
+    grid = ucg(x)
     C = zeros(ComplexF64, Nx ÷ 2 + 1, K)          # a real field's packed half
     ks = nothing
     for k in 1:K
@@ -452,7 +450,7 @@ function generate_execution_figure()
     N = 96
     xs = _uaxis(L, N)
     f = synthetic_field(N; slope = 5 / 3, seed = 5)
-    grid = ucg(xs, xs; L = L)
+    grid = ucg(xs, xs)
     ms = (N, N)
 
     execs = [

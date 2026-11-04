@@ -16,9 +16,8 @@ const PP_SER = CB.SerialBackend()
 const PP_DS = SB.DirectSumSpectralBackend()
 const PP_CART = FG.Geometry.CartesianGeometry{Float64}()
 
-pp_unif(L, N) = range(0.0, L; length = N + 1)[1:N]
-pp_cart(L, N) = FG.Grids.StructuredGrid(PP_CART, pp_unif(L, N), pp_unif(L, N);
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+pp_unif(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+pp_cart(L, N) = FG.Grids.StructuredGrid(PP_CART, pp_unif(L, N), pp_unif(L, N))
 pp_str(L, N, a) = [L * (i - 1) / N + a * L / N * sinpi(2 * (i - 1) / N) for i in 1:N]
 
 # The Hann window at each point's fractional position across the extent of `x` and `y`.
@@ -81,7 +80,7 @@ Test.@testset "Both detrends are least-squares fits under the transform's weight
     # nodes and the Gaussian weights of a Gauss–Legendre grid.
     gu = pp_cart(L, N)
     xst = pp_str(L, N, 0.25)
-    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, nothing))
     M = 60
     xc, yc = L .* rand(M), L .* rand(M)
     wc = 0.5 .+ rand(M)
@@ -178,7 +177,7 @@ Test.@testset "Zero padding lengthens the domain with zeros" begin
     # A stretched grid is padded the same way: its coefficients are the measure-weighted sum
     # `Σ w f e^{-ik·(x - x₀)} / (pad² Σ w)` on wavenumbers `2πn / (pad L)`, evaluated here directly.
     xst = pp_str(L, N, 0.05)
-    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    gs = FG.Grids.StructuredGrid(PP_CART, xst, xs; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, nothing))
     fs = [sin(3x) + 0.5 * cos(2y) for x in xst, y in xs]
     cs, kss = FFS.calculate_spectrum(gs, fs, (N, N); preprocess = nopad, transform = PP_DS, execution = PP_SER)
     Test.@test isapprox(kss[1][2] - kss[1][1], 2π / (2L); rtol = 1e-12)

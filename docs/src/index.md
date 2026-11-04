@@ -37,18 +37,17 @@ using FFTW: FFTW                     # an AbstractFFTs implementation for the FF
 using SpectralBackends: SpectralBackends as SB
 using FlowGeometries: FlowGeometries as FG
 
-# 1. Axes of a uniform, periodic Cartesian grid
+# 1. Axes of a uniform, periodic Cartesian grid: N equal cells around the period L
 L = 2π
 N = 32
-xs = range(0.0, L; length = N + 1)[1:N]
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 # 2. Zonal/meridional velocities as (N, N) field tensors
 u = [cos(2x) + 0.5 * sin(5y) for x in xs, y in xs]
 v = [sin(2x) for x in xs, y in xs]
 
 # 3. Build the grid (FlowGeometries) and compute Fourier coefficients
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 
 # 4. Radially integrate to a 1D isotropic (kinetic) energy spectrum (fold the component axis)

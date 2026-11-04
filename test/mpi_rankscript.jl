@@ -26,9 +26,9 @@ yv = rand(N) .* L
 f = rand(N, 2)
 cart = FG.Geometry.CartesianGeometry{Float64}()
 sc = FG.Grids.UnstructuredGrid(cart, (xv, yv), ones(N); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
-xs = range(0.0, L; length = 17)[1:16]
-ys = range(0.0, L; length = 17)[1:16]
-ug = FG.Grids.StructuredGrid(cart, xs, ys; topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, 16)
+ys = FG.Axes.PeriodicUniformAxis(0.0, L, 16)
+ug = FG.Grids.StructuredGrid(cart, xs, ys)
 u = [cos(2x) + 0.5 * sin(3y) for x in xs, y in ys]
 ub = cat(u, 2 .* u, 3 .* u, 4 .* u; dims = 3)
 

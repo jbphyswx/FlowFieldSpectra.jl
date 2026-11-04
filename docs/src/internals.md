@@ -123,6 +123,7 @@ FlowFieldSpectra.Grids._warn_longitude_bandlimit
 FlowFieldSpectra.Grids._zeroed_inactive
 FlowFieldSpectra.Grids._inactive_scale
 FlowFieldSpectra.Grids._inactive_weights
+FlowFieldSpectra.Grids._analysis_weights
 FlowFieldSpectra.Grids._transform_nodes
 ```
 

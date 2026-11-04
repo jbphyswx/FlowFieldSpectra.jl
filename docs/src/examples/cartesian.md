@@ -13,7 +13,7 @@ using FlowGeometries: FlowGeometries as FG
 
 L = 2π
 N = 64
-xs = range(0.0, L; length = N + 1)[1:N]
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 
 # Synthetic turbulence: a broadband streamfunction ψ, then u = ∂ψ/∂y, v = -∂ψ/∂x (spectral
 # derivatives), so the velocity is incompressible with an E(k) ∝ k⁻⁵ᐟ³ cascade.
@@ -28,8 +28,7 @@ u = real(FFTW.ifft([im * freq[j] * ψ̂[i, j] for i in 1:N, j in 1:N]))    # (N,
 v = real(FFTW.ifft([-im * freq[i] * ψ̂[i, j] for i in 1:N, j in 1:N]))
 
 # A uniform periodic Cartesian grid (FlowGeometries) defined by its axes; fields are (N, N) tensors.
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, xs)
 coeffs, ks = FFS.calculate_spectrum(grid, (u, v), (N, N); transform = SB.FFTSpectralBackend())
 ```
 

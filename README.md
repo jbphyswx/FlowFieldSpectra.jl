@@ -93,13 +93,13 @@ using SpectralBackends: SpectralBackends as SB     # transform tags
 using FlowGeometries: FlowGeometries as FG         # grid / geometry types
 
 # 1. A uniform Cartesian grid — a FlowGeometries StructuredGrid over a CartesianGeometry, periodic in
-#    both directions (the Fourier domain). Defined by its axes; no per-point coordinate arrays.
+#    both directions (the Fourier domain): each axis a `PeriodicUniformAxis` of N equal cells around the
+#    period L. Defined by its axes; no per-point coordinate arrays.
 L = 10.0
 N = 64
-xs = range(0.0, L; length = N + 1)[1:N]
-ys = range(0.0, L; length = N + 1)[1:N]
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+xs = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+ys = FG.Axes.PeriodicUniformAxis(0.0, L, N)
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), xs, ys)
 
 # 2. Fields are plain N-D tensors on the grid — here two velocity components (u, v).
 u = [cos(2π * 2 * x / L) + 0.5 * sin(2π * 5 * y / L) for x in xs, y in ys]   # (N, N)
@@ -118,7 +118,8 @@ Mke.save("energy_spectrum.png", fig)
 ```
 
 Construct the grid that matches your data with [FlowGeometries](https://github.com/jbphyswx/FlowGeometries.jl) —
-a `StructuredGrid`/`UnstructuredGrid` over a `CartesianGeometry` (uniform → FFT, scattered → NUFFT) or a
+a `StructuredGrid`/`UnstructuredGrid` over a `CartesianGeometry` (a periodic direction on a
+`PeriodicUniformAxis` or a bounded one on a range → FFT, stretched or scattered → NUFFT) or a
 `SphericalGeometry` (structured → SHT, scattered → NUFSHT) — and dispatch is exact. Transform tags come
 from [SpectralBackends](https://github.com/jbphyswx/SpectralBackends.jl) and execution backends from
 [ComputationalBackends](https://github.com/jbphyswx/ComputationalBackends.jl). For repeated transforms on
@@ -207,8 +208,8 @@ See the [API reference](https://jbphyswx.github.io/FlowFieldSpectra.jl/dev/api/)
   `calculate_spectrum` on a uniform periodic grid, its adjoint under the grid's quadrature on any grid.
 - `analysis = Quadrature()` (default) or `LeastSquares()`: on a scattered sphere, NUFSHT's quadrature
   projection or its least-squares fit (`maxiter`, `rtol`); `analysis_status(plan)` returns the last call's
-  `(; converged, iterations, residual)`. A fit that stops short still writes its coefficients and reports
-  it there. Backends without a fit raise on `LeastSquares()`.
+  `FlowTransformBindings.SolverResult` (`converged`, `iterations`, `residual`). A fit that stops short
+  still writes its coefficients and reports it there. Backends without a fit raise on `LeastSquares()`.
 - `batch_chunk`: how many batch fields one library execution carries on the NUFFT and NUFSHT paths (`0`
   for the whole batch). By default a host NonuniformFFTs plan carries four, which keeps its memory
   independent of the batch; FINUFFT, device plans and NUFSHT carry the whole batch. On a stretched tensor

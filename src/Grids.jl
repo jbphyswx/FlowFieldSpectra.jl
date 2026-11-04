@@ -346,8 +346,9 @@ struct Quadrature <: AbstractAnalysis end
 """
     LeastSquares <: AbstractAnalysis
 
-The coefficients minimizing `‖A C − f‖` over the field's samples, `A` the synthesis, by LSMR: on samples
-of a field synthesized from coefficients of the transform's resolution, those coefficients.
+The coefficients minimizing `Σ_j w_j |(A C − f)_j|²` over the field's samples under the grid's weights `w`
+([`_analysis_weights`](@ref)), `A` the synthesis, by LSMR: on samples of a field synthesized from
+coefficients of the transform's resolution, those coefficients.
 `NUFSHTSpectralBackend` computes this; the plan reports the fit's outcome through `analysis_status`.
 """
 struct LeastSquares <: AbstractAnalysis end
@@ -395,6 +396,20 @@ _base_weights(g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Ge
     FT.(_sht_weights(g, length(FlowGeometries.Grids.coordinates(g, 2)); sampling, weights))
 _base_weights(g::FlowGeometries.Grids.AbstractGrid, ::Type{FT}, sampling, weights) where {FT} =
     collect(FT, _sph_point_weights(g, FT; sampling, weights))
+
+"""
+    _analysis_weights(analysis, inactive, grid, ::Type{FT}; sampling = nothing, weights = nothing) -> weights
+
+The per-point weights `analysis` reads over a spherical `grid` under `inactive`, in the field's column-major
+order: those of [`_sph_point_weights`](@ref) under [`_inactive_weights`](@ref), an inactive point at zero;
+for a [`LeastSquares`](@ref) fit under [`ZeroFill`](@ref), which holds every node, each node's weight on
+the grid with every cell active.
+"""
+_analysis_weights(::AbstractAnalysis, s::AbstractInactiveCells, g, ::Type{FT}; sampling = nothing,
+    weights = nothing) where {FT} =
+    _sph_point_weights(g, FT; sampling, weights = _inactive_weights(s, g, FT; sampling, weights))
+_analysis_weights(::LeastSquares, ::ZeroFill, g, ::Type{FT}; sampling = nothing, weights = nothing) where {FT} =
+    _sph_point_weights(g, FlowGeometries.Grids.AllActive(size(g)), FT; sampling, weights)
 
 """
     _transform_nodes(inactive, grid, analysis) -> (act, live)
@@ -550,23 +565,26 @@ function _sht_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGe
 end
 
 """
-    _sph_point_weights(grid, ::Type{FT}; sampling=nothing, weights=nothing) -> AbstractVector{FT}
+    _sph_point_weights(grid[, mask], ::Type{FT}; sampling=nothing, weights=nothing) -> AbstractVector{FT}
 
-Per-point quadrature weights of a spherical `grid` in the field's column-major order, an inactive point at
-zero: on a structured sphere the latitude rule of [`_sht_weights`](@ref) times `2π/nlon`, and on every
-other grid the per-node weights of [`_sph_node_weights`](@ref). Both total `4π` over an unmasked grid.
-`sampling` and `weights` override the grid's own rule as those two state, so `weights` holds one value per
-latitude on a structured sphere and one per node elsewhere.
+Per-point quadrature weights of a spherical `grid` in the field's column-major order, a point `mask` (the
+grid's own by default) leaves out at zero: on a structured sphere the latitude rule of
+[`_sht_weights`](@ref) times `2π/nlon`, and on every other grid the per-node weights of
+[`_sph_node_weights`](@ref). Both total `4π` over an unmasked grid. `sampling` and `weights` override the
+grid's own rule as those two state, so `weights` holds one value per latitude on a structured sphere and one
+per node elsewhere.
 """
+_sph_point_weights(g::FlowGeometries.Grids.AbstractGrid, ::Type{FT}; sampling = nothing,
+    weights = nothing) where {FT} = _sph_point_weights(g, FlowGeometries.Grids.mask(g), FT; sampling, weights)
+
 function _sph_point_weights(
         g::FlowGeometries.Grids.AbstractStructuredGrid{<:FlowGeometries.Geometry.AbstractSphericalGeometry},
-        ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
+        mask::AbstractArray{Bool}, ::Type{FT}; sampling = nothing, weights = nothing) where {FT}
     nlon = length(FlowGeometries.Grids.coordinates(g, 1))
     nlat = length(FlowGeometries.Grids.coordinates(g, 2))
     wlat = _sht_weights(g, nlat; sampling = sampling, weights = weights)
     length(wlat) == nlat || throw(DimensionMismatch("$(length(wlat)) latitude weights for $nlat latitudes"))
     dλ = FT(2π) / nlon
-    mask = FlowGeometries.Grids.mask(g)
     wpt = Vector{FT}(undef, nlon * nlat)
     # Point `p` is `iλ + (jφ-1)·nlon`, the mask's own linear order.
     @inbounds for p in eachindex(wpt)
@@ -575,23 +593,23 @@ function _sph_point_weights(
     return wpt
 end
 
-_sph_point_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGeometry}, ::Type{FT};
-    sampling = nothing, weights = nothing) where {FT} = _sph_node_weights(g, FT, length(g), weights)
+_sph_point_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGeometry}, mask::AbstractArray{Bool},
+    ::Type{FT}; sampling = nothing, weights = nothing) where {FT} = _sph_node_weights(g, mask, FT, length(g), weights)
 
 """
-    _sph_node_weights(grid, ::Type{FT}, N, weights) -> Vector{FT}
+    _sph_node_weights(grid, mask, ::Type{FT}, N, weights) -> Vector{FT}
 
 Per-node quadrature weights for a scattered spherical `grid`, from its own per-node measure rescaled to
 sum to `4π` — the transform's convention, the same total the structured path's
-`latitude_weights ⊗ 2π/nlon` carries. `weights` overrides it, one per node, an inactive node still at
-zero. Only the relative measures matter, so a grid of true dual-cell areas integrates exactly and a grid
+`latitude_weights ⊗ 2π/nlon` carries. `weights` overrides it, one per node, a node `mask` leaves out still
+at zero. Only the relative measures matter, so a grid of true dual-cell areas integrates exactly and a grid
 of equal-area nodes gives `4π/N`.
 """
 function _sph_node_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmonicGeometry},
-        ::Type{FT}, N::Integer, weights) where {FT}
+        mask::AbstractArray{Bool}, ::Type{FT}, N::Integer, weights) where {FT}
     if weights !== nothing
         length(weights) == N || throw(DimensionMismatch("$(length(weights)) weights for $N nodes"))
-        return _masked_weights(FlowGeometries.Grids.mask(g), FT.(weights), one(FT), FT)
+        return _masked_weights(mask, FT.(weights), one(FT), FT)
     end
     m = FlowGeometries.Grids.measure(g)
     length(m) == N || throw(DimensionMismatch(
@@ -601,7 +619,7 @@ function _sph_node_weights(g::FlowGeometries.Grids.AbstractGrid{<:SphericalHarmo
         "grid measure sums to $s, so it cannot set quadrature weights; pass `weights=`."))
     # Divided by the whole grid's measure, each cell's measure is its solid angle on the unit sphere, and
     # the active ones total the covered solid angle: `4π` unmasked, `4π·f_sky` under a mask.
-    return _masked_weights(FlowGeometries.Grids.mask(g), m, FT(4π) / FT(s), FT)
+    return _masked_weights(mask, m, FT(4π) / FT(s), FT)
 end
 
 # No mask: every cell participates, so the scaled measure stands as it is (lazy where separable).

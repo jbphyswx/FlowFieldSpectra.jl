@@ -36,9 +36,9 @@ function main()
     Random.seed!(42)
     L = 2π
     ms = (16, 16)
-    xs = range(0.0, L; length = ms[1] + 1)[1:ms[1]]
-    ys = range(0.0, L; length = ms[2] + 1)[1:ms[2]]
-    ug = FG.Grids.StructuredGrid(cart, xs, ys; periodic = (true, true), period = (L, L))
+    xs = FG.Axes.PeriodicUniformAxis(0.0, L, ms[1])
+    ys = FG.Axes.PeriodicUniformAxis(0.0, L, ms[2])
+    ug = FG.Grids.StructuredGrid(cart, xs, ys)
     u = [cos(2x) + 0.5 * sin(3y) for x in xs, y in ys]          # (Nx, Ny) tensor
 
     Test.@testset "GPU fast-transform parity vs CPU (real CUDA device)" begin
@@ -53,7 +53,8 @@ function main()
         px = rand(M) .* L
         py = rand(M) .* L
         fs = @. cos(px) + sin(2py)                             # (M,) scattered field
-        sg = FG.Grids.UnstructuredGrid(cart, (px, py), ones(M); periodic = (true, true), period = (L, L))
+        sg = FG.Grids.UnstructuredGrid(cart, (px, py), ones(M); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()),
+                                       period = (L, L))
         c_finufft, _ = FFS.calculate_spectrum(sg, fs, ms; transform = FTB.FINUFFTBackend(), execution = CB.SerialBackend(), eps = 1e-12)
         c_cuf, _ = FFS.calculate_spectrum(sg, fs, ms; transform = FTB.FINUFFTBackend(), execution = dev, eps = 1e-12)
         Test.@test isapprox(Array(c_cuf), c_finufft; atol = 1e-8)

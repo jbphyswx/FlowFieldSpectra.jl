@@ -51,7 +51,6 @@ end
 Plans.coefficient_size(pp::PreprocessedPlan) = Plans.coefficient_size(pp.inner)
 Plans.coefficient_type(pp::PreprocessedPlan) = Plans.coefficient_type(pp.inner)
 Plans.wavenumbers(pp::PreprocessedPlan) = Plans.wavenumbers(pp.inner)
-Plans.analysis_status(pp::PreprocessedPlan) = Plans.analysis_status(pp.inner)
 Plans.close!(pp::PreprocessedPlan) = Plans.close!(pp.inner)
 
 """

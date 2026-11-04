@@ -24,10 +24,10 @@ const HP_SER = CB.SerialBackend()
 const HP_FFT = SB.FFTSpectralBackend()
 const HP_DS = SB.DirectSumSpectralBackend()
 hp_rel(a, b) = maximum(abs, a .- b) / max(maximum(abs, b), eps())
-hp_uni(L, N) = range(0.0, L; length = N + 1)[1:N]
+hp_uni(L, N) = FG.Axes.PeriodicUniformAxis(0.0, L, N)
 hp_str(L, N) = [L * (i - 1) / N + 0.04 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
 hp_grid(L, N1, N2) = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(),
-    hp_uni(L, N1), hp_str(L, N2); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (L, L))
+    hp_uni(L, N1), hp_str(L, N2); topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (nothing, L))
 
 # The coefficients and wavenumber axes against the direct sum's.
 function hp_against_ds(c, ks, g, f, ms; tol = 1e-10)
@@ -180,7 +180,7 @@ Test.@testset "Line passes on a device's staged route equal the host route" begi
     cart = FG.Geometry.CartesianGeometry{Float64}()
     for nu in (FTB.NonuniformFFTsBackend(), FTB.FINUFFTBackend()), N2 in (16, 15), T in (Float64, ComplexF64)
         gh = FG.Grids.StructuredGrid(cart, hp_uni(L, 8), hp_str(L, N2), hp_str(L, 12); topology = P3,
-            period = (L, L, L))
+            period = (nothing, L, L))
         ms = (8, N2, 12)
         # Three lines per execution: one library transform count for every pass, and a last execution that
         # carries fewer lines than the plan's count.

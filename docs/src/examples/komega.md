@@ -18,16 +18,15 @@ Random.seed!(0)
 
 Nx, Nt = 64, 64
 Lx, Lt = 2π, 2π
-x = range(0.0, Lx; length = Nx + 1)[1:Nx]
-t = range(0.0, Lt; length = Nt + 1)[1:Nt]
+x = FG.Axes.PeriodicUniformAxis(0.0, Lx, Nx)
+t = FG.Axes.PeriodicUniformAxis(0.0, Lt, Nt)
 
 k0, ω0 = 6.0, 6.0                          # phase speed c = ω0/k0 = 1  → on the ω = k line
 # f(x, t) as an (Nx, Nt) tensor: a wave on the ω = k line plus a slower off-line background.
 f = [cos(k0 * xi + ω0 * ti) + 0.4 * cos(2 * xi + 1.0 * ti + 0.5) for xi in x, ti in t]
 
 # dim 1 = space (→ k), dim 2 = time (→ ω)
-grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x, t;
-    topology = (FG.Grids.Periodic(), FG.Grids.Periodic()), period = (Lx, Lt))
+grid = FG.Grids.StructuredGrid(FG.Geometry.CartesianGeometry{Float64}(), x, t)
 coeffs, ks = FFS.calculate_spectrum(grid, f, (Nx, Nt); transform = SB.FFTSpectralBackend())
 kx, kω = ks
 Ekω = abs2.(coeffs)

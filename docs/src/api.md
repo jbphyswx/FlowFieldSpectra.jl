@@ -85,8 +85,9 @@ The grid type defines the coordinate system, so construct the grid that matches 
 [FlowGeometries.jl](https://github.com/jbphyswx/FlowGeometries.jl): a Cartesian grid is a
 `FG.Grids.StructuredGrid` / `FG.Grids.UnstructuredGrid` over a `FG.Geometry.CartesianGeometry`, and a
 spherical grid the same over a `FG.Geometry.SphericalGeometry`. Structured vs. scattered is the grid
-*architecture*, and uniform vs. stretched is each axis's type, read by `FG.Axes.spacing_trait` (a range
-axis is uniform, a `Vector` stretched); FlowFieldSpectra defines no grid types of its own. Spherical
+*architecture*, and uniform vs. stretched is each direction's type, read by `FG.Grids.spacing_trait` (a
+bounded direction on a range and a periodic direction on a `FG.Axes.PeriodicUniformAxis` are uniform, a
+`Vector` stretched); FlowFieldSpectra defines no grid types of its own. Spherical
 sampling schemes (`Fejer1Sampling`, `GaussLegendreSampling`, `DriscollHealySampling`, …) live in
 `FG.SphericalSampling`; build a structured spherical grid with `FG.Connectivity.structured_grid`.
 FlowFieldSpectra reads every grid through FlowGeometries' own accessors (`size`, `ndims`, `length`,

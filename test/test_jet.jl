@@ -36,7 +36,7 @@ Test.@testset "Entry points make no runtime dispatch" begin
         str = [L * (i - 1) / N + 0.04 * L * sinpi(2 * (i - 1) / N) for i in 1:N]
         ug = ucg((L, L), ms)
         hg = FG.Grids.StructuredGrid(_cg(Float64), ucg_axis(Float64, L, N), str; topology = _periodic(ms),
-            period = (L, L))
+            period = (nothing, L))
         tg = nucg((str, str), (L, L))
         sg = scg((rand(64) .* L, rand(64) .* L), (L, L))
         fin = FTB.FINUFFTBackend()

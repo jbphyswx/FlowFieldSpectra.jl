@@ -13,13 +13,12 @@ using FlowGeometries: FlowGeometries
 # over the fixed nodes is built once. Points `(θ, φ)` (colatitude, longitude) come from
 # `Grids._sph_points`, a structured grid expanded in its field's column-major order.
 #
-# Both analyses are `NUFSHT.nusht_analyze!`. `Quadrature()` passes the grid's weights: the projection
-# `Σⱼ wⱼ fⱼ Y_lm(xⱼ)` `calculate_spectrum` returns, against the direct sum's per-point weights
-# (`DirectSum._sph_point_data`), a structured grid's latitude quadrature or a scattered grid's rescaled node
-# measure. `LeastSquares()` passes none: the fit `A c ≈ f`, which recovers the coefficients a field was
-# synthesized from. A masked grid's inactive cells enter as `inactive` says (`Grids.ZeroFill`,
-# `Grids.Exclude`): the plan holds the nodes `Grids._transform_nodes` names, so a masked cell's `NaN` is
-# never read.
+# Both analyses take the grid's weights `wⱼ` (`Grids._analysis_weights`): a structured grid's latitude quadrature or
+# a scattered grid's rescaled node measure, a `ZeroFill` fit's inactive node at its unmasked weight. `Quadrature()` is the projection
+# `Σⱼ wⱼ fⱼ Y_lm(xⱼ)` (`NUFSHT.nusht_analyze!`); `LeastSquares()` the fit `min Σⱼ wⱼ |(A c − f)ⱼ|²` through
+# `FlowTransformBindings.RangeWeighted(plan, w)` (`NUFSHT.nusht_solve!`), which recovers the coefficients a field was
+# synthesized from. A masked grid's inactive cells enter as `inactive` says (`Grids.ZeroFill`, `Grids.Exclude`): the
+# plan holds the nodes `Grids._transform_nodes` names, so a masked cell's `NaN` is never read.
 
 FFS._available(::FFS._HostNUFSHT) = true
 
@@ -28,18 +27,19 @@ FFS._available(::FFS._HostNUFSHT) = true
 
 Reusable NUFSHT plan: the fixed-node NUFSHT plan (point preset + NUFFT setup) over the nodes its
 `inactive` holds, the coefficient and staged-field buffers, those nodes' indices and which of them read
-the field, their quadrature weights or the LSMR workspace of a fit, and the last fit's outcome, all built
-once for a fixed point set and batch shape. Reuse across many fields via `calculate_spectrum!`.
+the field, their quadrature weights or a fit's weighted operator and LSMR workspace, and the last fit's
+outcome, all built once for a fixed point set and batch shape. Reuse across many fields via
+`calculate_spectrum!`.
 """
-struct NUFSHTSphericalPlan{T, CT, NB, A, P, CR, WS, QW, FW, AC, LV, KS} <: FFS.AbstractSpectralPlan
+struct NUFSHTSphericalPlan{T, CT, NB, A, P, CR, WS, QW, FW, AC, LV, KS, ST} <: FFS.AbstractSpectralPlan
     plan::P                       # NUFSHT.NUSHTplan over the held nodes, ntrans = C
     C_real::CR                    # (Nθ, Nφ, C) real coefficient buffer
     ws::WS                        # FTB.LSMRWorkspace of a fit; `nothing` for a quadrature
-    qw::QW                        # (n,) the held nodes' quadrature weights; `nothing` for a fit
+    qw::QW                        # (n,) the held nodes' quadrature weights, or a fit's `FTB.RangeWeighted(plan, w)`
     fw::FW                        # (n, C) one component of one chunk of the field at the held nodes
     act::AC                       # the held nodes' linear indices, `nothing` for every node
     live::LV                      # per held node, whether it reads the field; `nothing` where every one does
-    status::Base.RefValue{FFS.Plans.AnalysisStatus{T}}  # NUFSHT's report of the last call
+    status::ST                    # NUFSHT's report of the last fit, a `Base.RefValue`; `nothing` for a quadrature
     N::Int                        # the grid's node count, the field's stride between batch slices
     lmax::Int
     Nθ::Int
@@ -67,18 +67,30 @@ Base.show(io::IO, p::NUFSHTSphericalPlan{T}) where {T} =
 FFS.Plans.coefficient_size(p::NUFSHTSphericalPlan) = (p.Nθ, p.Nφ, p.batch...)
 FFS.Plans.coefficient_type(::NUFSHTSphericalPlan{T, CT}) where {T, CT} = CT
 FFS.Plans.wavenumbers(p::NUFSHTSphericalPlan) = p.ks
-FFS.Plans.analysis_status(p::NUFSHTSphericalPlan) = p.status[]
 FFS.Plans.close!(p::NUFSHTSphericalPlan) = (NUFSHT.close!(p.plan); nothing)
 
-# What an analysis holds: a fit's LSMR workspace, a quadrature's weights at the held nodes.
-_fit_workspace(::FFS.Quadrature, plan) = nothing
-_fit_workspace(::FFS.LeastSquares, plan) = FTB.LSMRWorkspace(plan)
-_held_weights(::FFS.Quadrature, w, act) = FFS.Grids._at_points(w, act)
-_held_weights(::FFS.LeastSquares, w, act) = nothing
+const _FittingPlan = NUFSHTSphericalPlan{T, CT, NB, <:FFS.LeastSquares} where {T, CT, NB}
+FFS.Plans.analysis_status(p::_FittingPlan) = p.status[]
+FFS.Plans.analysis_status(pp::FFS.PreprocessedPlan{<:_FittingPlan}) = FFS.Plans.analysis_status(pp.inner)
 
-# The report `nusht_analyze!` returns, in the plan's real type.
-_status(r, ::Type{T}) where {T} =
-    FFS.Plans.AnalysisStatus{T}((Bool(r.converged), Int(r.iterations), T(r.residual)))
+# What an analysis holds: a quadrature its weights at the held nodes; a fit the operator weighted by them, and the
+# LSMR workspace built on it.
+_held_weights(::FFS.Quadrature, w, act, _plan) = FFS.Grids._at_points(w, act)
+_held_weights(::FFS.LeastSquares, w, act, plan) = FTB.RangeWeighted(plan, FFS.Grids._at_points(w, act))
+_fit_workspace(::FFS.Quadrature, _qw) = nothing
+_fit_workspace(::FFS.LeastSquares, op) = FTB.LSMRWorkspace(op)
+
+# One chunk's coefficients by the plan's analysis.
+_analyze_chunk!(::FFS.Quadrature, C, fw, p) = NUFSHT.nusht_analyze!(C, fw, p.plan; weights = p.qw)
+_analyze_chunk!(::FFS.LeastSquares, C, fw, p) =
+    NUFSHT.nusht_solve!(C, fw, p.qw; ws = p.ws, maxiter = p.maxiter, rtol = p.rtol)
+
+# A fit's report of one chunk, in the plan's real type; the quadrature has none. A plan's record before its first fit.
+_chunk_status(::FFS.Quadrature, _r, ::Type) = nothing
+_chunk_status(::FFS.LeastSquares, r, ::Type{T}) where {T} =
+    FTB.SolverResult{T}(Bool(r.converged), Int(r.iterations), T(r.residual))
+_status_ref(::FFS.Quadrature, ::Type) = nothing
+_status_ref(::FFS.LeastSquares, ::Type{T}) where {T} = Ref(FTB.SolverResult{T}(false, 0, zero(T)))
 
 # `fw[j, b] = part(field[node j, lo+b-1])` for the `nvalid` slices of one chunk, node `j` the plan's
 # `j`-th held node and `part` the field component NUFSHT's real transform reads, zero at a node that reads
@@ -112,25 +124,26 @@ function _nusht_plan(::Type{CT}, ::Type{FT}, g, ms::Tuple, batch::NTuple{NB, Int
     lmax = ms[1] - 1
     Nθ = lmax + 1
     Nφ = 2 * lmax + 1
-    θ, φ, w = FFS.DirectSum._sph_point_data(g, FT; sampling,
-        weights = FFS.Grids._inactive_weights(inactive, g, FT; sampling, weights))
+    θp, φp = FFS.Grids._sph_points(g)
+    θ, φ = FT.(θp), FT.(φp)
+    w = FFS.Grids._analysis_weights(analysis, inactive, g, FT; sampling, weights)
     N = length(θ)
     act, live = FFS.Grids._transform_nodes(inactive, g, analysis)
-    θa = FFS.Grids._at_points(θ, act)
+    θa =FFS.Grids._at_points(θ, act)
     B = prod(batch; init = 1)
     C = FFS._chunk(B, B, batch_chunk)
     plan = NUFSHT.make_plan(FT, θa, FFS.Grids._at_points(φ, act), lmax; execution = exec, tol = tol,
         ntrans = C, nufft = nufft)
     try
         C_real = zeros(FT, Nθ, Nφ, C)
-        ws = _fit_workspace(analysis, plan)
-        qw = _held_weights(analysis, collect(FT, w), act)
+        qw = _held_weights(analysis, collect(FT, w), act, plan)
+        ws = _fit_workspace(analysis, qw)
         fw = zeros(FT, length(θa), C)
         ks = (0:lmax, -lmax:lmax)
+        st = _status_ref(analysis, FT)
         return NUFSHTSphericalPlan{FT, CT, NB, typeof(analysis), typeof(plan), typeof(C_real), typeof(ws),
-                typeof(qw), typeof(fw), typeof(act), typeof(live), typeof(ks)}(plan, C_real, ws, qw, fw, act,
-            live, Ref(FFS.Plans._quadrature_status(FT)), N, lmax, Nθ, Nφ, batch, B, C, analysis, maxiter,
-            FT(rtol), ks)
+                typeof(qw), typeof(fw), typeof(act), typeof(live), typeof(ks), typeof(st)}(plan, C_real, ws, qw, fw,
+            act, live, st, N, lmax, Nθ, Nφ, batch, B, C, analysis, maxiter, FT(rtol), ks)
     catch
         NUFSHT.close!(plan)
         rethrow()
@@ -176,27 +189,29 @@ function FFS.calculate_spectrum!(coeffs::AbstractArray{<:Number}, plan::NUFSHTSp
     fill!(coeffs, zero(eltype(coeffs)))
     s = _nusht_pass!(coeffs, plan, field, real, one(T))
     eltype(field) <: Real || (s = FFS.Plans._combine_status(s, _nusht_pass!(coeffs, plan, field, imag, im)))
-    plan.status[] = s
+    FFS.Plans._record!(plan.status, s)
     return plan.ks
 end
 
 # One real field component through NUFSHT, added into `coeffs` at weight `scale`, `plan.C` batch slices
-# per execution; returns the outcome over the chunks. NUFSHT's transform is real and linear, so a real
+# per execution; returns the fit's outcome over the chunks. NUFSHT's transform is real and linear, so a real
 # field runs this once with `real` (the identity on it) at weight 1, and a complex field runs it again with
 # `imag` at weight `im`. NUFSHT's slots above degree `lmax` are zero, as FFS's are.
-function _nusht_pass!(coeffs, plan::NUFSHTSphericalPlan{T}, field, part, scale) where {T}
-    C = plan.C
+function _nusht_pass!(coeffs, plan::NUFSHTSphericalPlan, field, part, scale)
     Cc = reshape(coeffs, plan.Nθ, plan.Nφ, plan.B)
-    s = FFS.Plans._quadrature_status(T)
-    for lo in 1:C:plan.B
-        nvalid = min(C, plan.B - lo + 1)
-        r = NUFSHT.nusht_analyze!(plan.C_real,
-            _stage_component!(plan.fw, field, plan.act, plan.live, plan.N, part, lo, nvalid), plan.plan;
-            weights = plan.qw, ws = plan.ws, maxiter = plan.maxiter, rtol = plan.rtol)
-        s = FFS.Plans._combine_status(s, _status(r, T))
-        view(Cc, :, :, lo:(lo + nvalid - 1)) .+= scale .* view(plan.C_real, :, :, 1:nvalid)
+    s = _nusht_chunk!(Cc, plan, field, part, scale, 1)
+    for lo in (1 + plan.C):plan.C:plan.B
+        s = FFS.Plans._combine_status(s, _nusht_chunk!(Cc, plan, field, part, scale, lo))
     end
     return s
+end
+
+function _nusht_chunk!(Cc, plan::NUFSHTSphericalPlan{T}, field, part, scale, lo::Int) where {T}
+    nvalid = min(plan.C, plan.B - lo + 1)
+    r = _analyze_chunk!(plan.analysis, plan.C_real,
+                        _stage_component!(plan.fw, field, plan.act, plan.live, plan.N, part, lo, nvalid), plan)
+    view(Cc, :, :, lo:(lo + nvalid - 1)) .+= scale .* view(plan.C_real, :, :, 1:nvalid)
+    return _chunk_status(plan.analysis, r, T)
 end
 
 # One-shot: build a plan for this field's batch shape, then execute it once.

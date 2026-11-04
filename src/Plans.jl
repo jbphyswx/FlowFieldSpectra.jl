@@ -1,5 +1,7 @@
 module Plans
 
+using FlowTransformBindings: FlowTransformBindings as FTB
+
 export AbstractSpectralPlan, plan_spectrum,
     coefficient_size, coefficient_type, wavenumbers, allocate_coefficients, analysis_status,
     AbstractSynthesisPlan, plan_synthesis, synthesize!, field_size, field_type, allocate_field, close!
@@ -69,21 +71,23 @@ allocate_coefficients(plan::AbstractSpectralPlan) =
     zeros(coefficient_type(plan), coefficient_size(plan)...)
 
 """
-    analysis_status(plan) -> (; converged, iterations, residual)
+    analysis_status(plan) -> FlowTransformBindings.SolverResult
 
-The outcome of the plan's last `calculate_spectrum!`. A plan computing a least-squares fit
-(`analysis = LeastSquares()`) passes on the fitting library's report over the whole batch (NUFSHT's
-`nusht_analyze!` returns it per call): `converged` for every field, the most LSMR iterations, and the
-largest relative residual `‖A†r‖/‖A†f‖`. A fit that stops short still writes its coefficients and is
-reported here. A quadrature is `(true, 0, 0)`.
+The outcome of the least-squares fit (`analysis = LeastSquares()`) of the plan's last `calculate_spectrum!`: the
+fitting library's report over the whole batch (NUFSHT's `nusht_solve!` returns it per call), `converged` for every
+field, the most LSMR iterations, and the largest relative residual `‖A†r‖/‖A†f‖`. A fit that stops short still writes
+its coefficients and is reported here. A plan whose analysis is a quadrature or an exact transform fits nothing and
+has no method.
 """
-analysis_status(plan::AbstractSpectralPlan) = _quadrature_status(real(coefficient_type(plan)))
+function analysis_status end
 
-# The report `analysis_status` returns; a plan running its fit in several calls combines theirs.
-const AnalysisStatus{T} = @NamedTuple{converged::Bool, iterations::Int, residual::T}
-_quadrature_status(::Type{T}) where {T} = AnalysisStatus{T}((true, 0, zero(T)))
-_combine_status(a::AnalysisStatus{T}, b::AnalysisStatus{T}) where {T} =
-    AnalysisStatus{T}((a.converged & b.converged, max(a.iterations, b.iterations), max(a.residual, b.residual)))
+# The worst of the reports of a fit run in several calls, none for a quadrature; and a plan's record of its last
+# call's.
+_combine_status(::Nothing, ::Nothing) = nothing
+_combine_status(a::FTB.SolverResult{T}, b::FTB.SolverResult{T}) where {T} =
+    FTB.SolverResult{T}(a.converged & b.converged, max(a.iterations, b.iterations), max(a.residual, b.residual))
+_record!(::Nothing, ::Nothing) = nothing
+_record!(r::Base.RefValue{S}, s::S) where {S<:FTB.SolverResult} = (r[] = s; nothing)
 
 # A transform writes its modes by linear index, so `coeffs` must have the shape it writes.
 function _check_coefficients(coeffs::AbstractArray, plan::AbstractSpectralPlan)
